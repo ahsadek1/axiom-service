@@ -126,11 +126,33 @@ def get_position_gate() -> dict:
 
 # ── Core Axiom 10-point assessment ───────────────────────────────────────────
 
-def run_axiom_assessment(ticker: str, req: AssessRequest) -> dict:
+def run_axiom_assessment(ticker: str, req: AssessRequest) -> dict:  # noqa: C901
     """
-    Axiom's 10-point risk framework via DeepSeek (primary model).
-    Returns structured risk report.
+    Axiom's 10-layer risk framework — each layer independently scored.
+    Primary: risk_engine.run_full_assessment() (10 independent data sources)
+    Fallback: DeepSeek prompt-based assessment (if risk engine fails)
     """
+    # ── PRIMARY: 10-layer independent engine ─────────────────────────────────
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from risk_engine import run_full_assessment
+        result = run_full_assessment(
+            ticker       = ticker,
+            strategy     = req.strategy or req.direction or "options",
+            dte          = req.dte or 35,
+            strike       = None,
+            proposed_usd = min(MAX_RISK_PER_TRADE, 1000.0),
+        )
+        # Normalize output to match existing API contract
+        result["model"]          = "axiom-risk-engine-v2"
+        result["position_gate"]  = get_position_gate()
+        result["hard_stops"]     = [result["concern_1"]] if result.get("auto_reject") else []
+        return result
+    except Exception as engine_err:
+        print(f"Risk engine failed, falling back to DeepSeek: {engine_err}")
+
+    # ── FALLBACK: DeepSeek prompt-based ──────────────────────────────────────
     pos_gate = get_position_gate()
 
     # Hard stop checks BEFORE calling DeepSeek
@@ -355,6 +377,38 @@ def receive_pick(req: PickWebhookRequest, x_nexus_secret: Optional[str] = Header
         _pick_queue.append(pick)
         queue_depth = len(_pick_queue)
 
+    # War room: post pick arrival to appropriate Telegram group immediately
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "synthesis"))
+        from transparency_layer import post_pick_received, post_concordance
+        extra = {
+            "volume_ratio": req.dict().get("volume_ratio"),
+            "ivr":          req.dict().get("ivr"),
+            "atr_pct":      req.dict().get("atr_pct"),
+        }
+        post_pick_received(
+            agent      = req.agent or "unknown",
+            ticker     = req.ticker,
+            strategy   = req.strategy or req.path or "options",
+            confidence = req.confidence or 0,
+            direction  = req.direction or "",
+            strike     = req.strike,
+            expiry     = req.expiry,
+            extra      = {k: v for k, v in extra.items() if v is not None},
+        )
+        # If concordance path — also post concordance message
+        if req.path == "CONCORDANCE" and req.agents:
+            post_concordance(
+                ticker        = req.ticker,
+                strategy      = req.strategy or "options",
+                agents        = req.agents if isinstance(req.agents, list) else [req.agent or "unknown"],
+                arbiter_score = req.arbiter_score or req.confidence or 0,
+                extra         = {"ivr": req.dict().get("ivr"), "regime": req.dict().get("regime")},
+            )
+    except Exception:
+        pass  # Transparency layer never blocks the pipeline
+
     # Immediate Telegram ping to OMNI — don't wait for poller
     _ping_omni(req.ticker, req.path or "CONCORDANCE", req.agent or "unknown")
 
@@ -362,7 +416,7 @@ def receive_pick(req: PickWebhookRequest, x_nexus_secret: Optional[str] = Header
         "status": "queued",
         "ticker": req.ticker,
         "queue_depth": queue_depth,
-        "message": "Pick queued for OMNI synthesis. Telegram ping sent."
+        "message": "Pick queued for OMNI synthesis. War room notified. Telegram ping sent."
     }
 
 
@@ -456,13 +510,26 @@ def assess(req: AssessRequest, x_nexus_secret: Optional[str] = Header(None)):
 @app.post("/premarket")
 def premarket(req: PremarketRequest, x_nexus_secret: Optional[str] = Header(None)):
     """
-    Daily pre-market risk brief.
-    Called by OMNI before market open — distributed to all agents.
+    Daily pre-market risk brief — Official 11-Section Axiom Template.
+    Covers: regime, risk score, top risks, macro events, vol landscape,
+    sector map, position review, strategy guidance, watchlist, circuit
+    breakers, and OMNI directive.
+    Distributed to OMNI + all agents + all Telegram groups at 9:00 AM ET.
     """
     verify_secret(x_nexus_secret)
-    date = req.date or datetime.date.today().isoformat()
-    result = run_premarket_brief(date)
-    return result
+    # Primary: full 11-section template with live data
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from premarket_template import run_premarket_report
+        result = run_premarket_report(send_telegram=True)
+        return result
+    except Exception as e:
+        # Fallback: original DeepSeek-only brief
+        date = req.date or datetime.date.today().isoformat()
+        result = run_premarket_brief(date)
+        result["fallback_reason"] = str(e)
+        return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
