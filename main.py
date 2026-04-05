@@ -511,25 +511,33 @@ def assess(req: AssessRequest, x_nexus_secret: Optional[str] = Header(None)):
 def premarket(req: PremarketRequest, x_nexus_secret: Optional[str] = Header(None)):
     """
     Daily pre-market risk brief — Official 11-Section Axiom Template.
-    Covers: regime, risk score, top risks, macro events, vol landscape,
-    sector map, position review, strategy guidance, watchlist, circuit
-    breakers, and OMNI directive.
-    Distributed to OMNI + all agents + all Telegram groups at 9:00 AM ET.
+    Fires report generation in a background thread and returns 202 immediately.
+    Report is sent to Telegram groups when ready (30-60s after call).
     """
     verify_secret(x_nexus_secret)
-    # Primary: full 11-section template with live data
-    try:
-        import sys, os
-        sys.path.insert(0, os.path.dirname(__file__))
-        from premarket_template import run_premarket_report
-        result = run_premarket_report(send_telegram=True)
-        return result
-    except Exception as e:
-        # Fallback: original DeepSeek-only brief
-        date = req.date or datetime.date.today().isoformat()
-        result = run_premarket_brief(date)
-        result["fallback_reason"] = str(e)
-        return result
+
+    import threading as _threading
+    import sys as _sys, os as _os
+
+    def _run_report():
+        try:
+            _sys.path.insert(0, _os.path.dirname(__file__))
+            from premarket_template import run_premarket_report
+            run_premarket_report(send_telegram=True)
+        except Exception as _e:
+            # Fallback brief on error
+            try:
+                _date = req.date or datetime.date.today().isoformat()
+                run_premarket_brief(_date)
+            except Exception:
+                pass
+
+    _threading.Thread(target=_run_report, daemon=True).start()
+    return {
+        "status": "accepted",
+        "message": "Pre-market report generating in background — will be delivered to Telegram within 60s",
+        "date": req.date or datetime.date.today().isoformat(),
+    }
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
