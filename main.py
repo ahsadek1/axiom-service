@@ -5,7 +5,7 @@ OMNI's independent risk assessment layer.
 Full 10-point risk framework powered by DeepSeek.
 
 Deploy to Railway as a Python/FastAPI service.
-Replaces the current NestJS skeleton at axiom-production.up.railway.app
+Replaces the current NestJS skeleton at axiom-production-334c.up.railway.app
 
 Endpoints:
   GET  /health         — Service health check
@@ -26,7 +26,16 @@ from pydantic import BaseModel
 from typing import Optional
 import uvicorn
 
-app = FastAPI(title="Axiom Risk Intelligence", version="1.0.0")
+app = FastAPI(title="Axiom Risk Intelligence + OMNI Webhook Gateway", version="1.1.0")
+
+# ── In-memory pick queue (Alpha → OMNI webhook buffer) ────────────────────────
+# Alpha POSTs qualified picks here. OMNI drains this queue every 60s.
+# Provides instant < 60s latency vs polling Alpha's /pending directly.
+from collections import deque
+import threading
+
+_pick_queue: deque = deque(maxlen=100)   # circular buffer, max 100 pending picks
+_pick_lock = threading.Lock()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_KEY", "sk-b750bc3774144ebd95e8dee764ffd384")
@@ -68,6 +77,22 @@ class AssessRequest(BaseModel):
 
 class PremarketRequest(BaseModel):
     date: Optional[str] = None  # YYYY-MM-DD, defaults to today
+
+
+class PickWebhookRequest(BaseModel):
+    """Incoming pick from Alpha Railway when concordance/bypass qualifies."""
+    ticker: str
+    agent: Optional[str] = None
+    agents: Optional[list] = None
+    direction: Optional[str] = "bullish"
+    strategy: Optional[str] = None
+    confidence: Optional[float] = None
+    arbiter_score: Optional[float] = None
+    reasoning: Optional[str] = None
+    submission_id: Optional[str] = None
+    path: Optional[str] = "CONCORDANCE"
+    # Full submissions array (Alpha passes full context)
+    submissions: Optional[list] = None
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -311,6 +336,73 @@ GUIDANCE: [2-3 sentences: concise risk guidance for today's session]"""
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.post("/pick")
+def receive_pick(req: PickWebhookRequest, x_nexus_secret: Optional[str] = Header(None)):
+    """
+    OMNI Webhook Receiver.
+    Alpha Railway POSTs here when a pick qualifies (concordance or score bypass).
+    Pick is queued for OMNI's next poll cycle (≤60s latency).
+    Also sends an immediate Telegram ping to wake OMNI faster.
+    """
+    verify_secret(x_nexus_secret)
+
+    pick = req.dict()
+    pick["received_at"] = datetime.datetime.utcnow().isoformat()
+    pick["processed"] = False
+
+    with _pick_lock:
+        _pick_queue.append(pick)
+        queue_depth = len(_pick_queue)
+
+    # Immediate Telegram ping to OMNI — don't wait for poller
+    _ping_omni(req.ticker, req.path or "CONCORDANCE", req.agent or "unknown")
+
+    return {
+        "status": "queued",
+        "ticker": req.ticker,
+        "queue_depth": queue_depth,
+        "message": "Pick queued for OMNI synthesis. Telegram ping sent."
+    }
+
+
+@app.get("/pick/queue")
+def get_pick_queue(x_nexus_secret: Optional[str] = Header(None)):
+    """
+    OMNI polls this endpoint to drain the webhook queue.
+    Returns unprocessed picks and marks them as processed.
+    """
+    verify_secret(x_nexus_secret)
+
+    with _pick_lock:
+        unprocessed = [p for p in _pick_queue if not p.get("processed")]
+        for p in unprocessed:
+            p["processed"] = True
+
+    return {
+        "picks": unprocessed,
+        "count": len(unprocessed),
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+    }
+
+
+def _ping_omni(ticker: str, path: str, agent: str) -> None:
+    """Send immediate Telegram alert to OMNI when a pick arrives."""
+    TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc")
+    AHMED_CHAT_ID = os.getenv("AHMED_CHAT_ID", "8573754783")
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": AHMED_CHAT_ID,
+                "text": f"⚡ <b>OMNI PICK INCOMING</b> — {ticker}\nPath: {path} | Agent: {agent}\nSynthesis running...",
+                "parse_mode": "HTML"
+            },
+            timeout=5
+        )
+    except Exception:
+        pass
+
 
 @app.get("/health")
 def health():
