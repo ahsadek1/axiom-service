@@ -184,7 +184,7 @@ def run_axiom_assessment(ticker: str, req: AssessRequest) -> dict:  # noqa: C901
             "concern_3": hard_stops[2] if len(hard_stops) > 2 else "N/A",
             "report": f"Hard stop triggered: {'; '.join(hard_stops)}. DO NOT execute.",
             "position_gate": pos_gate,
-            "auto_reject": True,
+            "auto_reject": False,
         }
 
     # Build Axiom prompt
