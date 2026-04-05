@@ -374,7 +374,8 @@ def score_layer_3_volatility_regime(ticker: str, strategy: str) -> dict:
     """Layer 3: Volatility Regime Alignment — IVR vs VIX vs strategy type."""
     orats  = _get_orats_summary(ticker)
     vix    = _get_vix() or 20.0
-    ivr    = float(orats.get("ivRank", 50) or 50)
+    # ORATS upgraded tier field names: rip=rank implied percentile (IVR), iv30d=current IV
+    ivr    = float(orats.get("rip", orats.get("ivRank", 50)) or 50)
     iv30   = float(orats.get("iv30", 0) or 0)
     strat  = strategy.lower()
     score  = 2
@@ -430,8 +431,9 @@ def score_layer_4_earnings(ticker: str, dte: int) -> dict:
     mult    = 1.0
     notes   = []
 
-    # --- Source 1: ORATS real-time summary ---
-    earn_str = data.get("nextEarnDate", data.get("nextEarnings", data.get("earnDate", "")))
+    # --- Source 1: ORATS real-time summary (upgraded tier field names) ---
+    earn_str = data.get("nextErnDate", data.get("nextEarnDate",
+               data.get("nextEarnings", data.get("earnDate", ""))))
     days_to_earnings = 999
 
     if earn_str:
