@@ -59,7 +59,7 @@ ORATS_TOKEN   = os.getenv("ORATS_TOKEN",   "4476e955-241a-4540-b114-ebbf1a3a3b87
 DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY",  "sk-b750bc3774144ebd95e8dee764ffd384")
 
 TOTAL_CAPITAL   = float(os.getenv("NEXUS_TOTAL_CAPITAL", "25000"))
-MAX_POSITIONS   = int(os.getenv("NEXUS_MAX_POSITIONS",   "5"))
+MAX_POSITIONS   = int(os.getenv("NEXUS_MAX_POSITIONS",   "3"))  # HARD CAP per NEXUS_ARCHITECTURE.md + HARD_RULES.md
 MAX_TICKER_PCT  = 0.05    # 5% per ticker
 MAX_SECTOR_PCT  = 0.15    # 15% per sector
 
@@ -391,8 +391,8 @@ def score_layer_3_volatility_regime(ticker: str, strategy: str) -> dict:
             return {"score": 10, "sizing_mult": 0.0, "critical_flag": True,
                     "note": f"IVR {ivr:.0f} < 15 — premium too cheap for credit spread. Hard stop."}
         if ivr < 25:
-            score += 3; mult = 0.75
-            notes.append(f"IVR {ivr:.0f} in caution zone (15-25)")
+            score += 2; mult = 0.85  # MEMORY.md: IVR 15-25 = soft flag, 0.85x size reduction
+            notes.append(f"IVR {ivr:.0f} in caution zone (15-25) — soft flag, 0.85x size")
         if ivr > 80:
             score += 2; mult = min(mult, 0.75)
             notes.append(f"IVR {ivr:.0f} extreme — consider IV crush risk on spreads")
