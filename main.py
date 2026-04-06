@@ -91,6 +91,20 @@ class PickWebhookRequest(BaseModel):
     reasoning: Optional[str] = None
     submission_id: Optional[str] = None
     path: Optional[str] = "CONCORDANCE"
+    # R1/R2 schema fields — required for execution (R1_R2_SCHEMA.md)
+    round: Optional[int] = None          # 1 = R1 (pool only), 2 = R2 (concordance eligible)
+    r1_score: Optional[float] = None
+    r2_score: Optional[float] = None
+    expiry: Optional[str] = None         # "YYYY-MM-DD" — required for execution
+    strike: Optional[float] = None       # short strike price — required for execution
+    width: Optional[float] = None        # spread width in $ — required for spreads
+    option_type: Optional[str] = None    # "call" or "put"
+    dte: Optional[int] = None
+    # Options metrics
+    ivr: Optional[float] = None
+    iv_rank: Optional[float] = None
+    atr_pct: Optional[float] = None
+    volume_ratio: Optional[float] = None
     # Full submissions array (Alpha passes full context)
     submissions: Optional[list] = None
 
@@ -372,6 +386,13 @@ def receive_pick(req: PickWebhookRequest, x_nexus_secret: Optional[str] = Header
     pick = req.dict()
     pick["received_at"] = datetime.datetime.utcnow().isoformat()
     pick["processed"] = False
+    # Validate R2 contract fields — warn if missing (execution will fail without them)
+    missing_contract_fields = []
+    if not req.expiry:   missing_contract_fields.append("expiry")
+    if not req.strike:   missing_contract_fields.append("strike")
+    if not req.option_type: missing_contract_fields.append("option_type")
+    if missing_contract_fields:
+        pick["_contract_warning"] = f"Missing execution fields: {', '.join(missing_contract_fields)} — execution will require fallback ATM lookup"
 
     with _pick_lock:
         _pick_queue.append(pick)
