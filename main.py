@@ -561,6 +561,32 @@ def premarket(req: PremarketRequest, x_nexus_secret: Optional[str] = Header(None
     }
 
 
+
+
+# ── Startup — heartbeat emitter ───────────────────────────────────────────────
+
+_startup_time = datetime.datetime.utcnow()
+
+@app.on_event("startup")
+def startup_heartbeat():
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from heartbeat_emitter import start_heartbeat_emitter
+        start_heartbeat_emitter(
+            service_name    = "Axiom",
+            version         = "1.0.0",
+            get_loop_active = lambda: True,
+            get_extra       = lambda: {
+                "position_gate":   get_position_gate().get("gate", "UNKNOWN"),
+                "positions":       get_position_gate().get("count", 0),
+                "uptime_hours":    round((datetime.datetime.utcnow() - _startup_time).total_seconds() / 3600, 2),
+            }
+        )
+        print("[AXIOM] Heartbeat emitter started")
+    except Exception as e:
+        print(f"[AXIOM] Heartbeat emitter failed to start: {e} — continuing without")
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
