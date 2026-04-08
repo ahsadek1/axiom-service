@@ -590,6 +590,7 @@ def screen(req: ScreenRequest, x_nexus_secret: Optional[str] = Header(None)):
     try:
         # Build a minimal AssessRequest for the risk engine
         assess_req = AssessRequest(
+            ticker    = req.ticker,
             strategy  = "Bull Put Spread" if req.direction == "bullish" else "Bear Call Spread",
             direction = req.direction,
             dte       = 35,   # sensible default
