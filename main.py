@@ -563,6 +563,84 @@ def premarket(req: PremarketRequest, x_nexus_secret: Optional[str] = Header(None
 
 
 
+
+
+# ── /screen — lightweight pre-screen for scanning loop ───────────────────────
+
+class ScreenRequest(BaseModel):
+    ticker:    str
+    direction: str = "bullish"
+    mode:      str = "light"   # light | full (reserved)
+
+@app.post("/screen")
+def screen(req: ScreenRequest, x_nexus_secret: Optional[str] = Header(None)):
+    """
+    Lightweight Axiom pre-screen for the OMNI scanning loop.
+    Called every R1 cycle to update axiom_score in the pool.
+    Returns: score (0-100), flags (list[str]), critical (bool).
+    
+    Score interpretation:
+      85-100: Clean — no structural issues
+      65-84:  Moderate caution — minor flags
+      40-64:  Caution — notable issues (pathway locked)
+      0-39:   Structural fail (death trigger)
+    """
+    verify_secret(x_nexus_secret)
+    
+    try:
+        # Build a minimal AssessRequest for the risk engine
+        assess_req = AssessRequest(
+            strategy  = "Bull Put Spread" if req.direction == "bullish" else "Bear Call Spread",
+            direction = req.direction,
+            dte       = 35,   # sensible default
+        )
+        result = run_axiom_assessment(req.ticker, assess_req)
+        
+        sizing_mult   = float(result.get("sizing_mult", result.get("sizing_multiplier", 0.5)))
+        risk_score    = float(result.get("risk_score", 5.0))   # 0-10, higher=worse
+        crit_flags    = result.get("critical_flags", [])
+        crit_count    = int(result.get("critical_flag_count", len(crit_flags)))
+        hard_stops    = result.get("hard_stops", [])
+        
+        # Translate to 0-100 score (higher = cleaner / safer)
+        if hard_stops:
+            score = 15.0   # hard stop = near-death
+        elif sizing_mult == 0.0:
+            score = max(20.0, 40.0 - (risk_score * 2))
+        elif sizing_mult <= 0.5:
+            score = max(40.0, 60.0 - (risk_score * 2))
+        elif sizing_mult <= 0.75:
+            score = max(55.0, 72.0 - risk_score)
+        else:
+            # Full sizing — use risk_score as fine-tuner
+            score = max(65.0, 90.0 - (risk_score * 3))
+        
+        # Collect flag strings
+        flags = []
+        for f in crit_flags:
+            if isinstance(f, dict):
+                flags.append(f"{f.get('name','?')}: {f.get('reason','')}")
+            else:
+                flags.append(str(f))
+        flags.extend(hard_stops)
+        
+        return {
+            "score":    round(score, 1),
+            "flags":    flags[:5],   # cap at 5 flags
+            "critical": crit_count > 0 or bool(hard_stops),
+            "ticker":   req.ticker,
+            "sizing_mult":   sizing_mult,
+            "risk_score":    risk_score,
+        }
+    except Exception as e:
+        # Fallback: neutral score so pool entry isn't blocked
+        return {
+            "score":    50.0,
+            "flags":    [f"screen_error: {str(e)[:60]}"],
+            "critical": False,
+            "ticker":   req.ticker,
+        }
+
 # ── Startup — heartbeat emitter ───────────────────────────────────────────────
 
 _startup_time = datetime.datetime.utcnow()
