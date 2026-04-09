@@ -39,10 +39,10 @@ _pick_lock = threading.Lock()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEEPSEEK_KEY   = os.getenv("DEEPSEEK_KEY", "sk-b750bc3774144ebd95e8dee764ffd384")
-NEXUS_SECRET   = os.getenv("NEXUS_SECRET", "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2")
+NEXUS_SECRET   = os.getenv("NEXUS_SECRET", "")
 OPENAI_KEY     = os.getenv("OPENAI_KEY", "")
-ALPACA_KEY     = os.getenv("ALPACA_KEY", "PKPGM3BRNYPGCF5Z56IAUZCZJL")
-ALPACA_SECRET  = os.getenv("ALPACA_SECRET", "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs")
+ALPACA_KEY     = os.getenv("ALPACA_KEY", "")
+ALPACA_SECRET  = os.getenv("ALPACA_SECRET", "")
 ALPACA_URL     = "https://paper-api.alpaca.markets"
 
 # Hard limits — always enforced
@@ -513,7 +513,7 @@ def get_pick_queue(x_nexus_secret: Optional[str] = Header(None)):
 
 def _ping_omni(ticker: str, path: str, agent: str) -> None:
     """Send immediate Telegram alert to OMNI when a pick arrives."""
-    TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc")
+    TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "")
     AHMED_CHAT_ID = os.getenv("AHMED_CHAT_ID", "8573754783")
     try:
         requests.post(
