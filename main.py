@@ -149,7 +149,52 @@ def run_axiom_assessment(ticker: str, req: AssessRequest) -> dict:  # noqa: C901
     Axiom's 10-layer risk framework — each layer independently scored.
     Primary: risk_engine.run_full_assessment() (10 independent data sources)
     Fallback: DeepSeek prompt-based assessment (if risk engine fails)
+
+    2026-04-09 Fixes:
+      FIX A: hard_stops now populated from critical_flags (was using auto_reject which is always False)
+      FIX B: caller-supplied earnings_days_away + dte are pre-checked BEFORE risk engine call
+              so test scenarios with explicit earnings/DTE values are correctly caught
     """
+    # ── PRE-CHECK: caller-supplied hard-stop conditions ───────────────────────
+    # These take precedence over risk engine's own data fetch.
+    # Allows test scenarios and explicit override conditions to work correctly.
+    pos_gate_pre = get_position_gate()
+    pre_stops = []
+
+    if pos_gate_pre["gate"] == "CLOSED":
+        pre_stops.append(f"Position gate CLOSED — {pos_gate_pre['count']}/{MAX_POSITIONS} positions open")
+
+    if req.dte is not None and req.dte < MIN_DTE:
+        pre_stops.append(f"DTE {req.dte} < {MIN_DTE} minimum — gamma implosion zone. Hard stop.")
+
+    if req.dte is not None and req.dte > MAX_DTE:
+        pre_stops.append(f"DTE {req.dte} > {MAX_DTE} maximum — too far out. Hard stop.")
+
+    if req.earnings_days_away is not None and req.earnings_days_away <= 5:
+        pre_stops.append(
+            f"Earnings in {req.earnings_days_away} day(s) — within 5-day hard stop window. No new positions."
+        )
+
+    if req.vix is not None and req.vix > VIX_PAUSE_THRESHOLD:
+        pre_stops.append(f"VIX {req.vix} > {VIX_PAUSE_THRESHOLD} pause threshold")
+
+    if pre_stops:
+        return {
+            "ticker":            ticker,
+            "risk_score":        10,
+            "sizing_suggestion": "avoid",
+            "sizing_rec":        "avoid",
+            "hard_stops":        pre_stops,
+            "critical_flags":    [{"layer": 0, "name": "Pre-check", "reason": s} for s in pre_stops],
+            "concern_1":         pre_stops[0],
+            "concern_2":         pre_stops[1] if len(pre_stops) > 1 else "N/A",
+            "concern_3":         pre_stops[2] if len(pre_stops) > 2 else "N/A",
+            "report":            f"Hard stop triggered: {'; '.join(pre_stops)}. DO NOT execute.",
+            "position_gate":     pos_gate_pre,
+            "auto_reject":       False,
+            "model":             "axiom-pre-check",
+        }
+
     # ── PRIMARY: 10-layer independent engine ─────────────────────────────────
     try:
         import sys, os
@@ -163,9 +208,10 @@ def run_axiom_assessment(ticker: str, req: AssessRequest) -> dict:  # noqa: C901
             proposed_usd = min(MAX_RISK_PER_TRADE, 1000.0),
         )
         # Normalize output to match existing API contract
+        # FIX A: populate hard_stops from critical_flags (auto_reject is always False — wrong source)
         result["model"]          = "axiom-risk-engine-v2"
         result["position_gate"]  = get_position_gate()
-        result["hard_stops"]     = [result["concern_1"]] if result.get("auto_reject") else []
+        result["hard_stops"]     = [f["reason"] for f in result.get("critical_flags", [])]
         return result
     except Exception as engine_err:
         print(f"Risk engine failed, falling back to DeepSeek: {engine_err}")
@@ -679,3 +725,4 @@ def startup_heartbeat():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8001))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
