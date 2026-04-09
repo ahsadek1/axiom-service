@@ -52,8 +52,8 @@ from typing import Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ALPACA_BASE   = "https://paper-api.alpaca.markets"
-ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKPGM3BRNYPGCF5Z56IAUZCZJL")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET", "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs")
+ALPACA_KEY    = os.getenv("ALPACA_KEY",    "")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
 ALPACA_H      = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 ORATS_TOKEN   = os.getenv("ORATS_TOKEN",   "4476e955-241a-4540-b114-ebbf1a3a3b87")
 DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY",  "sk-b750bc3774144ebd95e8dee764ffd384")
