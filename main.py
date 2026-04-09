@@ -52,6 +52,10 @@ MIN_DTE           = 21
 MAX_DTE           = 60
 VIX_PAUSE_THRESHOLD = 35.0
 CONSECUTIVE_LOSS_LIMIT = 3
+MIN_IVR_CREDIT_SPREAD  = 15    # IVR < 15 = hard stop on credit spreads
+MIN_IVR_CREDIT_CAUTION = 25    # IVR < 25 = soft flag, 0.85x size
+MAX_IVR_DEBIT          = 25    # IVR > 25 = hard stop on debit spreads
+MAX_IVR_DEBIT_CAUTION  = 20    # IVR > 20 = soft flag on debit
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
