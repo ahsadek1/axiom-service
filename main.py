@@ -510,12 +510,16 @@ def limits(x_nexus_secret: Optional[str] = Header(None)):
     return {
         "position_gate": pos_gate,
         "hard_limits": {
-            "max_positions": MAX_POSITIONS,
-            "max_risk_per_trade_usd": MAX_RISK_PER_TRADE,
-            "min_dte": MIN_DTE,
-            "max_dte": MAX_DTE,
-            "vix_pause_threshold": VIX_PAUSE_THRESHOLD,
-            "consecutive_loss_limit": CONSECUTIVE_LOSS_LIMIT,
+            "max_positions":           MAX_POSITIONS,
+            "max_risk_per_trade_usd":  MAX_RISK_PER_TRADE,
+            "min_dte":                 MIN_DTE,
+            "max_dte":                 MAX_DTE,
+            "vix_pause_threshold":     VIX_PAUSE_THRESHOLD,
+            "consecutive_loss_limit":  CONSECUTIVE_LOSS_LIMIT,
+            "min_ivr_credit_spread":   MIN_IVR_CREDIT_SPREAD,
+            "min_ivr_credit_caution":  MIN_IVR_CREDIT_CAUTION,
+            "max_ivr_debit":           MAX_IVR_DEBIT,
+            "max_ivr_debit_caution":   MAX_IVR_DEBIT_CAUTION,
         },
         "timestamp": datetime.datetime.utcnow().isoformat(),
     }
