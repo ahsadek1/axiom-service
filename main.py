@@ -480,8 +480,7 @@ def receive_pick(req: PickWebhookRequest, x_nexus_secret: Optional[str] = Header
     except Exception:
         pass  # Transparency layer never blocks the pipeline
 
-    # Immediate Telegram ping to OMNI — don't wait for poller
-    _ping_omni(req.ticker, req.path or "CONCORDANCE", req.agent or "unknown")
+    # Signal-only: pick arrival pings suppressed — Ahmed only sees GO verdicts
 
     return {
         "status": "queued",
@@ -512,21 +511,8 @@ def get_pick_queue(x_nexus_secret: Optional[str] = Header(None)):
 
 
 def _ping_omni(ticker: str, path: str, agent: str) -> None:
-    """Send immediate Telegram alert to OMNI when a pick arrives."""
-    TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "")
-    AHMED_CHAT_ID = os.getenv("AHMED_CHAT_ID", "8573754783")
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": AHMED_CHAT_ID,
-                "text": f"⚡ <b>OMNI PICK INCOMING</b> — {ticker}\nPath: {path} | Agent: {agent}\nSynthesis running...",
-                "parse_mode": "HTML"
-            },
-            timeout=5
-        )
-    except Exception:
-        pass
+    """Suppressed — signal-only mode. Ahmed only sees final GO verdicts."""
+    pass
 
 
 @app.get("/health")
@@ -725,4 +711,5 @@ def startup_heartbeat():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8001))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
 
