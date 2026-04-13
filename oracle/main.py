@@ -31,6 +31,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_ORACLE_START_TIME = datetime.utcnow().isoformat() + "Z"
+
 # OMNI M3 fix: replace deprecated @app.on_event("startup") with lifespan context manager.
 # on_event("startup") was deprecated in FastAPI 0.93 and will stop working in future versions.
 @asynccontextmanager
@@ -350,7 +352,18 @@ async def health_alias() -> dict:
     Cipher P2-8: intentionally unauthenticated. Same rationale as /ping.
     The authenticated /oracle/health endpoint returns full engine/stub status.
     """
-    return {"status": "healthy", "service": "oracle", "port": 8007}
+    hit_rate = cache.hit_rate()
+    warm     = cache.warm_count()
+    return {
+        "status":          "healthy" if hit_rate >= 0.5 or warm > 0 else "degraded",
+        "service":         "oracle",
+        "version":         "1.0.0",
+        "port":            8007,
+        "cache_hit_rate":  round(hit_rate, 3),
+        "cache_warm_tickers": warm,
+        "engines":         8,
+        "uptime_since":    _ORACLE_START_TIME,
+    }
 
 
 @app.get("/oracle/health", response_model=HealthCheck)
