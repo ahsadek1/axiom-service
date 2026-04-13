@@ -1,0 +1,386 @@
+"""
+quad_intelligence.py — OMNI Quad Intelligence Engine
+
+Runs 4 AI brains in parallel. Each brain receives identical complete context.
+Each brain leads on one dimension. All 4 must respond to achieve STRONG_GO.
+
+Brain assignments:
+  Claude    — PRIMARY synthesis. Evaluates overall trade coherence.
+  o3-mini   — ADVERSARIAL. Attacks the thesis. Finds edge cases and failure modes.
+  Gemini    — PATTERN. Pattern recognition across price action, sector, macro context.
+  DeepSeek  — MOMENTUM. Fast market structure and near-term momentum analysis.
+
+If a brain fails (timeout/API error), it contributes an error result — not a NO_GO vote.
+With ≥ 3 brains responding, synthesis proceeds. Fewer → CONDITIONAL automatically.
+"""
+
+import json
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+
+from config import (
+    ALL_BRAINS,
+    BRAIN_CLAUDE,
+    BRAIN_DEEPSEEK,
+    BRAIN_GEMINI,
+    BRAIN_O3MINI,
+    BRAIN_DIMENSIONS,
+    BRAIN_TIMEOUT_SECONDS,
+)
+
+logger = logging.getLogger("omni.quad_intelligence")
+
+# ── Brain System Prompts ──────────────────────────────────────────────────────
+
+_BASE_PROMPT = """You are analyzing a multi-agent concordance signal for a live trading system.
+The system targets: Win rate ≥75%, avg win ≥40%, avg loss ≤20%.
+Respond ONLY with valid JSON. No markdown, no preamble.
+
+CONCORDANCE CONTEXT:
+{context_json}
+
+YOUR ROLE: {role_description}
+
+Respond in this EXACT JSON format:
+{{
+  "vote": "GO" or "NO_GO" or "CONDITIONAL",
+  "confidence": <integer 0-100>,
+  "concern_1": "<primary concern ≤100 chars, or 'None'>",
+  "concern_2": "<secondary concern ≤100 chars, or 'None'>",
+  "echo_chamber": <true or false>,
+  "reasoning": "<2-3 sentences explaining your vote>"
+}}"""
+
+BRAIN_ROLES = {
+    BRAIN_CLAUDE:   "You are the PRIMARY synthesis brain. Evaluate the overall quality, "
+                    "coherence and conviction of this concordance signal. Does the collective "
+                    "agent agreement represent a genuine high-probability opportunity? Flag if "
+                    "agents appear to be citing the same source (echo chamber).",
+    BRAIN_O3MINI:   "You are the ADVERSARIAL brain. Your job is to find every reason this "
+                    "trade should NOT be taken. Challenge the thesis. Identify edge cases, "
+                    "hidden risks, timing problems, and failure modes. Be skeptical by default. "
+                    "Also check if the agent reasoning shows signs of echo chamber (shared source).",
+    BRAIN_GEMINI:   "You are the PATTERN recognition brain. Analyze this signal in the context "
+                    "of market regime, sector dynamics, and whether this setup matches historically "
+                    "high-probability patterns. Does the technical and macro context support this "
+                    "entry at this moment?",
+    BRAIN_DEEPSEEK: "You are the MOMENTUM analysis brain. Focus on near-term market structure: "
+                    "is momentum aligned with this direction? Is this an early entry or is the "
+                    "move already extended? What does the VIX regime and current session context "
+                    "say about timing?",
+}
+
+
+def run_all_brains(
+    context: dict,
+    anthropic_api_key: str,
+    openai_api_key:    str,
+    gemini_api_key:    str,
+    deepseek_api_key:  str,
+) -> dict[str, dict]:
+    """
+    Run all 4 brains in parallel and collect their votes.
+
+    Args:
+        context:           Full concordance + regime + Axiom context dict.
+        anthropic_api_key: Anthropic API key for Claude.
+        openai_api_key:    OpenAI API key for o3-mini.
+        gemini_api_key:    Google Gemini API key.
+        deepseek_api_key:  DeepSeek API key.
+
+    Returns:
+        Dict mapping brain name → brain result dict.
+        Every brain has an entry — errors are recorded as error results, not omitted.
+    """
+    api_keys = {
+        BRAIN_CLAUDE:   anthropic_api_key,
+        BRAIN_O3MINI:   openai_api_key,
+        BRAIN_GEMINI:   gemini_api_key,
+        BRAIN_DEEPSEEK: deepseek_api_key,
+    }
+
+    context_json = json.dumps(context, indent=2, default=str)
+
+    results: dict[str, dict] = {}
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(
+                _call_brain,
+                brain_name,
+                context_json,
+                api_keys[brain_name],
+            ): brain_name
+            for brain_name in ALL_BRAINS
+        }
+
+        for future in as_completed(futures):
+            brain_name = futures[future]
+            try:
+                result = future.result(timeout=BRAIN_TIMEOUT_SECONDS + 5)
+            except TimeoutError:
+                logger.warning("Brain %s timed out after %ds", brain_name, BRAIN_TIMEOUT_SECONDS)
+                result = _error_result(brain_name, f"timeout after {BRAIN_TIMEOUT_SECONDS}s")
+            except Exception as e:
+                logger.warning("Brain %s raised exception: %s", brain_name, e)
+                result = _error_result(brain_name, str(e)[:200])
+
+            results[brain_name] = result
+            if "error" not in result:
+                logger.info(
+                    "Brain %s voted %s (confidence=%s)",
+                    brain_name.upper(),
+                    result.get("vote", "UNKNOWN"),
+                    result.get("confidence", "?"),
+                )
+
+    return results
+
+
+def _call_brain(
+    brain_name:  str,
+    context_json: str,
+    api_key:     str,
+) -> dict:
+    """
+    Call a single brain's API and parse the response.
+
+    Args:
+        brain_name:   Brain identifier (BRAIN_CLAUDE, etc.).
+        context_json: JSON string of full context.
+        api_key:      API key for this brain's service.
+
+    Returns:
+        Brain result dict with vote, confidence, concerns, reasoning.
+        Returns error result dict on any failure.
+    """
+    prompt = _BASE_PROMPT.format(
+        context_json     = context_json,
+        role_description = BRAIN_ROLES[brain_name],
+    )
+
+    start_ms = int(time.time() * 1000)
+    try:
+        raw_text = _dispatch_api(brain_name, prompt, api_key)
+        elapsed  = int(time.time() * 1000) - start_ms
+
+        result = _parse_brain_response(raw_text, brain_name)
+        result["elapsed_ms"]  = elapsed
+        result["brain"]       = brain_name
+        result["dimension"]   = BRAIN_DIMENSIONS[brain_name]
+        return result
+
+    except Exception as e:
+        elapsed = int(time.time() * 1000) - start_ms
+        logger.warning("Brain %s call failed (%dms): %s", brain_name, elapsed, e)
+        err = _error_result(brain_name, str(e)[:200])
+        err["elapsed_ms"] = elapsed
+        return err
+
+
+def _dispatch_api(brain_name: str, prompt: str, api_key: str) -> str:
+    """
+    Send prompt to the appropriate API and return raw text response.
+
+    Args:
+        brain_name: Brain identifier.
+        prompt:     Complete prompt string.
+        api_key:    API key.
+
+    Returns:
+        Raw response text from the API.
+
+    Raises:
+        Exception: On API error, timeout, or non-2xx response.
+    """
+    if brain_name == BRAIN_CLAUDE:
+        return _call_anthropic(prompt, api_key)
+    elif brain_name == BRAIN_O3MINI:
+        return _call_openai(prompt, api_key)
+    elif brain_name == BRAIN_GEMINI:
+        return _call_gemini(prompt, api_key)
+    elif brain_name == BRAIN_DEEPSEEK:
+        return _call_deepseek(prompt, api_key)
+    else:
+        raise ValueError(f"Unknown brain: {brain_name}")
+
+
+def _call_anthropic(prompt: str, api_key: str) -> str:
+    """Call Claude claude-sonnet-4-6 via Anthropic Messages API."""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key":         api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
+        },
+        json={
+            "model":      "claude-sonnet-4-6",
+            "max_tokens": 1000,
+            "messages":   [{"role": "user", "content": prompt}],
+        },
+        timeout=BRAIN_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"]
+
+
+def _call_openai(prompt: str, api_key: str) -> str:
+    """Call o3-mini via OpenAI Chat Completions API."""
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+        },
+        json={
+            "model":                 "o3-mini",
+            "messages":              [{"role": "user", "content": prompt}],
+            "max_completion_tokens": 2000,
+        },
+        timeout=BRAIN_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _call_gemini(prompt: str, api_key: str) -> str:
+    """Call Gemini 2.5 Flash via Google Generative AI REST API."""
+    resp = requests.post(
+        # Cipher Finding 9: spec requires Gemini 2.5 Pro (not Flash).
+        # Flash is faster but has lower reasoning depth — insufficient for
+        # multi-factor financial synthesis requiring cross-domain correlation.
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}",
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": 1000,
+                "temperature": 0.2,
+            },
+        },
+        timeout=BRAIN_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    # Parse response defensively — Gemini 2.5 Flash (thinking model) may include
+    # thought blocks before the text response. Filter to actual text parts only.
+    # Handle missing/empty/malformed content gracefully.
+    try:
+        data = resp.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logger.warning("Gemini returned no candidates | Response: %s", resp.text[:200])
+            return ""
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            logger.warning("Gemini returned no parts in content | Candidate: %s", candidates[0])
+            return ""
+        # Skip thought-only parts; prefer non-thought text
+        text_parts = [
+            p.get("text", "")
+            for p in parts
+            if isinstance(p, dict) and "text" in p and not p.get("thought", False)
+        ]
+        if not text_parts:
+            # Fall back: accept any text part including thought blocks
+            text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
+        return text_parts[0] if text_parts else ""
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        logger.warning("Gemini response parsing error: %s | Response: %s", e, resp.text[:300])
+        return ""
+
+
+def _call_deepseek(prompt: str, api_key: str) -> str:
+    """Call DeepSeek V3 via DeepSeek Chat Completions API (OpenAI-compatible)."""
+    resp = requests.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+        },
+        json={
+            "model":       "deepseek-chat",
+            "messages":    [{"role": "user", "content": prompt}],
+            "max_tokens":  1000,
+            "temperature": 0.2,
+        },
+        timeout=BRAIN_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _parse_brain_response(raw_text: str, brain_name: str) -> dict:
+    """
+    Parse a brain's raw text response into a structured dict.
+
+    Strips markdown fences if present. Returns error result on parse failure.
+
+    Args:
+        raw_text:   Raw text response from the brain API.
+        brain_name: Brain name for error logging.
+
+    Returns:
+        Parsed brain result dict.
+    """
+    # Strip markdown code fences
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text  = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.warning("Brain %s returned unparseable JSON: %s | Raw: %s", brain_name, e, text[:200])
+        return _error_result(brain_name, f"JSON parse error: {e}")
+
+    # Validate and normalize vote
+    vote = str(parsed.get("vote", "")).upper().strip()
+    if vote not in ("GO", "NO_GO", "CONDITIONAL"):
+        logger.warning("Brain %s returned invalid vote '%s' — treating as CONDITIONAL", brain_name, vote)
+        vote = "CONDITIONAL"
+
+    return {
+        "vote":          vote,
+        "confidence":    min(100, max(0, int(parsed.get("confidence", 50)))),
+        "concern_1":     str(parsed.get("concern_1", "None"))[:120],
+        "concern_2":     str(parsed.get("concern_2", "None"))[:120],
+        "echo_chamber":  bool(parsed.get("echo_chamber", False)),
+        "reasoning":     str(parsed.get("reasoning", ""))[:500],
+        "brain":         brain_name,
+        "dimension":     BRAIN_DIMENSIONS[brain_name],
+    }
+
+
+def _error_result(brain_name: str, error_msg: str) -> dict:
+    """
+    Create a standardized error result for a brain that failed.
+
+    Error results do NOT count as votes — they count toward brains_responded = False.
+
+    Args:
+        brain_name: Brain name.
+        error_msg:  Error description.
+
+    Returns:
+        Error result dict. 'error' key present signals failure to caller.
+    """
+    return {
+        "vote":        None,
+        "confidence":  None,
+        "concern_1":   None,
+        "concern_2":   None,
+        "echo_chamber": False,
+        "reasoning":   None,
+        "brain":       brain_name,
+        "dimension":   BRAIN_DIMENSIONS.get(brain_name, "unknown"),
+        "error":       error_msg,
+    }

@@ -1,0 +1,71 @@
+"""
+config.py — Prime Execution Engine Configuration
+
+Prime trades swing equity — directional stock positions, not options.
+Fixed dollar position sizing during paper phase. -18% hard backstop.
+"""
+
+import os
+from dataclasses import dataclass
+
+# ── Exit Rules (approved Apr 10, 2026) ───────────────────────────────────────
+EXIT_PARTIAL_TRIGGER_PCT     = 0.35   # +35% → sell 50%
+EXIT_PARTIAL_SELL_FRACTION   = 0.50
+EXIT_TRAILING_STOP_PCT       = 0.12   # 12% trailing stop after +35%
+EXIT_TRAILING_TIGHTEN_AT_PCT = 0.50   # tighten to 8% trail at +50%
+EXIT_TRAILING_TIGHT_PCT      = 0.08   # tight trailing stop after +50%
+EXIT_HARD_BACKSTOP_PCT       = -0.18  # -18% absolute backstop (technical stop preferred)
+
+# ── Position Limits ───────────────────────────────────────────────────────────
+MAX_CONCURRENT_POSITIONS = 10
+MAX_NEW_PER_DAY          = 5
+
+ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
+ALPACA_DATA_URL  = "https://data.alpaca.markets"
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Prime Execution runtime configuration."""
+
+    nexus_prime_secret:  str
+    prime_db_path:       str
+    alpaca_api_key:      str
+    alpaca_secret_key:   str
+    prime_buffer_url:    str
+    telegram_bot_token:  str
+    ahmed_chat_id:       str
+    port:                int
+
+
+def load_settings() -> Settings:
+    """
+    Load and validate all required environment variables.
+
+    Raises:
+        ValueError: If any required env vars are missing.
+    """
+    required = {
+        "NEXUS_PRIME_SECRET":   os.getenv("NEXUS_PRIME_SECRET"),
+        "PRIME_EXEC_DB_PATH":   os.getenv("PRIME_EXEC_DB_PATH"),
+        "ALPACA_API_KEY":       os.getenv("ALPACA_API_KEY"),
+        "ALPACA_SECRET_KEY":    os.getenv("ALPACA_SECRET_KEY"),
+        "PRIME_BUFFER_URL":     os.getenv("PRIME_BUFFER_URL"),
+        "TELEGRAM_BOT_TOKEN":   os.getenv("TELEGRAM_BOT_TOKEN"),
+        "AHMED_CHAT_ID":        os.getenv("AHMED_CHAT_ID"),
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        raise ValueError(
+            f"Prime Execution startup failed — missing env vars: {', '.join(missing)}"
+        )
+    return Settings(
+        nexus_prime_secret  = required["NEXUS_PRIME_SECRET"],
+        prime_db_path       = required["PRIME_EXEC_DB_PATH"],
+        alpaca_api_key      = required["ALPACA_API_KEY"],
+        alpaca_secret_key   = required["ALPACA_SECRET_KEY"],
+        prime_buffer_url    = required["PRIME_BUFFER_URL"],
+        telegram_bot_token  = required["TELEGRAM_BOT_TOKEN"],
+        ahmed_chat_id       = required["AHMED_CHAT_ID"],
+        port                = int(os.getenv("PORT", "8006")),
+    )
