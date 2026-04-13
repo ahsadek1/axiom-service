@@ -510,6 +510,63 @@ def get_pick_queue(x_nexus_secret: Optional[str] = Header(None)):
     }
 
 
+@app.delete("/pick/queue/clear")
+def clear_pick_queue(x_nexus_secret: Optional[str] = Header(None)):
+    """
+    FIX [AXIOM-DRAIN]: Manual + auto-drain endpoint.
+    Alpha's drain thread calls GET /pick/queue every 60s (marks processed=True).
+    This DELETE endpoint allows full hard-clear of the queue (e.g. end of day reset).
+    Also auto-expires picks older than 4 hours that were never processed.
+    """
+    verify_secret(x_nexus_secret)
+    now = datetime.datetime.utcnow()
+    with _pick_lock:
+        before = len(_pick_queue)
+        # Remove processed items + items older than 4h
+        to_keep = []
+        expired = 0
+        for p in list(_pick_queue):
+            received = p.get("received_at", "")
+            try:
+                age_hours = (now - datetime.datetime.fromisoformat(received.replace("Z",""))).total_seconds() / 3600
+            except Exception:
+                age_hours = 0
+            if not p.get("processed") and age_hours < 4:
+                to_keep.append(p)
+            else:
+                expired += 1
+        _pick_queue.clear()
+        for p in to_keep:
+            _pick_queue.append(p)
+        after = len(_pick_queue)
+
+    return {
+        "cleared": before - after,
+        "remaining": after,
+        "timestamp": now.isoformat(),
+    }
+
+
+@app.get("/pick/queue/status")
+def pick_queue_status(x_nexus_secret: Optional[str] = Header(None)):
+    """Quick status of the pick queue — how many pending vs processed."""
+    verify_secret(x_nexus_secret)
+    with _pick_lock:
+        total     = len(_pick_queue)
+        pending   = sum(1 for p in _pick_queue if not p.get("processed"))
+        processed = total - pending
+        oldest_pending = None
+        for p in _pick_queue:
+            if not p.get("processed"):
+                oldest_pending = p.get("received_at")
+                break
+    return {
+        "total": total, "pending": pending, "processed": processed,
+        "oldest_pending": oldest_pending,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+    }
+
+
 def _ping_omni(ticker: str, path: str, agent: str) -> None:
     """Suppressed — signal-only mode. Ahmed only sees final GO verdicts."""
     pass
