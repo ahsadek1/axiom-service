@@ -389,7 +389,8 @@ def run_premarket_report(send_telegram: bool = True) -> dict:
     tg_message    = format_telegram_report(report_text, data)
 
     if send_telegram:
-        for chat_id in [AHMED_ID, ALPHA_GROUP, PRIME_GROUP, HEALTH_GRP]:
+        # Signal-only: pre-market brief goes to Ahmed DM only — not groups
+        for chat_id in [AHMED_ID]:
             try:
                 requests.post(
                     f"https://api.telegram.org/bot{TG_BOT}/sendMessage",
@@ -419,3 +420,4 @@ if __name__ == "__main__":
     result = run_premarket_report(send_telegram=not dry)
     print("\n" + "═"*60)
     print(result["report_text"])
+
