@@ -288,7 +288,15 @@ def score_layer_1_concentration(ticker: str, proposed_usd: float) -> dict:
     account   = _get_alpaca_account()
     equity    = float(account.get("equity", TOTAL_CAPITAL))
 
-    open_count    = len(positions)
+    # Leg-count fix: count by underlying, not individual legs (spreads = 1 underlying = 1 position)
+    _underlying_set = set()
+    for _p in positions:
+        _sym = _p.get("symbol", "")
+        if len(_sym) >= 15:  # OCC option symbol — extract underlying (first 6 chars, stripped)
+            _underlying_set.add(_sym[:6].rstrip().upper())
+        else:
+            _underlying_set.add(_sym.upper())
+    open_count    = len(_underlying_set)
     sector        = _get_sector(ticker)
     ticker_pct    = proposed_usd / equity
     hard_stop     = False
