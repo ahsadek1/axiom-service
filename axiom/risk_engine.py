@@ -137,6 +137,53 @@ def _get_alpaca_account() -> dict:
     except Exception:
         return {}
 
+def _extract_underlying_from_occ(symbol: str) -> str:
+    """Extract underlying ticker from OCC option symbol.
+    NVDA260515P00195000 → NVDA | Falls back to full symbol if not OCC format.
+    FIX [LEG-COUNT-BUG]: Used by Layer 1 to count spreads, not legs.
+    """
+    m = re.match(r'^([A-Z]{1,5})\d{6}[CP]\d{8}$', symbol.strip())
+    return m.group(1) if m else symbol
+
+
+def _count_spread_positions(positions: list) -> int:
+    """Count STRATEGY positions, not individual option legs.
+    A 2-leg bull put spread on NVDA = 1 position (same underlying).
+    FIX [LEG-COUNT-BUG]: Replaces len(positions) in Layer 1.
+    """
+    underlying_set = set()
+    for p in positions:
+        symbol      = p.get("symbol", "")
+        asset_class = p.get("asset_class", "")
+        underlying  = p.get("underlying_symbol", "")
+        if asset_class == "us_option" or re.match(r'^[A-Z]{1,5}\d{6}[CP]\d{8}$', symbol):
+            if not underlying:
+                underlying = _extract_underlying_from_occ(symbol)
+        else:
+            underlying = symbol
+        if underlying:
+            underlying_set.add(underlying)
+    return len(underlying_set)
+
+
+def _get_open_underlyings(positions: list) -> set:
+    """Return set of underlying tickers currently open (for display in Layer 1 note)."""
+    underlyings = set()
+    for p in positions:
+        symbol      = p.get("symbol", "")
+        asset_class = p.get("asset_class", "")
+        underlying  = p.get("underlying_symbol", "")
+        if asset_class == "us_option" or re.match(r'^[A-Z]{1,5}\d{6}[CP]\d{8}$', symbol):
+            if not underlying:
+                underlying = _extract_underlying_from_occ(symbol)
+        else:
+            underlying = symbol
+        if underlying:
+            underlyings.add(underlying)
+    return underlyings
+
+
+
 
 def _get_vix() -> Optional[float]:
     try:
@@ -288,7 +335,9 @@ def score_layer_1_concentration(ticker: str, proposed_usd: float) -> dict:
     account   = _get_alpaca_account()
     equity    = float(account.get("equity", TOTAL_CAPITAL))
 
-    open_count    = len(positions)
+    # FIX [LEG-COUNT-BUG]: count by underlying ticker (spreads = 1 position, not 2 legs)
+    open_count       = _count_spread_positions(positions)
+    open_underlyings = _get_open_underlyings(positions)
     sector        = _get_sector(ticker)
     ticker_pct    = proposed_usd / equity
     hard_stop     = False
@@ -296,7 +345,7 @@ def score_layer_1_concentration(ticker: str, proposed_usd: float) -> dict:
 
     if open_count >= MAX_POSITIONS:
         return {"score": 10, "sizing_mult": 0.0, "critical_flag": True,
-                "note": f"Position gate CLOSED — {open_count}/{MAX_POSITIONS} full"}
+                "note": f"Position gate CLOSED — {open_count}/{MAX_POSITIONS} spreads open ({chr(44).join(sorted(open_underlyings))})"}
 
     if ticker_pct > MAX_TICKER_PCT:
         notes.append(f"Proposed ${proposed_usd:.0f} = {ticker_pct*100:.1f}% > {MAX_TICKER_PCT*100:.0f}% max")
@@ -320,7 +369,9 @@ def score_layer_1_concentration(ticker: str, proposed_usd: float) -> dict:
     score = min(10, int(open_count / MAX_POSITIONS * 8) + 1)
     mult  = 1.0 - (open_count / MAX_POSITIONS) * 0.3
     return {"score": score, "sizing_mult": round(mult, 2), "critical_flag": False,
-            "note": f"{open_count}/{MAX_POSITIONS} positions open | {sector or 'unknown'} sector | {ticker_pct*100:.1f}% exposure"}
+            "note": f"{open_count}/{MAX_POSITIONS} spreads open | "
+                    f"{sector or 'unknown'} sector | {ticker_pct*100:.1f}% exposure | "
+                    f"open: {chr(44).join(sorted(open_underlyings)) or 'none'}"}
 
 
 def score_layer_2_liquidity(ticker: str, strike: Optional[float],
@@ -873,3 +924,4 @@ if __name__ == "__main__":
     print(f"Sector for JPM:  {_get_sector('JPM')}")
     print(f"Macro sensitivity GROWTH: {MACRO_SENSITIVITY.get('GROWTH')}")
     print("\n✅ Layer architecture verified. Call run_full_assessment() for live assessment.")
+
