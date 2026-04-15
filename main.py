@@ -762,11 +762,27 @@ def startup_heartbeat():
         print("[AXIOM] Heartbeat emitter started")
     except Exception as e:
         print(f"[AXIOM] Heartbeat emitter failed to start: {e} — continuing without")
+    # ── Resilience Framework v1.0 (Axiom) ────────────────────────────────────
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from graceful_degradation import get_degradation_manager as _axiom_gdm
+        from redundant_data_client import get_iv30 as _axiom_get_iv
+        from predictive_failure_model import get_predictive_model as _axiom_pred
+        from snapshot_system import get_snapshot_system as _axiom_snap
+        _axiom_gdm()
+        _axiom_pred()
+        _axiom_snap()
+        print("[AXIOM] ✅ Resilience Framework active — degradation/predictive/snapshot running")
+    except Exception as _rf_err:
+        print(f"[AXIOM] Resilience framework failed (non-fatal): {_rf_err}")
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8001))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
 
 
