@@ -28,6 +28,19 @@ import uvicorn
 
 app = FastAPI(title="Axiom Risk Intelligence + OMNI Webhook Gateway", version="1.1.0")
 
+@app.get("/")
+def root():
+    """Root health — Axiom is alive."""
+    import datetime as _dt
+    return {
+        "service": "axiom-risk-intelligence",
+        "version": "1.1.0",
+        "status": "online",
+        "endpoints": ["/health", "/assess", "/limits", "/pick", "/pick/queue"],
+        "timestamp": _dt.datetime.utcnow().isoformat(),
+    }
+
+
 # ── In-memory pick queue (Alpha → OMNI webhook buffer) ────────────────────────
 # Alpha POSTs qualified picks here. OMNI drains this queue every 60s.
 # Provides instant < 60s latency vs polling Alpha's /pending directly.
