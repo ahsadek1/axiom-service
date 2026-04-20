@@ -371,7 +371,7 @@ def _ping_omni(ticker: str, path: str, agent: str):
 
 @app.get("/health")
 def health():
-    """Returns service health including data source statuses."""
+    """Returns service health including data source statuses and circuit breaker config."""
     pos_gate = get_position_gate()
     uptime   = (datetime.datetime.utcnow() - _startup_time).total_seconds() / 3600
     return {
@@ -383,6 +383,16 @@ def health():
         "risk_engine":      "operational",
         "data_sources":     _source_health,
         "uptime_hours":     round(uptime, 2),
+        # Circuit breaker config — exposed in /health so diagnostic tools
+        # can verify thresholds without requiring auth (read-only, non-sensitive)
+        "hard_limits": {
+            "max_positions":       MAX_POSITIONS,
+            "max_risk_per_trade":  MAX_RISK_PER_TRADE,
+            "min_dte":             MIN_DTE,
+            "max_dte":             MAX_DTE,
+            "vix_pause_threshold": VIX_PAUSE_THRESHOLD,
+        },
+        "vix_pause_threshold": VIX_PAUSE_THRESHOLD,
     }
 
 
