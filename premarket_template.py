@@ -32,16 +32,16 @@ import requests
 from typing import Optional
 
 DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY",  "sk-b750bc3774144ebd95e8dee764ffd384")
-POLYGON_KEY   = os.getenv("POLYGON_KEY",   "lzWjU48O_ZoEjNHkKt3G7M_nqbxrweUI")
+POLYGON_KEY   = os.getenv("POLYGON_KEY",   "os.getenv("POLYGON_KEY", "")")
 ALPACA_BASE   = "https://paper-api.alpaca.markets"
-ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKPGM3BRNYPGCF5Z56IAUZCZJL")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET", "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs")
+ALPACA_KEY    = os.getenv("ALPACA_KEY",    "os.getenv("ALPACA_API_KEY", "")")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET", "os.getenv("ALPACA_SECRET_KEY", "")")
 ALPACA_H      = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-TG_BOT        = "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc"
+TG_BOT        = "os.getenv("TG_BOT_TOKEN", "")"
 AHMED_ID      = "8573754783"
-ALPHA_GROUP   = "-5167351071"
+ALPHA_GROUP   = "-1003539872205"
 PRIME_GROUP   = "-5111649337"
-HEALTH_GRP    = "-5184172590"
+HEALTH_GRP    = "-1003954790884"
 
 # FOMC dates 2025-2026
 FOMC_DATES = [
@@ -389,8 +389,7 @@ def run_premarket_report(send_telegram: bool = True) -> dict:
     tg_message    = format_telegram_report(report_text, data)
 
     if send_telegram:
-        # Signal-only: pre-market brief goes to Ahmed DM only — not groups
-        for chat_id in [AHMED_ID]:
+        for chat_id in [AHMED_ID, ALPHA_GROUP, PRIME_GROUP, HEALTH_GRP]:
             try:
                 requests.post(
                     f"https://api.telegram.org/bot{TG_BOT}/sendMessage",
@@ -420,4 +419,3 @@ if __name__ == "__main__":
     result = run_premarket_report(send_telegram=not dry)
     print("\n" + "═"*60)
     print(result["report_text"])
-
