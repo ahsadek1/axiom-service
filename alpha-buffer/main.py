@@ -35,6 +35,8 @@ from circuit_breaker import (
     reset_circuit_breaker,
 )
 from database import (
+    get_conn,
+    is_already_submitted_today,
     get_all_tickers_in_window,
     get_circuit_breaker_state,
     get_concordance_result,
@@ -197,7 +199,18 @@ def _alert_lost_concordance(row: dict) -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB and circuit breaker state on startup."""
     import asyncio as _asyncio
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from shared.db_guard import assert_unique_db_path  # S4: collision guard
+    assert_unique_db_path("alpha-buffer", settings.alpha_db_path)
     logger.info("Alpha Buffer starting...")
+    # G9 SYS-2: Auth registry validation
+    from shared.auth_registry import validate_service_auth_config, AuthConfigError
+    try:
+        validate_service_auth_config("alpha-buffer")
+        logger.info("Auth registry validation passed for alpha-buffer")
+    except AuthConfigError as e:
+        logger.critical("Auth config invalid: %s", e)
     init_db(settings.alpha_db_path)
     init_circuit_breaker(settings.alpha_db_path)
     logger.info("Alpha Buffer ready (solo_entries=%s)", settings.solo_entries_enabled)
@@ -307,6 +320,24 @@ def submit_pick(
     """
     verify_secret(x_nexus_secret)
 
+    # Earnings / manual block check — must run before anything else.
+    # Tickers in EARNINGS_BLOCKED_TICKERS env var are unconditionally rejected.
+    # This is the primary defence against re-fire after a Railway restart because
+    # it does not depend on DB state — it's config-driven and always survives restarts.
+    if body.ticker.upper() in settings.earnings_blocked_tickers:
+        logger.warning(
+            "Submission BLOCKED (earnings/manual block): %s/%s from %s",
+            body.ticker, body.direction, body.agent,
+        )
+        return JSONResponse(
+            status_code = 423,   # 423 Locked — unambiguous signal for monitoring
+            content     = {
+                "accepted": False,
+                "reason":   f"{body.ticker} is blocked (earnings/manual override). "
+                            f"Remove from EARNINGS_BLOCKED_TICKERS to re-enable.",
+            },
+        )
+
     # Circuit breaker check
     cb_status = evaluate_circuit_breaker(settings.alpha_db_path)
     if not cb_status.can_trade:
@@ -337,7 +368,58 @@ def submit_pick(
             },
         )
 
+    # Daily dedup gate — one submission per agent+ticker+direction per day.
+    # Prevents the same agent flooding concordance with identical picks across windows.
+    # Sage fix (Apr 14): Sage produced 106 picks / 14 windows = same tickers 7x.
+    # Even with per-agent dedup on the agent side, the buffer is the last line of defense.
+    if is_already_submitted_today(settings.alpha_db_path, body.agent, body.ticker, body.direction):
+        logger.info(
+            "Submission DEDUPLICATED (already submitted today): %s/%s from %s",
+            body.ticker, body.direction, body.agent,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "accepted": False,
+                "reason":   f"Duplicate: {body.agent} already submitted {body.ticker} {body.direction} today",
+                "deduplicated": True,
+            },
+        )
+
     window_id = current_window_id()
+
+    # SW3: Window mismatch detection — check pick staleness before accepting
+    _current_window = window_id  # default: fail-open (treat as FRESH if Axiom unreachable)
+    try:
+        import sys as _sys_wc, os as _os_wc
+        _sys_wc.path.insert(0, _os_wc.path.join(_os_wc.path.dirname(__file__), ".."))
+        import requests as _wc_req
+        _axiom_resp = _wc_req.get(
+            f"{getattr(settings, 'axiom_url', 'http://localhost:8001')}/pool/window",
+            timeout=3,
+        )
+        if _axiom_resp.status_code == 200:
+            _current_window = _axiom_resp.json().get("window_id", window_id)
+    except Exception:
+        pass  # fail-open: treat as FRESH
+
+    from shared.window_coordinator import evaluate_window
+    _window_result = evaluate_window(
+        body.window_id if hasattr(body, "window_id") and body.window_id else window_id,
+        _current_window,
+        body.ticker,
+        body.agent,
+    )
+    if _window_result["action"] == "REJECTED":
+        logger.warning("WINDOW EXPIRED — rejecting %s/%s from %s", body.ticker, body.direction, body.agent)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "accepted":     False,
+                "reason":       f"Window EXPIRED: pick is {_window_result['cycles_stale'] * 15} min stale",
+                "window_match": _window_result,
+            },
+        )
 
     # Persist submission
     save_submission(
@@ -354,6 +436,13 @@ def submit_pick(
         "Submission ACCEPTED: %s | %s/%s | score=%.1f | window=%s",
         body.agent, body.ticker, body.direction, body.score, window_id,
     )
+
+    # Pipeline Sentinel — buffer accepted this pick
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+        _trace_hop(f"{window_id}:{body.ticker}", "buffer_accepted", "alpha-buffer", body.ticker, "alpha")
+    except Exception:
+        pass
 
     # Evaluate concordance
     all_subs = get_window_submissions(
@@ -550,4 +639,79 @@ def circuit_breaker_reset(
         "reset":   True,
         "status":  "NORMAL",
         "message": "Circuit breaker reset to NORMAL. All counters cleared.",
+    })
+
+
+@app.post("/concordance/purge")
+def concordance_purge(
+    x_nexus_secret: str = Header(default=""),
+    tickers: Optional[list[str]] = None,
+) -> JSONResponse:
+    """
+    Purge concordance state for specific tickers (or all tickers if none given).
+
+    Deletes today's submission records and concordance results for the named tickers,
+    preventing them from re-entering the concordance pool after a restart.
+    Call this after a Railway deploy when earnings-blocked tickers may have
+    pre-restart concordances sitting in the DB.
+
+    Args:
+        tickers: Optional list of uppercase ticker symbols. If omitted, purges ALL
+                 today's concordance and submission state (full reset).
+
+    Returns:
+        JSON summary of rows deleted.
+    """
+    verify_secret(x_nexus_secret)
+
+    from zoneinfo import ZoneInfo
+    et_date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    deleted_submissions    = 0
+    deleted_concordances   = 0
+
+    with get_conn(settings.alpha_db_path) as conn:
+        if tickers:
+            _upper = [t.upper() for t in tickers]
+            # Build IN clause
+            placeholders = ",".join("?" * len(_upper))
+            deleted_submissions = conn.execute(
+                f"""
+                DELETE FROM submissions
+                WHERE SUBSTR(window_id, 1, 10) = ?
+                  AND ticker IN ({placeholders})
+                """,
+                [et_date, *_upper],
+            ).rowcount
+            deleted_concordances = conn.execute(
+                f"""
+                DELETE FROM concordance_results
+                WHERE SUBSTR(window_id, 1, 10) = ?
+                  AND ticker IN ({placeholders})
+                """,
+                [et_date, *_upper],
+            ).rowcount
+        else:
+            # Full day purge
+            deleted_submissions = conn.execute(
+                "DELETE FROM submissions WHERE SUBSTR(window_id, 1, 10) = ?",
+                (et_date,),
+            ).rowcount
+            deleted_concordances = conn.execute(
+                "DELETE FROM concordance_results WHERE SUBSTR(window_id, 1, 10) = ?",
+                (et_date,),
+            ).rowcount
+
+    scope = tickers if tickers else ["ALL"]
+    logger.warning(
+        "CONCORDANCE PURGE — tickers=%s deleted_submissions=%d deleted_concordances=%d",
+        scope, deleted_submissions, deleted_concordances,
+    )
+
+    return JSONResponse({
+        "purged":               True,
+        "date":                 et_date,
+        "tickers":              scope,
+        "deleted_submissions":  deleted_submissions,
+        "deleted_concordances": deleted_concordances,
     })

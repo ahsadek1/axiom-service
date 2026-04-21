@@ -8,6 +8,8 @@ WAL mode, foreign keys enforced, no silent failures.
 
 import json
 import logging
+import os
+import sys
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -16,29 +18,49 @@ from typing import Generator, Optional
 logger = logging.getLogger("omni.database")
 
 
+# ── Connection (SQLite + Postgres via shared adapter) ─────────────────────────
+
+try:
+    _shared_path = os.path.join(os.path.dirname(__file__), "..", "shared")
+    if _shared_path not in sys.path:
+        sys.path.insert(0, _shared_path)
+    from pg_adapter import get_conn as _pg_get_conn  # type: ignore
+    _PG_ADAPTER_AVAILABLE = True
+    logger.debug("pg_adapter loaded — SQLite/Postgres unified backend active")
+except ImportError:
+    _PG_ADAPTER_AVAILABLE = False
+    logger.debug("pg_adapter not found — using SQLite-only backend")
+
+
 @contextmanager
-def get_conn(db_path: str) -> Generator[sqlite3.Connection, None, None]:
+def get_conn(db_path: str) -> Generator:
     """
-    Context manager yielding a WAL-mode SQLite connection.
+    Context manager yielding a database connection.
+
+    Routes to Postgres when DATABASE_URL is set (Railway), SQLite otherwise.
 
     Args:
-        db_path: Path to the SQLite database file.
+        db_path: Path to the SQLite database file (ignored when using Postgres).
 
     Yields:
-        sqlite3.Connection with WAL mode and foreign keys enabled.
+        Connection with consistent sqlite3-like interface.
     """
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if _PG_ADAPTER_AVAILABLE:
+        with _pg_get_conn(db_path) as conn:
+            yield conn
+    else:
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def init_db(db_path: str) -> None:

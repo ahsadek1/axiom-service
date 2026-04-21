@@ -8,6 +8,8 @@ No silent failures — every exception propagates to caller.
 
 import json
 import logging
+import os
+import sys
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -16,31 +18,51 @@ from typing import Generator, Optional
 logger = logging.getLogger("alpha_buffer.database")
 
 
-# ── Connection ────────────────────────────────────────────────────────────────
+# ── Connection (SQLite + Postgres via shared adapter) ─────────────────────────
+
+# Prefer the shared pg_adapter when available; fall back to SQLite-only.
+try:
+    _shared_path = os.path.join(os.path.dirname(__file__), "..", "shared")
+    if _shared_path not in sys.path:
+        sys.path.insert(0, _shared_path)
+    from pg_adapter import get_conn as _pg_get_conn  # type: ignore
+    _PG_ADAPTER_AVAILABLE = True
+    logger.debug("pg_adapter loaded — SQLite/Postgres unified backend active")
+except ImportError:
+    _PG_ADAPTER_AVAILABLE = False
+    logger.debug("pg_adapter not found — using SQLite-only backend")
+
 
 @contextmanager
-def get_conn(db_path: str) -> Generator[sqlite3.Connection, None, None]:
+def get_conn(db_path: str) -> Generator:
     """
-    Context manager yielding a WAL-mode SQLite connection.
+    Context manager yielding a database connection.
+
+    Routes to Postgres when DATABASE_URL is set (Railway), SQLite otherwise.
+    The yielded object has a consistent sqlite3-like interface in both cases.
 
     Args:
-        db_path: Path to the SQLite database file.
+        db_path: Path to the SQLite database file (ignored when using Postgres).
 
     Yields:
-        sqlite3.Connection with WAL mode and foreign keys enabled.
+        Connection with WAL mode (SQLite) or autocommit-off (Postgres).
     """
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if _PG_ADAPTER_AVAILABLE:
+        with _pg_get_conn(db_path) as conn:
+            yield conn
+    else:
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -214,6 +236,53 @@ def get_window_submissions(
             (window_id, ticker, direction),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def is_already_submitted_today(
+    db_path:   str,
+    agent:     str,
+    ticker:    str,
+    direction: str,
+    et_date:   Optional[str] = None,
+) -> bool:
+    """
+    Check if the same agent already submitted this ticker+direction today (any window).
+
+    Prevents the same agent from submitting TSLA bullish 7 times in 7 different windows
+    and flooding the concordance system with duplicate weight.
+
+    Uses the window_id date (YYYY-MM-DD prefix, ET-based) as the day boundary — NOT the
+    UTC timestamp. This prevents false deduplication when a late-night window (e.g.
+    2026-04-14-2215 at 10:15 PM ET) rolls past midnight UTC and creates a UTC April 15
+    record that would block the real April 15 ET trading session.
+
+    Args:
+        db_path:   Path to database.
+        agent:     Agent name (Cipher/Atlas/Sage).
+        ticker:    Stock ticker symbol.
+        direction: 'bullish' or 'bearish'.
+        et_date:   Optional YYYY-MM-DD ET date override (for testing). Defaults to today in ET.
+
+    Returns:
+        True if a submission already exists today for this agent+ticker+direction.
+    """
+    from zoneinfo import ZoneInfo
+    if et_date is None:
+        et_date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM submissions
+            WHERE agent = ?
+              AND ticker = ?
+              AND direction = ?
+              AND SUBSTR(window_id, 1, 10) = ?
+            LIMIT 1
+            """,
+            (agent, ticker, direction, et_date),
+        ).fetchone()
+    return row is not None
 
 
 def get_all_tickers_in_window(db_path: str, window_id: str) -> list[tuple[str, str]]:

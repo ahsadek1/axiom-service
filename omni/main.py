@@ -14,17 +14,21 @@ Endpoints:
 
 import logging
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from shared.sovereign_comms import get_instructions, report
 
 import pytz
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from config import BASE_POSITION_SIZE, load_settings
+from config import BASE_POSITION_SIZE, MIN_BRAINS_REQUIRED, load_settings
 from axiom_client import assess_ticker, get_regime
 from database import (
     get_recent_syntheses,
@@ -35,7 +39,8 @@ from database import (
 )
 from execution_router import calculate_position_size, route_to_execution
 from quad_intelligence import run_all_brains
-from synthesis import build_context, compute_verdict
+from synthesis import build_context, compute_verdict, _maybe_alert_brain_degradation
+import oracle_client
 from telegram import send_axiom_block_alert, send_synthesis_card
 
 logging.basicConfig(
@@ -44,15 +49,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger("omni.main")
 
+
+def _check_min_brains_required(value: int) -> None:
+    """
+    Assert that MIN_BRAINS_REQUIRED is at or above the safe minimum of 3.
+
+    Called at startup to catch misconfigured thresholds before the service
+    accepts any traffic.
+
+    Args:
+        value: The MIN_BRAINS_REQUIRED value to validate.
+
+    Raises:
+        RuntimeError: If value < 3.
+    """
+    if value < 3:
+        raise RuntimeError(
+            f"MIN_BRAINS_REQUIRED={value} is below safe minimum of 3. "
+            "This is a system safety parameter — do not lower it."
+        )
+
 ET = pytz.timezone("America/New_York")
 
 settings       = load_settings()
+_auto_execute  = os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true"
+logger.info("OMNI: NEXUS_AUTO_EXECUTE=%s", _auto_execute)
 _state_lock    = threading.Lock()   # Pass B fix (V6): guards app_state counter mutations
 app_state = {
     "settings":          settings,
     "start_time":        datetime.now(ET).isoformat(),
     "syntheses_today":   0,
     "go_verdicts_today": 0,
+    "p4_dispatched_windows": set(),  # INV-15: (ticker, window_id) pairs — max 1 P4 per ticker per window
+    "synthesized_concordances": set(),  # Dedup: (ticker, window_id, direction, system, pathway) — max 1 synthesis per concordance pathway per window [GENESIS 2026-04-20]
 }
 
 
@@ -96,9 +125,84 @@ def verify_concordance_auth(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB on startup."""
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from shared.db_guard import assert_unique_db_path  # S4: collision guard
+    assert_unique_db_path("omni", settings.omni_db_path)
     logger.info("OMNI service starting...")
+    # G8 SYS-1: MIN_BRAINS_REQUIRED safety guard — must be ≥ 3 for system integrity
+    _check_min_brains_required(MIN_BRAINS_REQUIRED)
+    logger.info("OMNI safety check: MIN_BRAINS_REQUIRED=%d ✓", MIN_BRAINS_REQUIRED)
+    # G9 SYS-2: Auth registry validation
+    from shared.auth_registry import validate_service_auth_config, AuthConfigError
+    try:
+        validate_service_auth_config("omni")
+        logger.info("Auth registry validation passed for OMNI")
+    except AuthConfigError as e:
+        logger.critical("Auth config invalid: %s", e)
+    # G11 SYS-4: Validate all 4 brain API keys at startup
+    from shared.api_key_validator import ApiKeyValidator, ValidationResult as _VR
+    _validator = ApiKeyValidator()
+    _brain_results = [
+        _validator.validate_anthropic(settings.anthropic_api_key),
+        _validator.validate_openai(settings.openai_api_key),
+        _validator.validate_gemini(settings.gemini_api_key),
+        _validator.validate_deepseek(settings.deepseek_api_key),
+    ]
+    for _r in _brain_results:
+        if _r.status == "failed":
+            logger.critical("API key probe: %s → FAILED (%s)", _r.api_name, _r.message)
+        elif _r.status == "degraded":
+            logger.warning("API key probe: %s → DEGRADED (%s)", _r.api_name, _r.message)
+        else:
+            logger.info("API key probe: %s → %s (%s)", _r.api_name, _r.status, _r.message)
     init_db(settings.omni_db_path)
+
+    # ── Restart-safe state reconstruction ────────────────────────────────────
+    # Pre-populate synthesized_concordances from today's DB records so a
+    # Railway restart (or any restart mid-day) cannot re-synthesize concordances
+    # that were already processed this session. Without this, NVDA/AVGO with
+    # strong scanners can immediately re-qualify and re-fire after deploy.
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _et_date_today = datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
+        with __import__("database").get_conn(settings.omni_db_path) as _startup_conn:
+            _prior_rows = _startup_conn.execute(
+                """
+                SELECT ticker, window_id, direction, system, pathway
+                FROM synthesis_results
+                WHERE SUBSTR(window_id, 1, 10) = ?
+                """,
+                (_et_date_today,),
+            ).fetchall()
+        _recovered = 0
+        with _state_lock:
+            for _pr in _prior_rows:
+                _rkey = (
+                    _pr["ticker"],
+                    _pr["window_id"],
+                    _pr["direction"],
+                    _pr["system"],
+                    _pr["pathway"],
+                )
+                app_state["synthesized_concordances"].add(_rkey)
+                _recovered += 1
+        logger.info(
+            "OMNI restart recovery: pre-loaded %d synthesized_concordances from DB (date=%s)",
+            _recovered, _et_date_today,
+        )
+    except Exception as _re:
+        logger.warning(
+            "OMNI restart recovery failed: %s — starting with empty synthesized_concordances",
+            _re,
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     logger.info("OMNI service ready — Quad Intelligence active")
+    report("omni", "status", {"event": "started"})
+    _instr = get_instructions("omni")
+    if _instr:
+        logger.info("OMNI: %d instruction(s) from SOVEREIGN on startup", len(_instr))
     yield
     logger.info("OMNI service stopped")
 
@@ -240,14 +344,85 @@ def receive_concordance(
     verify_concordance_auth(x_nexus_secret, x_nexus_prime_secret)
 
     concordance = body.model_dump()
+    _pathway = concordance.get("pathway", "alpha")
+    _ticker  = concordance["ticker"]
+    _win_id  = concordance.get("window_id", "unknown")
+
+    # INV-15: Max 1 P4 signal per ticker per 15-minute window
+    if concordance.get("pathway") == "P4":
+        _p4_key = (concordance.get("ticker", ""), _win_id)
+        with _state_lock:
+            if _p4_key in app_state["p4_dispatched_windows"]:
+                logger.warning(
+                    "INV-15: P4 duplicate blocked — ticker=%s window=%s",
+                    concordance.get("ticker"), _win_id,
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "accepted": False,
+                        "reason": f"P4 already dispatched for {concordance.get('ticker')} in window {_win_id}",
+                    },
+                )
+            app_state["p4_dispatched_windows"].add(_p4_key)
+            # Prune stale window keys (keep only current and last window)
+            current_win = datetime.now(ET).strftime("%Y-%m-%d-%H%M")
+            app_state["p4_dispatched_windows"] = {
+                k for k in app_state["p4_dispatched_windows"]
+                if k[1] >= current_win[:13]  # keep today's entries
+            }
+    _trace_id = f"{_win_id}:{_ticker}"
+
+    # Concordance dedup: max 1 synthesis per (ticker, window, direction, system, pathway).
+    # The Alpha Buffer fires concordance events each time a new agent joins (P3→P2→P1
+    # upgrade). Without dedup, a 3-agent concordance triggers 3 separate OMNI syntheses.
+    # The 3rd synthesis gets degraded LLM votes (echo chamber, tired context) and
+    # frequently downgrades from CONDITIONAL to NO_GO. One synthesis per pathway level
+    # is the correct design — pathway upgrades get new synthesis, same pathway does not.
+    # [GENESIS 2026-04-20: fixes triple-synthesis degradation on HD/IEMG today]
+    _conc_key = (
+        _ticker,
+        _win_id,
+        concordance.get("direction", ""),
+        concordance.get("system", "alpha"),
+        _pathway,
+    )
+    with _state_lock:
+        if _conc_key in app_state["synthesized_concordances"]:
+            logger.info(
+                "Concordance dedup — already synthesized %s/%s pathway=%s window=%s",
+                _ticker, concordance.get("direction", ""), _pathway, _win_id,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "accepted": False,
+                    "reason": f"Concordance already synthesized for {_ticker}/{_pathway}/{_win_id}",
+                },
+            )
+        app_state["synthesized_concordances"].add(_conc_key)
+        # Prune: keep only current window's entries to prevent unbounded growth
+        _cur_win_prefix = _win_id[:13]  # "YYYY-MM-DD-HH"
+        app_state["synthesized_concordances"] = {
+            k for k in app_state["synthesized_concordances"]
+            if k[1][:13] >= _cur_win_prefix
+        }
+
     logger.info(
         "Concordance received: %s/%s/%s | pathway=%s | score=%.1f",
-        concordance["ticker"],
+        _ticker,
         concordance["direction"],
         concordance["system"],
-        concordance["pathway"],
+        _pathway,
         concordance["weighted_score"],
     )
+
+    # Pipeline Sentinel — OMNI synthesis starting
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+        _trace_hop(_trace_id, "omni_started", "omni", _ticker, _pathway)
+    except Exception:
+        pass
 
     # ── Step 1: Axiom risk assessment ─────────────────────────────────────────
     axiom_result = assess_ticker(
@@ -259,8 +434,16 @@ def receive_concordance(
     # ── Step 2: Current regime ────────────────────────────────────────────────
     regime = get_regime(settings.axiom_url, settings.axiom_secret)
 
-    # ── Step 3: Build context ─────────────────────────────────────────────────
-    context = build_context(concordance, axiom_result, regime)
+    # ── Step 3: Fetch ORACLE intelligence for this ticker ─────────────────────
+    # Brains require real market data to make informed GO/NO_GO decisions.
+    # Without ORACLE context, all 4 brains correctly default to NO_GO.
+    oracle_ctx = oracle_client.get_context(concordance["ticker"])
+    if oracle_ctx is None:
+        logger.warning("ORACLE context unavailable for %s — brains will operate with degraded context",
+                       concordance["ticker"])
+
+    # ── Step 4: Build context ─────────────────────────────────────────────────
+    context = build_context(concordance, axiom_result, regime, oracle_ctx)
 
     # ── Step 4: Quad Intelligence ─────────────────────────────────────────────
     brain_results = run_all_brains(
@@ -278,6 +461,16 @@ def receive_concordance(
         concordance_sizing = concordance["sizing_mult"],
         axiom_result       = axiom_result,
     )
+
+    # G8 SYS-1: Alert on brain degradation (< 4 brains responded)
+    if verdict.brains_responded < 4:
+        _maybe_alert_brain_degradation(
+            ticker           = concordance["ticker"],
+            brains_responded = verdict.brains_responded,
+            brain_summary    = verdict.brain_summary,
+            bot_token        = settings.telegram_bot_token,
+            chat_id          = settings.ahmed_chat_id,
+        )
 
     # ── Step 6: Calculate position size ──────────────────────────────────────
     position_size = calculate_position_size(
@@ -375,6 +568,13 @@ def receive_concordance(
             notes       = verdict.notes,
         )
 
+    # Pipeline Sentinel — OMNI synthesis completed
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+        _trace_hop(_trace_id, "omni_completed", "omni", _ticker, _pathway)
+    except Exception:
+        pass
+
     logger.info(
         "Synthesis complete: %s/%s/%s | verdict=%s | votes=%d/4 | exec=%s",
         concordance["ticker"],
@@ -384,6 +584,17 @@ def receive_concordance(
         verdict.votes_go,
         execution_ok,
     )
+    _msg_type = "alert" if verdict.verdict in ("GO", "STRONG_GO") else "status"
+    report("omni", _msg_type, {
+        "event":     "synthesis_complete",
+        "ticker":    concordance["ticker"],
+        "direction": concordance["direction"],
+        "pathway":   concordance["pathway"],
+        "verdict":   verdict.verdict,
+        "votes_go":  verdict.votes_go,
+        "brains":    verdict.brains_responded,
+        "exec_ok":   execution_ok,
+    })
 
     return JSONResponse({
         "synthesis_id":   synthesis_id,

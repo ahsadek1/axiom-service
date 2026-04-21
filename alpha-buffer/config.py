@@ -59,13 +59,14 @@ MAX_NEW_POSITIONS_PER_DAY    = 5
 class Settings:
     """Alpha Buffer runtime configuration."""
 
-    nexus_webhook_secret: str
-    alpha_db_path:        str
-    omni_webhook_url:     str
-    telegram_bot_token:   str
-    ahmed_chat_id:        str
-    solo_entries_enabled: bool
-    port:                 int
+    nexus_webhook_secret:    str
+    alpha_db_path:           str
+    omni_webhook_url:        str
+    telegram_bot_token:      str
+    ahmed_chat_id:           str
+    solo_entries_enabled:    bool
+    port:                    int
+    earnings_blocked_tickers: frozenset  # tickers blocked from concordance (e.g. earnings)
 
     @property
     def omni_auth_header(self) -> dict[str, str]:
@@ -94,12 +95,21 @@ def load_settings() -> Settings:
             f"Alpha Buffer startup failed — missing required env vars: {', '.join(missing)}"
         )
 
+    # EARNINGS_BLOCKED_TICKERS — comma-separated list of tickers to permanently
+    # reject from concordance, regardless of DB state. Survives Railway restarts
+    # because it's an env var. Set this to "NVDA,AVGO" when earnings are imminent.
+    _blocked_raw = os.getenv("EARNINGS_BLOCKED_TICKERS", "")
+    _blocked = frozenset(
+        t.strip().upper() for t in _blocked_raw.split(",") if t.strip()
+    )
+
     return Settings(
-        nexus_webhook_secret = required["NEXUS_WEBHOOK_SECRET"],
-        alpha_db_path        = required["ALPHA_DB_PATH"],
-        omni_webhook_url     = required["OMNI_WEBHOOK_URL"],
-        telegram_bot_token   = required["TELEGRAM_BOT_TOKEN"],
-        ahmed_chat_id        = required["AHMED_CHAT_ID"],
-        solo_entries_enabled = os.getenv("SOLO_ENTRIES_ENABLED", "false").lower() == "true",
-        port                 = int(os.getenv("PORT", "8002")),
+        nexus_webhook_secret     = required["NEXUS_WEBHOOK_SECRET"],
+        alpha_db_path            = required["ALPHA_DB_PATH"],
+        omni_webhook_url         = required["OMNI_WEBHOOK_URL"],
+        telegram_bot_token       = required["TELEGRAM_BOT_TOKEN"],
+        ahmed_chat_id            = required["AHMED_CHAT_ID"],
+        solo_entries_enabled     = os.getenv("SOLO_ENTRIES_ENABLED", "false").lower() == "true",
+        port                     = int(os.getenv("PORT", "8002")),
+        earnings_blocked_tickers = _blocked,
     )
