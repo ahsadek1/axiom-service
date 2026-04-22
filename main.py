@@ -1,4 +1,3 @@
-# OMNI restart trigger: 2026-04-21 14:21 UTC
 """
 Axiom Risk Intelligence Service — v3 Clean Rewrite
 ====================================================
@@ -372,7 +371,7 @@ def _ping_omni(ticker: str, path: str, agent: str):
 
 @app.get("/health")
 def health():
-    """Returns service health including data source statuses and circuit breaker config."""
+    """Returns service health including data source statuses."""
     pos_gate = get_position_gate()
     uptime   = (datetime.datetime.utcnow() - _startup_time).total_seconds() / 3600
     return {
@@ -381,19 +380,10 @@ def health():
         "version":     "3.0.0",
         "max_positions":    MAX_POSITIONS,
         "alpaca_positions": pos_gate["count"],
+        "position_gate":    pos_gate,
         "risk_engine":      "operational",
         "data_sources":     _source_health,
         "uptime_hours":     round(uptime, 2),
-        # Circuit breaker config — exposed in /health so diagnostic tools
-        # can verify thresholds without requiring auth (read-only, non-sensitive)
-        "hard_limits": {
-            "max_positions":       MAX_POSITIONS,
-            "max_risk_per_trade":  MAX_RISK_PER_TRADE,
-            "min_dte":             MIN_DTE,
-            "max_dte":             MAX_DTE,
-            "vix_pause_threshold": VIX_PAUSE_THRESHOLD,
-        },
-        "vix_pause_threshold": VIX_PAUSE_THRESHOLD,
     }
 
 
@@ -505,13 +495,23 @@ def assess(req: AssessRequest, x_nexus_secret: Optional[str] = Header(None)):
     """
     verify_secret(x_nexus_secret)
 
-    # Hard validation
-    if req.dte is not None:
-        if req.dte < MIN_DTE or req.dte > MAX_DTE:
-            raise HTTPException(
-                status_code=422,
-                detail=f"DTE {req.dte} outside valid range [{MIN_DTE}-{MAX_DTE}]"
-            )
+    # DTE range enforcement — return risk_score=10 (hard stop) rather than
+    # raising 422, so callers always receive a structured risk response.
+    if req.dte is not None and (req.dte < MIN_DTE or req.dte > MAX_DTE):
+        reason = f"DTE {req.dte} outside valid range [{MIN_DTE}-{MAX_DTE}]"
+        return {
+            "ticker":       req.ticker,
+            "risk_score":   10,
+            "sizing":       "avoid",
+            "approved":     False,
+            "flags":        [reason],
+            "hard_stops":   [reason],
+            "layer_scores": {},
+            "reason":       f"Hard stop: {reason}",
+            "position_gate": get_position_gate(),
+            "model":        "axiom-dte-gate",
+            "assessed_at":  datetime.datetime.utcnow().isoformat(),
+        }
 
     result = run_axiom_assessment(req)
     return result
