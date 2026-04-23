@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from shared.sovereign_comms import get_instructions, report
+from shared.sovereign_comms import EscalationLevel, get_instructions, report
 
 import pytz
 from fastapi import FastAPI, Header, HTTPException
@@ -272,6 +272,46 @@ def verify_concordance_auth(
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
+
+# ── SOVEREIGN Continuous Comms Loop ──────────────────────────────────────────
+_comms_stop_omni = threading.Event()
+SOVEREIGN_POLL_INTERVAL_S      = 30   # Poll SOVEREIGN inbox every 30 seconds
+SOVEREIGN_HEARTBEAT_INTERVAL_S = 300  # Push heartbeat every 5 minutes
+
+
+def _sovereign_comms_loop_omni() -> None:
+    """
+    Daemon thread: polls SOVEREIGN inbox every 30s and pushes a heartbeat
+    every 5 minutes. Never raises.
+    """
+    last_heartbeat: float = 0.0
+    logger.info("SOVEREIGN comms loop started (poll=%ds heartbeat=%ds)",
+                SOVEREIGN_POLL_INTERVAL_S, SOVEREIGN_HEARTBEAT_INTERVAL_S)
+    while not _comms_stop_omni.is_set():
+        now = time.monotonic()
+        try:
+            instructions = get_instructions("omni")
+            if instructions:
+                logger.info("SOVEREIGN comms: %d directive(s) received", len(instructions))
+                for instr in instructions:
+                    _dispatch_sovereign_instruction(instr)
+            if now - last_heartbeat >= SOVEREIGN_HEARTBEAT_INTERVAL_S:
+                with _state_lock:
+                    snap = {
+                        "event":               "heartbeat",
+                        "halted":              _sovereign_halted,
+                        "syntheses_today":     app_state.get("syntheses_today", 0),
+                        "go_verdicts_today":   app_state.get("go_verdicts_today", 0),
+                        "last_synthesis_time": app_state.get("last_synthesis_time"),
+                        "ts":                  __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                    }
+                report("omni", "AUTONOMOUS", snap)
+                last_heartbeat = now
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SOVEREIGN comms loop error: %s", exc)
+        _comms_stop_omni.wait(SOVEREIGN_POLL_INTERVAL_S)
+    logger.info("SOVEREIGN comms loop stopped")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB on startup."""
@@ -357,12 +397,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("OMNI service ready — Quad Intelligence active")
     report("omni", "status", {"event": "started"})
-    _instr = get_instructions("omni")
-    if _instr:
-        logger.info("OMNI: %d instruction(s) from SOVEREIGN on startup", len(_instr))
-        for _i in _instr:
+    # Drain queued directives from before this startup
+    _startup_instr = get_instructions("omni")
+    if _startup_instr:
+        logger.info("OMNI: %d instruction(s) from SOVEREIGN on startup", len(_startup_instr))
+        for _i in _startup_instr:
             _dispatch_sovereign_instruction(_i)
+
+    # Launch continuous comms loop (polls every 30s, heartbeat every 5min)
+    _comms_stop_omni.clear()
+    threading.Thread(target=_sovereign_comms_loop_omni, daemon=True, name="omni-sovereign-comms").start()
+
     yield
+
+    _comms_stop_omni.set()
+    report("omni", "status", {"event": "stopped"})
     logger.info("OMNI service stopped")
 
 
@@ -832,6 +881,7 @@ def _run_synthesis(
         execution_ok,
     )
     _msg_type = "alert" if verdict.verdict in ("GO", "STRONG_GO") else "status"
+    _esc = EscalationLevel.CRITICAL if verdict.verdict in ("GO", "STRONG_GO") else EscalationLevel.INFO
     report("omni", _msg_type, {
         "event":     "synthesis_complete",
         "ticker":    concordance["ticker"],
@@ -841,7 +891,7 @@ def _run_synthesis(
         "votes_go":  verdict.votes_go,
         "brains":    verdict.brains_responded,
         "exec_ok":   execution_ok,
-    })
+    }, escalation=_esc)
 
     return JSONResponse({
         "synthesis_id":   synthesis_id,
@@ -897,6 +947,87 @@ def get_synthesis(
         raise HTTPException(status_code=404, detail=f"Synthesis {synthesis_id} not found")
 
     return JSONResponse(dict(row))
+
+
+
+# ── SOVEREIGN Push Endpoints ──────────────────────────────────────────────────
+
+class _SovDirective(BaseModel):
+    directive: str
+    data: dict = {}
+    from_agent: str = "sovereign"
+
+
+@app.post("/sovereign/directive", status_code=200)
+def sovereign_directive(
+    body: _SovDirective,
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN pushes a directive directly. Zero polling lag."""
+    verify_secret(x_nexus_secret)
+    global _sovereign_halted, _auto_execute
+
+    d = body.directive.strip().upper()
+    logger.info("SOVEREIGN direct push: %s", d)
+
+    if d == "PING":
+        report("omni", "ack", {"directive": "PING", "status": "alive"})
+        return JSONResponse({"ok": True, "directive": "PING", "status": "alive"})
+    elif d == "HALT":
+        _sovereign_halted = True
+        report("omni", "ack", {"directive": "HALT", "status": "applied", "halted": True})
+        return JSONResponse({"ok": True, "directive": "HALT", "halted": True})
+    elif d == "RESUME":
+        _sovereign_halted = False
+        report("omni", "ack", {"directive": "RESUME", "status": "applied", "halted": False})
+        return JSONResponse({"ok": True, "directive": "RESUME", "halted": False})
+    elif d in ("FLUSH", "RESET_DAY"):
+        with _state_lock:
+            app_state["syntheses_today"] = 0
+            app_state["go_verdicts_today"] = 0
+            app_state["p4_dispatched_windows"] = set()
+            app_state["synthesized_concordances"] = set()
+        report("omni", "ack", {"directive": d, "status": "applied"})
+        return JSONResponse({"ok": True, "directive": d})
+    elif d == "SET_AUTO_EXECUTE":
+        val = str(body.data.get("value", "")).lower()
+        if val in ("true", "false"):
+            _auto_execute = val == "true"
+            report("omni", "ack", {"directive": "SET_AUTO_EXECUTE", "value": _auto_execute})
+            return JSONResponse({"ok": True, "auto_execute": _auto_execute})
+        return JSONResponse({"ok": False, "error": "value must be \'true\' or \'false\'"}, status_code=400)
+    elif d == "STATUS":
+        with _state_lock:
+            snap = {
+                "directive": "STATUS", "service": "omni",
+                "halted": _sovereign_halted, "auto_execute": _auto_execute,
+                "syntheses_today": app_state.get("syntheses_today", 0),
+                "go_verdicts_today": app_state.get("go_verdicts_today", 0),
+                "last_synthesis_time": app_state.get("last_synthesis_time"),
+            }
+        report("omni", "status", snap)
+        return JSONResponse({"ok": True, **snap})
+    else:
+        report("omni", "ack", {"directive": d, "status": "unrecognized"})
+        return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+@app.get("/sovereign/status", status_code=200)
+def sovereign_status(
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN queries full OMNI state on-demand."""
+    verify_secret(x_nexus_secret)
+    with _state_lock:
+        return JSONResponse({
+            "ok": True, "service": "omni",
+            "halted": _sovereign_halted,
+            "auto_execute": _auto_execute,
+            "syntheses_today": app_state.get("syntheses_today", 0),
+            "go_verdicts_today": app_state.get("go_verdicts_today", 0),
+            "last_synthesis_time": app_state.get("last_synthesis_time"),
+            "port": int(__import__("os").getenv("PORT", "8004")),
+        })
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

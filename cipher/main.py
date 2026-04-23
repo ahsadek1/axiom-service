@@ -14,6 +14,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -21,7 +22,7 @@ from typing import Any, Optional, Union
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.log_setup import configure_service_logging
-from shared.sovereign_comms import get_instructions, report
+from shared.sovereign_comms import EscalationLevel, get_instructions, report
 
 import pytz
 import uvicorn
@@ -121,6 +122,46 @@ def _dispatch_sovereign_instruction(instr: dict) -> None:
         report("cipher", "ack", {"directive": directive[:100], "status": "unrecognized"})
 
 
+
+
+# ── SOVEREIGN Continuous Comms Loop ──────────────────────────────────────────
+_comms_stop = threading.Event()
+SOVEREIGN_POLL_INTERVAL_S      = 30   # Poll SOVEREIGN inbox every 30 seconds
+SOVEREIGN_HEARTBEAT_INTERVAL_S = 300  # Push heartbeat every 5 minutes
+
+
+def _sovereign_comms_loop() -> None:
+    """
+    Daemon thread: polls SOVEREIGN inbox every 30s and pushes a heartbeat
+    every 5 minutes, independent of any pool cycle. Never raises.
+    """
+    last_heartbeat: float = 0.0
+    logger.info("SOVEREIGN comms loop started (poll=%ds heartbeat=%ds)",
+                SOVEREIGN_POLL_INTERVAL_S, SOVEREIGN_HEARTBEAT_INTERVAL_S)
+    while not _comms_stop.is_set():
+        now = time.monotonic()
+        try:
+            instructions = get_instructions("cipher")
+            if instructions:
+                logger.info("SOVEREIGN comms: %d directive(s) received", len(instructions))
+                for instr in instructions:
+                    _dispatch_sovereign_instruction(instr)
+            if now - last_heartbeat >= SOVEREIGN_HEARTBEAT_INTERVAL_S:
+                stats = get_stats(_settings.db_path) if _settings else {}
+                report("cipher", "AUTONOMOUS", {
+                    "event":              "heartbeat",
+                    "halted":             _sovereign_halted,
+                    "brain_failures":     _consecutive_brain_failures,
+                    "threshold_override": _score_threshold_override,
+                    "ts":                 datetime.utcnow().isoformat() + "Z",
+                    **stats,
+                })
+                last_heartbeat = now
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SOVEREIGN comms loop error: %s", exc)
+        _comms_stop.wait(SOVEREIGN_POLL_INTERVAL_S)
+    logger.info("SOVEREIGN comms loop stopped")
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -130,12 +171,21 @@ async def lifespan(app: FastAPI):
     init_db(_settings.db_path)
     logger.info("Cipher agent started on port %d", _settings.port)
     report("cipher", "status", {"event": "started", "port": _settings.port})
-    _instr = get_instructions("cipher")
-    if _instr:
-        logger.info("Cipher: %d instruction(s) from SOVEREIGN on startup", len(_instr))
-        for _i in _instr:
+    # Drain any queued directives accumulated before this startup
+    _startup_instr = get_instructions("cipher")
+    if _startup_instr:
+        logger.info("Cipher: %d instruction(s) from SOVEREIGN on startup", len(_startup_instr))
+        for _i in _startup_instr:
             _dispatch_sovereign_instruction(_i)
+
+    # Launch continuous comms loop (polls every 30s, heartbeat every 5min)
+    _comms_stop.clear()
+    threading.Thread(target=_sovereign_comms_loop, daemon=True, name="cipher-sovereign-comms").start()
+
     yield
+
+    _comms_stop.set()
+    report("cipher", "status", {"event": "stopped"})
     logger.info("Cipher agent shutting down")
 
 
@@ -253,7 +303,7 @@ def _analyze_pool(payload: dict) -> None:
                         _settings.telegram_chat_id,
                         _consecutive_brain_failures,
                     )
-                    report("cipher", "alert", {"event": "brain_down", "consecutive_failures": _consecutive_brain_failures})
+                    report("cipher", "alert", {"event": "brain_down", "consecutive_failures": _consecutive_brain_failures}, escalation=EscalationLevel.CRITICAL)
                     _consecutive_brain_failures = 0
                 continue
 
@@ -289,14 +339,14 @@ def _analyze_pool(payload: dict) -> None:
 
     except Exception as e:
         logger.error("_analyze_pool crashed for window %s at analyzed=%d: %s", window_id, analyzed, e)
-        report("cipher", "incident", {"event": "pool_crash", "window_id": window_id, "error": str(e)[:200]})
+        report("cipher", "incident", {"event": "pool_crash", "window_id": window_id, "error": str(e)[:200]}, escalation=EscalationLevel.CRITICAL)
     finally:
         complete_window(_settings.db_path, window_id, analyzed, submitted)
         logger.info(
             "Window %s complete — analyzed=%d submitted=%d",
             window_id, analyzed, submitted,
         )
-        report("cipher", "status", {"event": "window_complete", "window_id": window_id, "analyzed": analyzed, "submitted": submitted})
+        report("cipher", "status", {"event": "window_complete", "window_id": window_id, "analyzed": analyzed, "submitted": submitted}, escalation=EscalationLevel.INFO)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -366,6 +416,96 @@ async def stats(
     """Return aggregate session statistics. Auth required."""
     _check_auth(x_nexus_secret)
     return JSONResponse({"agent": AGENT_NAME, **get_stats(_settings.db_path)})
+
+
+# ── SOVEREIGN Push Endpoints ─────────────────────────────────────────────────
+
+class SovereignDirective(BaseModel):
+    directive: str
+    data: dict = {}
+    from_agent: str = "sovereign"
+
+
+@app.post("/sovereign/directive", status_code=200)
+async def sovereign_directive(
+    body: SovereignDirective,
+    x_nexus_secret: Optional[str] = Header(None, alias="X-Nexus-Secret"),
+) -> JSONResponse:
+    """
+    SOVEREIGN pushes a directive directly to this agent.
+    Executes immediately — zero polling lag.
+    Supported: HALT, RESUME, STATUS, SET_THRESHOLD, FLUSH, PING, RESET_DAY.
+    """
+    _check_auth(x_nexus_secret)
+    global _consecutive_brain_failures, _score_threshold_override, _sovereign_halted
+
+    d = body.directive.strip().upper()
+    logger.info("SOVEREIGN direct push: %s (from=%s)", d, body.from_agent)
+
+    if d == "PING":
+        report(AGENT_NAME, "ack", {"directive": "PING", "status": "alive", "agent": AGENT_NAME})
+        return JSONResponse({"ok": True, "directive": "PING", "status": "alive"})
+
+    elif d == "HALT":
+        _sovereign_halted = True
+        report(AGENT_NAME, "ack", {"directive": "HALT", "status": "applied", "halted": True})
+        return JSONResponse({"ok": True, "directive": "HALT", "halted": True})
+
+    elif d == "RESUME":
+        _sovereign_halted = False
+        report(AGENT_NAME, "ack", {"directive": "RESUME", "status": "applied", "halted": False})
+        return JSONResponse({"ok": True, "directive": "RESUME", "halted": False})
+
+    elif d == "FLUSH" or d == "RESET_DAY":
+        _consecutive_brain_failures = 0
+        report(AGENT_NAME, "ack", {"directive": d, "status": "applied"})
+        return JSONResponse({"ok": True, "directive": d, "brain_failures": 0})
+
+    elif d == "SET_THRESHOLD":
+        try:
+            val = float(body.data.get("value", ""))
+            _score_threshold_override = val
+            report(AGENT_NAME, "ack", {"directive": "SET_THRESHOLD", "value": val, "status": "applied"})
+            return JSONResponse({"ok": True, "directive": "SET_THRESHOLD", "threshold": val})
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "invalid value for SET_THRESHOLD"}, status_code=400)
+
+    elif d == "STATUS":
+        stats = get_stats(_settings.db_path) if _settings else {}
+        payload = {
+            "directive": "STATUS", "agent": AGENT_NAME,
+            "halted": _sovereign_halted,
+            "brain_failures": _consecutive_brain_failures,
+            "threshold_override": _score_threshold_override,
+            **stats,
+        }
+        report(AGENT_NAME, "status", payload)
+        return JSONResponse({"ok": True, **payload})
+
+    else:
+        report(AGENT_NAME, "ack", {"directive": d, "status": "unrecognized"})
+        return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+@app.get("/sovereign/status", status_code=200)
+async def sovereign_status(
+    x_nexus_secret: Optional[str] = Header(None, alias="X-Nexus-Secret"),
+) -> JSONResponse:
+    """
+    SOVEREIGN queries full agent state without sending a directive.
+    Returns comprehensive status for fleet_status() calls.
+    """
+    _check_auth(x_nexus_secret)
+    stats = get_stats(_settings.db_path) if _settings else {}
+    return JSONResponse({
+        "ok": True,
+        "agent": AGENT_NAME,
+        "halted": _sovereign_halted,
+        "brain_failures": _consecutive_brain_failures,
+        "threshold_override": _score_threshold_override,
+        "port": _settings.port if _settings else 9001,
+        **stats,
+    })
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────

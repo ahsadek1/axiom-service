@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import AsyncGenerator, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from shared.sovereign_comms import get_instructions, report
+from shared.sovereign_comms import EscalationLevel, get_instructions, report
 
 
 def _report_exec_event(
@@ -53,7 +53,7 @@ def _report_exec_event(
         payload["pathway"] = pathway
     if extra:
         payload.update(extra)
-    report("alpha_execution", "alert", payload)
+    report("alpha_execution", "alert", payload, escalation=EscalationLevel.CRITICAL)
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -342,21 +342,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.warning("SOVEREIGN DIRECTIVE: unrecognized '%s'", directive[:100])
             report("alpha_execution", "ack", {"directive": directive[:100], "status": "unrecognized"})
 
+    _alpha_exec_last_heartbeat = [0.0]   # mutable cell for closure
+
     def _poll_sovereign_instructions() -> None:
-        """Poll SOVEREIGN inbox every 60s for mid-session directives."""
+        """Poll SOVEREIGN inbox every 30s; push heartbeat every 5 minutes."""
         try:
             instr = get_instructions("alpha_execution")
             if instr:
                 logger.info("Alpha Execution: %d instruction(s) from SOVEREIGN", len(instr))
                 for _i in instr:
                     _dispatch_sovereign_instruction(_i)
+            import time as _time
+            now = _time.monotonic()
+            if now - _alpha_exec_last_heartbeat[0] >= 300:
+                with _state_lock:
+                    snap = {
+                        "event":         "heartbeat",
+                        "paused":        app_state.get("execution_paused", False),
+                        "auto_execute":  app_state.get("auto_execute", False),
+                        "trades_today":  app_state.get("trades_today", 0),
+                        "total_trades":  app_state.get("total_trades", 0),
+                        "ts":            __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                    }
+                report("alpha_execution", "AUTONOMOUS", snap)
+                _alpha_exec_last_heartbeat[0] = now
         except Exception as exc:  # noqa: BLE001
             logger.warning("Alpha Execution: SOVEREIGN poll error: %s", exc)
 
     from apscheduler.triggers.interval import IntervalTrigger
     scheduler.add_job(
         func             = _poll_sovereign_instructions,
-        trigger          = IntervalTrigger(seconds=60),
+        trigger          = IntervalTrigger(seconds=30),
         id               = "sovereign_poll",
         replace_existing = True,
     )
@@ -769,7 +785,7 @@ def execute(
                     "ticker": body.ticker,
                     "error":  order_error,
                     "reason": "first_execution_failure",
-                })
+                }, escalation=EscalationLevel.CRITICAL)
                 try:
                     import requests as _req
                     _req.post(
@@ -880,7 +896,7 @@ def execute(
         "position_id": position_id,
         "contracts":   contracts,
         "size_usd":    body.position_size_usd,
-    })
+    }, escalation=EscalationLevel.CRITICAL)
 
     # ── Telegram Notification ────────────────────────────────────────────────
     _send_entry_notification(
@@ -964,6 +980,79 @@ def resume_execution(x_nexus_secret: str = Header(default="")) -> JSONResponse:
         app_state["first_exec_failed"] = False
     logger.info("Alpha execution RESUMED (was_paused=%s)", was_paused)
     return JSONResponse({"resumed": True, "was_paused": was_paused})
+
+
+
+# ── SOVEREIGN Push Endpoints ──────────────────────────────────────────────────
+
+class _SovDirective(BaseModel):
+    directive: str
+    data: dict = {}
+    from_agent: str = "sovereign"
+
+
+@app.post("/sovereign/directive", status_code=200)
+def sovereign_directive(
+    body: _SovDirective,
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN pushes a directive. Zero polling lag."""
+    verify_secret(x_nexus_secret)
+    d = body.directive.strip().upper()
+    logger.info("SOVEREIGN direct push: %s", d)
+
+    if d == "PING":
+        report("alpha_execution", "ack", {"directive": "PING", "status": "alive"})
+        return JSONResponse({"ok": True, "directive": "PING", "status": "alive"})
+    elif d == "HALT":
+        with _state_lock:
+            app_state["execution_paused"] = True
+        report("alpha_execution", "ack", {"directive": "HALT", "status": "applied", "paused": True})
+        return JSONResponse({"ok": True, "directive": "HALT", "paused": True})
+    elif d == "RESUME":
+        with _state_lock:
+            app_state["execution_paused"] = False
+            app_state["first_exec_failed"] = False
+        report("alpha_execution", "ack", {"directive": "RESUME", "status": "applied", "paused": False})
+        return JSONResponse({"ok": True, "directive": "RESUME", "paused": False})
+    elif d in ("FLUSH", "RESET_DAY"):
+        with _state_lock:
+            app_state["trades_today"] = 0
+            app_state["first_exec_failed"] = False
+        report("alpha_execution", "ack", {"directive": d, "status": "applied"})
+        return JSONResponse({"ok": True, "directive": d})
+    elif d == "STATUS":
+        with _state_lock:
+            snap = {
+                "directive": "STATUS", "service": "alpha_execution",
+                "paused": app_state.get("execution_paused", False),
+                "auto_execute": app_state.get("auto_execute", False),
+                "trades_today": app_state.get("trades_today", 0),
+                "alpaca_reachable": app_state.get("alpaca_reachable"),
+            }
+        report("alpha_execution", "status", snap)
+        return JSONResponse({"ok": True, **snap})
+    else:
+        report("alpha_execution", "ack", {"directive": d, "status": "unrecognized"})
+        return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+@app.get("/sovereign/status", status_code=200)
+def sovereign_status(
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN queries full alpha-execution state on-demand."""
+    verify_secret(x_nexus_secret)
+    with _state_lock:
+        return JSONResponse({
+            "ok": True, "service": "alpha_execution",
+            "paused": app_state.get("execution_paused", False),
+            "auto_execute": app_state.get("auto_execute", False),
+            "trades_today": app_state.get("trades_today", 0),
+            "total_trades": app_state.get("total_trades", 0),
+            "alpaca_reachable": app_state.get("alpaca_reachable"),
+            "port": int(__import__("os").getenv("PORT", "8005")),
+        })
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
