@@ -1,10 +1,20 @@
 """
-sovereign_comms.py — Bidirectional SOVEREIGN Communication Module
+sovereign_comms.py — Bidirectional SOVEREIGN Communication Module v2.0
 
 Drop-in shared module for every agent on 192.168.1.141.
-Provides two methods:
-  - report()           : fire-and-forget push to SOVEREIGN via message bus
-  - get_instructions() : poll SOVEREIGN's outbox with watermark deduplication
+
+Public API:
+  - report()                : fire-and-forget push to SOVEREIGN (with EscalationLevel routing)
+  - get_instructions()      : poll SOVEREIGN's outbox with watermark deduplication
+  - dispatch_instruction()  : parse and execute a raw SOVEREIGN instruction dict
+  - start_polling_loop()    : launch background daemon thread that polls every N seconds
+
+Escalation levels (EscalationLevel):
+  CRITICAL     → SOVEREIGN immediate (bus, daemon thread)
+  INFO         → SOVEREIGN standard (bus, daemon thread)
+  EOD          → SQLite queue; flushed daily at 16:15 ET
+  AUTONOMOUS   → suppressed; no bus call, no thread (logged at DEBUG only)
+  AHMED_DIRECT → bypass SOVEREIGN; Telegram direct to Ahmed (daemon thread)
 
 All methods are safe to call at any time — they never raise.
 """
@@ -12,11 +22,13 @@ All methods are safe to call at any time — they never raise.
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -36,67 +48,186 @@ GENESIS_BOT_TOKEN: str = os.getenv(
 SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID: str = os.getenv(
     "SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID", "8573754783"
 )
-NEXUS_GROUP_CHAT_ID: str = os.getenv(
-    "NEXUS_GROUP_CHAT_ID", "-1003579956463"
+EOD_DB_PATH: str = os.getenv(
+    "NEXUS_EOD_DB_PATH", "/Users/ahmedsadek/nexus/data/eod_queue.db"
 )
+EOD_FLUSH_HOUR: int = 16
+EOD_FLUSH_MINUTE: int = 15
+POLL_INTERVAL_SECONDS: int = int(os.getenv("SOVEREIGN_POLL_INTERVAL", "60"))
 
-_EPOCH_TS: str = "1970-01-01T00:00:00+00:00"
 _RETRY_DELAYS: List[float] = [0.5, 1.0, 2.0]
 _HTTP_TIMEOUT: float = 3.0
 
 # ---------------------------------------------------------------------------
-# Escalation Matrix
-# ---------------------------------------------------------------------------
-# Keys are message_type values that trigger special routing.
-# bus_retries: how many POST attempts before giving up on the bus.
-# telegram_ahmed: DM Ahmed directly via bot.
-# telegram_group: Post to the NEXUS group chat.
-# bus: whether to attempt the message bus at all.
+# Escalation Level Constants
 # ---------------------------------------------------------------------------
 
-ESCALATION_MATRIX: Dict[str, Dict] = {
-    "CRITICAL": {
-        "bus": True,
-        "telegram_ahmed": True,
-        "telegram_group": True,
-        "bus_retries": 5,
-    },
-    "INFO": {
-        "bus": True,
-        "telegram_ahmed": False,
-        "telegram_group": False,
-        "bus_retries": 3,
-    },
-    "EOD": {
-        "bus": True,
-        "telegram_ahmed": True,
-        "telegram_group": True,
-        "bus_retries": 3,
-    },
-    "AUTONOMOUS": {
-        "bus": True,
-        "telegram_ahmed": False,
-        "telegram_group": False,
-        "bus_retries": 3,
-    },
-    "AHMED_DIRECT": {
-        "bus": False,
-        "telegram_ahmed": True,
-        "telegram_group": False,
-        "bus_retries": 0,
-    },
-}
+
+class EscalationLevel:
+    """
+    Five-tier escalation routing table.
+
+    CRITICAL     — SOVEREIGN immediate; process within 60 seconds.
+    INFO         — SOVEREIGN standard; next 60-second batch cycle.
+    EOD          — Daily batch; flushed at 16:15 ET via SQLite-backed queue.
+    AUTONOMOUS   — Suppressed; do not send, do not thread. Logged at DEBUG.
+    AHMED_DIRECT — Bypass SOVEREIGN; Telegram direct to Ahmed immediately.
+    """
+
+    CRITICAL: str = "critical"
+    INFO: str = "info"
+    EOD: str = "eod"
+    AUTONOMOUS: None = None          # type: ignore[assignment]
+    AHMED_DIRECT: str = "ahmed"
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# EOD SQLite Queue
+# ---------------------------------------------------------------------------
+
+_eod_db_lock = threading.Lock()
+_eod_flush_thread_started = False
+_eod_flush_thread_lock = threading.Lock()
+
+
+def _eod_db_connect() -> sqlite3.Connection:
+    """Open (and initialise if needed) the EOD SQLite queue database."""
+    Path(EOD_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(EOD_DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS eod_queue (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name  TEXT    NOT NULL,
+            message_type TEXT   NOT NULL,
+            payload     TEXT    NOT NULL,
+            queued_at   TEXT    NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _eod_enqueue(agent_name: str, message_type: str, payload: Any) -> None:
+    """Persist one EOD entry to SQLite. Never raises."""
+    try:
+        with _eod_db_lock:
+            conn = _eod_db_connect()
+            conn.execute(
+                "INSERT INTO eod_queue (agent_name, message_type, payload, queued_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    agent_name,
+                    message_type,
+                    _serialize_payload(payload),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("sovereign_comms: EOD enqueue failed: %s — message lost", exc)
+
+
+def _eod_flush_and_clear() -> List[Dict]:
+    """Read all queued EOD rows, delete them, return as list of dicts. Never raises."""
+    try:
+        with _eod_db_lock:
+            conn = _eod_db_connect()
+            rows = conn.execute(
+                "SELECT agent_name, message_type, payload, queued_at FROM eod_queue ORDER BY id"
+            ).fetchall()
+            conn.execute("DELETE FROM eod_queue")
+            conn.commit()
+            conn.close()
+        return [
+            {"agent": r[0], "message_type": r[1], "payload": r[2], "queued_at": r[3]}
+            for r in rows
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("sovereign_comms: EOD flush failed: %s", exc)
+        return []
+
+
+def _eod_flush_worker() -> None:
+    """
+    Background daemon thread.
+    Sleeps until 16:15 ET each day, flushes EOD queue to SOVEREIGN bus.
+    Loops forever (one flush per calendar day).
+    """
+    import pytz  # soft import — already required by every nexus service
+
+    ET = pytz.timezone("America/New_York")
+
+    while True:
+        try:
+            now = datetime.now(ET)
+            flush_today = now.replace(
+                hour=EOD_FLUSH_HOUR, minute=EOD_FLUSH_MINUTE,
+                second=0, microsecond=0,
+            )
+            if now >= flush_today:
+                # Already past today's flush — sleep until tomorrow's
+                from datetime import timedelta
+                flush_today = flush_today + timedelta(days=1)
+            sleep_seconds = (flush_today - now).total_seconds()
+            logger.debug(
+                "sovereign_comms: EOD flush scheduled in %.0f seconds", sleep_seconds
+            )
+            time.sleep(max(sleep_seconds, 1))
+
+            entries = _eod_flush_and_clear()
+            if not entries:
+                logger.info("sovereign_comms: EOD flush — queue empty, nothing to send")
+                continue
+
+            body = {
+                "from": "sovereign_comms_eod",
+                "to": "sovereign",
+                "message": f"eod_summary: {json.dumps(entries)}",
+            }
+            url = f"{SOVEREIGN_BUS_URL}/send"
+            try:
+                resp = requests.post(url, json=body, timeout=_HTTP_TIMEOUT)
+                if resp.status_code < 300:
+                    logger.info(
+                        "sovereign_comms: EOD flush sent — %d entries", len(entries)
+                    )
+                else:
+                    logger.warning(
+                        "sovereign_comms: EOD flush HTTP %d — entries may be lost",
+                        resp.status_code,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("sovereign_comms: EOD flush bus POST failed: %s", exc)
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "sovereign_comms: EOD flush thread crash: %s — will retry next cycle", exc
+            )
+            time.sleep(60)
+
+
+def _ensure_eod_flush_thread() -> None:
+    """Start the EOD flush daemon thread exactly once per process."""
+    global _eod_flush_thread_started
+    with _eod_flush_thread_lock:
+        if _eod_flush_thread_started:
+            return
+        t = threading.Thread(target=_eod_flush_worker, daemon=True, name="sovereign-eod-flush")
+        t.start()
+        _eod_flush_thread_started = True
+        logger.info("sovereign_comms: EOD flush thread started (flushes at %02d:%02d ET)",
+                    EOD_FLUSH_HOUR, EOD_FLUSH_MINUTE)
+
+
+# ---------------------------------------------------------------------------
+# Serialisation helper
 # ---------------------------------------------------------------------------
 
 
 def _serialize_payload(payload: Any) -> str:
     """
-    Attempt JSON serialisation of payload.
-    Falls back to str() on any TypeError.
+    JSON-serialise payload. Falls back to str() on failure.
 
     :param payload: Arbitrary value to serialise.
     :return: JSON string or str() representation.
@@ -105,160 +236,129 @@ def _serialize_payload(payload: Any) -> str:
         return json.dumps(payload)
     except (TypeError, ValueError) as exc:
         logger.error(
-            "sovereign_comms: payload not JSON-serialisable (%s) — "
-            "falling back to str()",
-            exc,
+            "sovereign_comms: payload not JSON-serialisable (%s) — falling back to str()", exc
         )
         return str(payload)
 
 
-def _post_to_bus(agent_name: str, message_type: str, payload: Any, max_retries: int = 3) -> bool:
+# ---------------------------------------------------------------------------
+# Bus / Telegram delivery helpers
+# ---------------------------------------------------------------------------
+
+
+def _post_to_bus(
+    agent_name: str,
+    message_type: str,
+    payload: Any,
+    escalation: Optional[str] = EscalationLevel.INFO,
+) -> bool:
     """
-    Attempt to POST a message to the SOVEREIGN bus with configurable retries.
+    POST a message to the SOVEREIGN bus with up to 3 retries.
 
     :param agent_name: Sending agent name.
-    :param message_type: Category string (e.g. "alert", "status").
-    :param payload: Message body (dict or str).
-    :param max_retries: Maximum number of POST attempts (default 3).
-    :return: True if the POST succeeded, False after all retries exhausted.
+    :param message_type: Category string.
+    :param payload: Message body.
+    :param escalation: Escalation level string (included in message body).
+    :return: True on success, False after all retries exhausted.
     """
     body = {
         "from": agent_name,
         "to": "sovereign",
         "message": f"{message_type}: {_serialize_payload(payload)}",
+        "escalation": escalation or "info",
     }
     url = f"{SOVEREIGN_BUS_URL}/send"
-    delays = [0.5, 1.0, 2.0, 4.0, 8.0][:max_retries]
 
-    for attempt, delay in enumerate(delays, start=1):
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
         try:
             resp = requests.post(url, json=body, timeout=_HTTP_TIMEOUT)
             if resp.status_code < 300:
                 return True
             logger.warning(
                 "sovereign_comms: bus POST attempt %d returned HTTP %d",
-                attempt,
-                resp.status_code,
+                attempt, resp.status_code,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "sovereign_comms: bus POST attempt %d failed: %s",
-                attempt,
-                exc,
-            )
-        if attempt < len(delays):
+            logger.warning("sovereign_comms: bus POST attempt %d failed: %s", attempt, exc)
+        if attempt < len(_RETRY_DELAYS):
             time.sleep(delay)
 
     return False
 
 
-def _post_telegram(chat_id: str, text: str) -> bool:
+def _post_telegram_direct(
+    agent_name: str,
+    message_type: str,
+    payload: Any,
+    prefix: str = "[DIRECT]",
+) -> bool:
     """
-    Send a Telegram message to the given chat_id via the GENESIS bot.
-
-    :param chat_id: Telegram chat ID (user or group).
-    :param text: Message text.
-    :return: True on success, False on failure.
-    """
-    url = f"https://api.telegram.org/bot{GENESIS_BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(
-            url,
-            json={"chat_id": chat_id, "text": text},
-            timeout=_HTTP_TIMEOUT,
-        )
-        return resp.status_code < 300
-    except Exception as exc:  # noqa: BLE001
-        logger.error("sovereign_comms: Telegram send to %s failed: %s", chat_id, exc)
-        return False
-
-
-def _post_telegram_fallback(agent_name: str, message_type: str, payload: Any) -> bool:
-    """
-    Send a Telegram message to Ahmed as a last-resort fallback.
+    Post directly to Ahmed's Telegram. Used for AHMED_DIRECT and bus fallback.
 
     :param agent_name: Sending agent name.
     :param message_type: Category string.
     :param payload: Message body.
+    :param prefix: Message prefix tag.
     :return: True on success, False on failure.
     """
     text = (
-        f"[SOVEREIGN BUS DOWN] {agent_name.upper()} → {message_type}: "
+        f"{prefix} {agent_name.upper()} → {message_type}: "
         f"{_serialize_payload(payload)}"
     )
-    return _post_telegram(SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID, text)
+    url = f"https://api.telegram.org/bot{GENESIS_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={"chat_id": SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID, "text": text},
+            timeout=_HTTP_TIMEOUT,
+        )
+        return resp.status_code < 300
+    except Exception as exc:  # noqa: BLE001
+        logger.error("sovereign_comms: Telegram direct failed: %s", exc)
+        return False
 
 
-def _report_worker(agent_name: str, message_type: str, payload: Any) -> None:
+def _report_worker(
+    agent_name: str,
+    message_type: str,
+    payload: Any,
+    escalation: Optional[str],
+) -> None:
     """
     Daemon-thread worker for report().
-    Routes via escalation matrix when message_type matches a known tier.
-    Falls back to standard bus+Telegram path for unknown types.
 
-    :param agent_name: Sending agent name.
-    :param message_type: Category string or escalation tier.
-    :param payload: Message body.
+    Routes:
+      AHMED_DIRECT → Telegram direct (no bus)
+      CRITICAL/INFO → bus with retry; fallback to Telegram on bus failure
     """
     try:
-        matrix = ESCALATION_MATRIX.get(message_type.upper())
-        serialized = _serialize_payload(payload)
-
-        if matrix is not None:
-            # ── Escalation-matrix routing ──────────────────────────────────
-            bus_ok = False
-            if matrix["bus"]:
-                bus_ok = _post_to_bus(
-                    agent_name, message_type, payload,
-                    max_retries=matrix["bus_retries"],
-                )
-                if not bus_ok:
-                    logger.warning(
-                        "sovereign_comms: bus failed for %s/%s after %d retries",
-                        agent_name, message_type, matrix["bus_retries"],
-                    )
-
-            if matrix["telegram_ahmed"]:
-                prefix = "" if bus_ok else "[BUS DOWN] "
-                ahmed_text = (
-                    f"{prefix}[{message_type}] {agent_name.upper()}: {serialized}"
-                )
-                _post_telegram(SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID, ahmed_text)
-
-            if matrix["telegram_group"]:
-                group_text = (
-                    f"🔔 [{message_type}] {agent_name.upper()}: {serialized}"
-                )
-                _post_telegram(NEXUS_GROUP_CHAT_ID, group_text)
-
-            if not matrix["bus"] and not matrix["telegram_ahmed"] and not matrix["telegram_group"]:
+        if escalation == EscalationLevel.AHMED_DIRECT:
+            if not _post_telegram_direct(agent_name, message_type, payload, prefix="[DIRECT]"):
                 logger.error(
-                    "sovereign_comms: escalation matrix entry for %s has no delivery path — "
-                    "message discarded",
-                    message_type,
+                    "sovereign_comms: AHMED_DIRECT delivery failed for %s/%s — message lost",
+                    agent_name, message_type,
                 )
-        else:
-            # ── Standard routing (bus + Telegram fallback) ─────────────────
-            if _post_to_bus(agent_name, message_type, payload):
-                return
+            return
 
-            logger.warning(
-                "sovereign_comms: bus unreachable after 3 retries — "
-                "attempting Telegram fallback"
-            )
-            if _post_telegram_fallback(agent_name, message_type, payload):
-                return
+        # CRITICAL or INFO → bus first
+        if _post_to_bus(agent_name, message_type, payload, escalation):
+            return
 
-            logger.error(
-                "sovereign_comms: all delivery paths failed for %s/%s — "
-                "message discarded",
-                agent_name,
-                message_type,
-            )
+        logger.warning(
+            "sovereign_comms: bus unreachable after 3 retries — attempting Telegram fallback"
+        )
+        if _post_telegram_direct(
+            agent_name, message_type, payload, prefix="[SOVEREIGN BUS DOWN]"
+        ):
+            return
+
+        logger.error(
+            "sovereign_comms: all delivery paths failed for %s/%s — message discarded",
+            agent_name, message_type,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error(
-            "sovereign_comms: unhandled exception in report worker: %s — "
-            "message discarded",
-            exc,
+            "sovereign_comms: unhandled exception in report worker: %s — message discarded", exc
         )
 
 
@@ -268,25 +368,12 @@ def _report_worker(agent_name: str, message_type: str, payload: Any) -> None:
 
 
 def _watermark_path(agent_name: str) -> Path:
-    """
-    Resolve watermark file path for an agent.
-
-    :param agent_name: Agent name (e.g. "cipher").
-    :return: Path object for the watermark file.
-    """
     env_key = f"NEXUS_{agent_name.upper()}_DIR"
     workdir = os.getenv(env_key, f"/Users/ahmedsadek/nexus/{agent_name}/")
     return Path(workdir) / ".sovereign_watermark"
 
 
 def _read_watermark(path: Path) -> datetime:
-    """
-    Read watermark timestamp from file.
-    Returns epoch on missing or corrupt file.
-
-    :param path: Path to watermark file.
-    :return: datetime with UTC timezone.
-    """
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     if not path.exists():
         return epoch
@@ -298,21 +385,12 @@ def _read_watermark(path: Path) -> datetime:
         return dt
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "sovereign_comms: corrupt watermark at %s (%s) — resetting to epoch",
-            path,
-            exc,
+            "sovereign_comms: corrupt watermark at %s (%s) — resetting to epoch", path, exc
         )
         return epoch
 
 
 def _write_watermark(path: Path, ts: datetime) -> None:
-    """
-    Write watermark timestamp to file.
-    Logs a warning and continues if the file is unwritable.
-
-    :param path: Path to watermark file.
-    :param ts: Timestamp to persist.
-    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(ts.isoformat())
@@ -320,18 +398,11 @@ def _write_watermark(path: Path, ts: datetime) -> None:
         logger.warning(
             "sovereign_comms: cannot write watermark to %s (%s) — "
             "watermark held in memory only",
-            path,
-            exc,
+            path, exc,
         )
 
 
 def _parse_ts(ts_str: str) -> Optional[datetime]:
-    """
-    Parse an ISO-8601 timestamp string into a timezone-aware datetime.
-
-    :param ts_str: Timestamp string.
-    :return: datetime or None on parse failure.
-    """
     try:
         dt = datetime.fromisoformat(ts_str)
         if dt.tzinfo is None:
@@ -342,26 +413,199 @@ def _parse_ts(ts_str: str) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
+# Instruction dispatch
+# ---------------------------------------------------------------------------
+
+# Registry of directive handlers: directive_name → callable(instr_dict) → None
+# Agents can register their own handlers via register_directive_handler().
+_directive_handlers: Dict[str, Callable[[Dict], None]] = {}
+_directive_handlers_lock = threading.Lock()
+
+# Built-in no-op directives that every agent honours silently
+_NOOP_DIRECTIVES = frozenset({"PING", "NOP", "HEARTBEAT"})
+
+
+def register_directive_handler(directive: str, handler: Callable[[Dict], None]) -> None:
+    """
+    Register a handler for a named SOVEREIGN directive.
+
+    Directive names are case-insensitive. The handler receives the full
+    instruction dict: {"id", "from", "message", "timestamp"}.
+
+    :param directive: Directive name (e.g. "HALT", "RESUME", "STATUS").
+    :param handler:   Callable that executes the directive. Must never raise.
+    """
+    with _directive_handlers_lock:
+        _directive_handlers[directive.upper()] = handler
+    logger.debug("sovereign_comms: registered handler for directive '%s'", directive.upper())
+
+
+def dispatch_instruction(instr: Dict) -> None:
+    """
+    Parse and execute one SOVEREIGN instruction dict.
+
+    Instruction message format: "DIRECTIVE" or "DIRECTIVE: <json_or_text>"
+    Dispatches to a registered handler if available.
+    Logs unrecognised directives at WARNING — never raises.
+
+    :param instr: Instruction dict with keys: id, from, message, timestamp.
+    """
+    try:
+        raw = instr.get("message", "").strip()
+        if ":" in raw:
+            directive, _, args_raw = raw.partition(":")
+            directive = directive.strip().upper()
+            args_raw = args_raw.strip()
+            try:
+                args = json.loads(args_raw)
+            except (json.JSONDecodeError, ValueError):
+                args = args_raw
+        else:
+            directive = raw.upper()
+            args = {}
+
+        if directive in _NOOP_DIRECTIVES:
+            logger.debug("sovereign_comms: NOOP directive '%s' — acknowledged", directive)
+            return
+
+        with _directive_handlers_lock:
+            handler = _directive_handlers.get(directive)
+
+        if handler:
+            logger.info("sovereign_comms: dispatching directive '%s'", directive)
+            handler(instr)
+        else:
+            logger.warning(
+                "sovereign_comms: unrecognised directive '%s' (id=%s) — no handler registered",
+                directive, instr.get("id", "?"),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "sovereign_comms: dispatch_instruction crashed for instr=%s: %s", instr, exc
+        )
+
+
+# ---------------------------------------------------------------------------
+# Background polling loop
+# ---------------------------------------------------------------------------
+
+_polling_threads: Dict[str, threading.Thread] = {}
+_polling_threads_lock = threading.Lock()
+
+
+def start_polling_loop(
+    agent_name: str,
+    interval_seconds: int = POLL_INTERVAL_SECONDS,
+    on_instruction: Optional[Callable[[Dict], None]] = None,
+) -> None:
+    """
+    Launch a background daemon thread that polls SOVEREIGN every interval_seconds.
+
+    Safe to call multiple times — only one thread is ever started per agent_name.
+    Instructions are dispatched via dispatch_instruction() (registered handlers)
+    and optionally also passed to on_instruction() callback.
+
+    :param agent_name:        Agent name — used for inbox polling.
+    :param interval_seconds:  Poll interval in seconds (default: 60).
+    :param on_instruction:    Optional callback called for each new instruction.
+    """
+    with _polling_threads_lock:
+        if agent_name in _polling_threads and _polling_threads[agent_name].is_alive():
+            logger.debug(
+                "sovereign_comms: polling loop already running for '%s'", agent_name
+            )
+            return
+
+        def _loop() -> None:
+            logger.info(
+                "sovereign_comms: polling loop started for '%s' (interval=%ds)",
+                agent_name, interval_seconds,
+            )
+            while True:
+                try:
+                    instructions = get_instructions(agent_name)
+                    if instructions:
+                        logger.info(
+                            "sovereign_comms: %d instruction(s) from SOVEREIGN for '%s'",
+                            len(instructions), agent_name,
+                        )
+                        for instr in instructions:
+                            dispatch_instruction(instr)
+                            if on_instruction:
+                                try:
+                                    on_instruction(instr)
+                                except Exception as cb_exc:  # noqa: BLE001
+                                    logger.error(
+                                        "sovereign_comms: on_instruction callback error: %s",
+                                        cb_exc,
+                                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "sovereign_comms: polling loop error for '%s': %s", agent_name, exc
+                    )
+                time.sleep(interval_seconds)
+
+        t = threading.Thread(
+            target=_loop,
+            daemon=True,
+            name=f"sovereign-poll-{agent_name}",
+        )
+        t.start()
+        _polling_threads[agent_name] = t
+        logger.info(
+            "sovereign_comms: polling loop thread launched for '%s'", agent_name
+        )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
-def report(agent_name: str, message_type: str, payload: Dict[str, Any]) -> None:
+def report(
+    agent_name: str,
+    message_type: str,
+    payload: Dict[str, Any],
+    escalation: Optional[str] = EscalationLevel.INFO,
+) -> None:
     """
-    Fire-and-forget push to SOVEREIGN via the local message bus.
+    Fire-and-forget push to SOVEREIGN with escalation-level routing.
 
-    Spawns a daemon thread so the caller is never blocked.
-    Retries up to 3 times on bus failure, then falls back to Telegram.
+    Escalation routing:
+      AUTONOMOUS (None) → returns immediately, no thread, no bus call.
+                          Logged at DEBUG: "considered and suppressed".
+      EOD               → enqueued in SQLite; flushed at 16:15 ET daily.
+      AHMED_DIRECT      → Telegram direct to Ahmed, bypasses SOVEREIGN bus.
+      CRITICAL / INFO   → daemon thread → bus (3 retries) → Telegram fallback.
+
     Never raises under any circumstances.
 
-    :param agent_name: Sending agent name (e.g. "cipher", "atlas").
+    :param agent_name:   Sending agent name (e.g. "cipher", "atlas").
     :param message_type: Message category (e.g. "alert", "status", "escalation").
-    :param payload: Arbitrary JSON-serialisable dict. Non-serialisable values
-                    are converted to str() before sending.
+    :param payload:      Arbitrary JSON-serialisable dict.
+    :param escalation:   EscalationLevel constant. Default: INFO.
     """
+    # AUTONOMOUS — considered and suppressed
+    if escalation is EscalationLevel.AUTONOMOUS:
+        logger.debug(
+            "sovereign_comms: AUTONOMOUS suppression — %s/%s not sent (by design)",
+            agent_name, message_type,
+        )
+        return
+
+    # EOD — SQLite queue
+    if escalation == EscalationLevel.EOD:
+        _eod_enqueue(agent_name, message_type, payload)
+        _ensure_eod_flush_thread()
+        logger.debug(
+            "sovereign_comms: EOD enqueued — %s/%s", agent_name, message_type
+        )
+        return
+
+    # CRITICAL, INFO, AHMED_DIRECT — daemon thread
     t = threading.Thread(
         target=_report_worker,
-        args=(agent_name, message_type, payload),
+        args=(agent_name, message_type, payload, escalation),
         daemon=True,
     )
     t.start()
@@ -371,13 +615,10 @@ def get_instructions(agent_name: str) -> List[Dict[str, str]]:
     """
     Poll SOVEREIGN's outbox for new instructions, deduplicated via watermark.
 
-    Reads GET {bus}/inbox/{agent_name}, filters messages newer than the last
-    processed timestamp, updates the watermark, and returns the new messages.
-
     Never raises under any circumstances.
 
     :param agent_name: Agent polling its own inbox (e.g. "cipher").
-    :return: List of unprocessed instruction dicts, each containing:
+    :return: List of unprocessed instruction dicts:
              {"id": str, "from": str, "message": str, "timestamp": str}.
              Returns [] on any failure.
     """
@@ -390,18 +631,13 @@ def get_instructions(agent_name: str) -> List[Dict[str, str]]:
         if resp.status_code >= 300:
             logger.warning(
                 "sovereign_comms: GET inbox returned HTTP %d for agent %s",
-                resp.status_code,
-                agent_name,
+                resp.status_code, agent_name,
             )
             return []
         data = resp.json()
         messages: List[Dict] = data.get("messages", [])
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "sovereign_comms: get_instructions failed for %s: %s",
-            agent_name,
-            exc,
-        )
+        logger.warning("sovereign_comms: get_instructions failed for %s: %s", agent_name, exc)
         return []
 
     new_messages: List[Dict[str, str]] = []
@@ -411,15 +647,13 @@ def get_instructions(agent_name: str) -> List[Dict[str, str]]:
         ts_raw = msg.get("timestamp")
         if ts_raw is None:
             logger.warning(
-                "sovereign_comms: skipping malformed message (no timestamp): %s",
-                msg,
+                "sovereign_comms: skipping malformed message (no timestamp): %s", msg
             )
             continue
         ts = _parse_ts(ts_raw)
         if ts is None:
             logger.warning(
-                "sovereign_comms: skipping message with unparseable timestamp: %s",
-                ts_raw,
+                "sovereign_comms: skipping message with unparseable timestamp: %s", ts_raw
             )
             continue
         if ts > watermark:
