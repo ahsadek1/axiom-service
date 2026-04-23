@@ -11,10 +11,49 @@ Port: 8005 (local), $PORT (Railway).
 import logging
 import os
 import secrets
+import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncGenerator, Optional
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from shared.sovereign_comms import get_instructions, report
+
+
+def _report_exec_event(
+    event: str,
+    ticker: str,
+    direction: str,
+    reason: str,
+    pathway: str = "",
+    extra: Optional[dict] = None,
+) -> None:
+    """
+    Fire-and-forget execution event to SOVEREIGN bus.
+
+    Used for every execution attempt outcome — success, error, or rejection.
+    Never raises.
+
+    Args:
+        event:     Event type: 'execution_error', 'execution_rejected', 'trade_placed'.
+        ticker:    Ticker symbol.
+        direction: 'bullish' or 'bearish'.
+        reason:    Human-readable outcome description.
+        pathway:   Concordance pathway (P1/P2/P3/P4) — optional.
+        extra:     Additional key/value pairs to include in the payload.
+    """
+    payload: dict = {
+        "event":     event,
+        "ticker":    ticker,
+        "direction": direction,
+        "reason":    reason,
+    }
+    if pathway:
+        payload["pathway"] = pathway
+    if extra:
+        payload.update(extra)
+    report("alpha_execution", "alert", payload)
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -24,13 +63,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
 from alpaca_client import AlpacaClient
+from config import ALPACA_PAPER_URL
 from buffer_reporter import BufferReporter
 from config import (
+    EARNINGS_BLOCK_DAYS,
     MAX_CONCURRENT_POSITIONS,
     MAX_NEW_PER_DAY,
+    TARGET_DTE,
+    VIX_BRAKE_ELEVATED,
+    VIX_BRAKE_FULL,
     load_settings,
 )
-from contract_resolver import resolve_spread
+from contract_resolver import resolve_spread, resolve_available_contract
 from database import (
     cancel_pending_position,
     confirm_pending_position,
@@ -53,11 +97,25 @@ ET       = pytz.timezone("America/New_York")
 settings = load_settings()
 
 app_state: dict = {
-    "settings":      settings,
-    "start_time":    datetime.now(ET).isoformat(),
-    "trades_today":  0,
-    "total_trades":  0,
+    "settings":            settings,
+    "start_time":          datetime.now(ET).isoformat(),
+    "trades_today":        0,
+    "total_trades":        0,
+    "execution_paused":    False,
+    "first_exec_failed":   False,
+    "alpaca_reachable":    None,  # None=unchecked, True=ok, False=unreachable
+    "auto_execute":  os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true",
+    "mode":          "live" if os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true" else "dry_run",
+    # Exit monitor state (S10 fix)
+    "exit_monitor_last_run_at":     None,
+    "exit_monitor_last_event_count": 0,
+    "exit_monitor_last_error":      None,
+    "exit_monitor_run_count":       0,
 }
+if not app_state["auto_execute"]:
+    logger.warning("NEXUS_AUTO_EXECUTE=false — running in DRY_RUN mode. No Alpaca orders will be placed.")
+else:
+    logger.warning("NEXUS_AUTO_EXECUTE=true — LIVE TRADING MODE. Orders will be submitted to Alpaca.")
 # Thread-safe lock for position-limit checks + app_state mutations
 _execute_lock = threading.Lock()
 _state_lock   = threading.Lock()  # OMNI M-NEW-3: guards app_state counter mutations
@@ -81,6 +139,119 @@ def _get_reporter() -> BufferReporter:
     return BufferReporter(settings.alpha_buffer_url, settings.nexus_webhook_secret)
 
 
+def _get_current_vix() -> Optional[float]:
+    """
+    Fetch current VIX from Axiom's /health endpoint.
+    Returns None if Axiom is unreachable or VIX is unavailable.
+    Non-blocking — fails gracefully.
+    """
+    try:
+        import requests as _req
+        resp = _req.get(
+            f"{settings.axiom_url}/health",
+            headers={"X-Axiom-Secret": settings.axiom_secret},
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            vix = resp.json().get("vix")
+            return float(vix) if vix is not None else None
+    except Exception as e:
+        logger.warning("VIX fetch from Axiom failed: %s", e)
+    return None
+
+
+def _check_vix_brake(vix: Optional[float], direction: str) -> Optional[str]:
+    """
+    Check VIX brake gates.
+
+    Returns:
+        None if trade is allowed.
+        Rejection reason string if trade should be blocked.
+    """
+    if vix is None:
+        return None   # Can't check — allow trade with warning logged
+
+    if vix >= VIX_BRAKE_FULL:
+        return f"VIX FULL BRAKE: VIX={vix:.1f} ≥ {VIX_BRAKE_FULL} — ALL new positions blocked"
+
+    if vix >= VIX_BRAKE_ELEVATED:
+        # Debit positions blocked at elevated VIX; credit spreads may continue
+        # Alpha trades credit spreads — allow. Flag in response.
+        logger.info("VIX ELEVATED (%.1f) — credit spreads allowed, debit positions blocked", vix)
+        return None   # Credit spreads are fine at elevated VIX
+
+    return None
+
+
+def _check_earnings_gate(ticker: str, expiration_date: str, polygon_key: str) -> Optional[str]:
+    """
+    Check if ticker has earnings within DTE + EARNINGS_BLOCK_DAYS days.
+
+    Uses Polygon.io earnings calendar. Returns rejection reason or None if clear.
+
+    Args:
+        ticker:          Stock ticker symbol.
+        expiration_date: Options expiry date 'YYYY-MM-DD'.
+        polygon_key:     Polygon API key. If empty, gate is skipped with warning.
+
+    Returns:
+        None if clear to trade.
+        Rejection reason string if earnings gate fires.
+    """
+    if not polygon_key:
+        logger.warning("EARNINGS GATE: No Polygon API key — gate skipped for %s", ticker)
+        return None
+
+    try:
+        import requests as _req
+        from datetime import date as _date, timedelta as _td
+
+        today = _date.today()
+        expiry = _date.fromisoformat(expiration_date)
+        block_until = expiry + _td(days=EARNINGS_BLOCK_DAYS)
+
+        # Polygon earnings calendar endpoint
+        url = (
+            f"https://api.polygon.io/v2/reference/financials/{ticker}"
+            f"?limit=4&type=Q&apiKey={polygon_key}"
+        )
+        resp = _req.get(url, timeout=8)
+        if resp.status_code != 200:
+            # Fallback: try the newer earnings endpoint
+            url2 = (
+                f"https://api.polygon.io/v3/reference/tickers/{ticker}"
+                f"?apiKey={polygon_key}"
+            )
+            resp2 = _req.get(url2, timeout=5)
+            if resp2.status_code != 200:
+                logger.warning("EARNINGS GATE: Polygon returned %d for %s — gate skipped", resp.status_code, ticker)
+                return None
+            # Can't get earnings from ticker endpoint alone — skip
+            return None
+
+        data = resp.json()
+        results = data.get("results", [])
+        for record in results:
+            # Next earnings date field
+            report_date_str = record.get("reportDate") or record.get("report_date")
+            if not report_date_str:
+                continue
+            try:
+                report_date = _date.fromisoformat(report_date_str[:10])
+            except ValueError:
+                continue
+            if today <= report_date <= block_until:
+                return (
+                    f"EARNINGS GATE: {ticker} has earnings on {report_date_str} "
+                    f"which is within {EARNINGS_BLOCK_DAYS} days of expiry {expiration_date}"
+                )
+
+    except Exception as e:
+        logger.warning("EARNINGS GATE: Check failed for %s: %s — gate skipped", ticker, e)
+
+    return None
+
+
 def _is_market_hours() -> bool:
     """Return True if within market hours (9:30 AM – 4:00 PM ET, weekdays)."""
     now = datetime.now(ET)
@@ -94,7 +265,28 @@ def _is_market_hours() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB and start exit monitor scheduler."""
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from shared.db_guard import assert_unique_db_path  # S4: collision guard
+    assert_unique_db_path("alpha-execution", settings.alpha_db_path)
     logger.info("Alpha Execution starting...")
+    # G9 SYS-2: Auth registry validation
+    from shared.auth_registry import validate_service_auth_config, AuthConfigError
+    try:
+        validate_service_auth_config("alpha-execution")
+        logger.info("Auth registry validation passed for alpha-execution")
+    except AuthConfigError as e:
+        logger.critical("Auth config invalid: %s", e)
+    # G11 SYS-4: Validate Alpaca API key at startup
+    from shared.api_key_validator import ApiKeyValidator
+    _validator = ApiKeyValidator()
+    _alpaca_result = _validator.validate_alpaca(
+        settings.alpaca_api_key, settings.alpaca_secret_key, ALPACA_PAPER_URL
+    )
+    if _alpaca_result.status == "failed":
+        logger.critical("API key probe: alpaca → FAILED (%s)", _alpaca_result.message)
+    else:
+        logger.info("API key probe: alpaca → %s (%s)", _alpaca_result.status, _alpaca_result.message)
     init_db(settings.alpha_db_path)
 
     # OMNI H-NEW-1 fix: start AILS outcome retry worker
@@ -111,18 +303,83 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         id      = "exit_monitor",
         replace_existing=True,
     )
+
+    def _dispatch_sovereign_instruction(instr: dict) -> None:
+        """Execute a SOVEREIGN instruction. Supported: HALT, RESUME, STATUS, FLUSH."""
+        raw = instr.get("message", "").strip()
+        directive = raw.split(":", 1)[0].strip().upper() if ":" in raw else raw.upper()
+        logger.info("SOVEREIGN directive received — raw: %s", raw[:200])
+
+        if directive == "HALT":
+            with _state_lock:
+                app_state["execution_paused"] = True
+            logger.warning("SOVEREIGN DIRECTIVE: HALT — execution engine paused")
+            report("alpha_execution", "ack", {"directive": "HALT", "status": "applied", "paused": True})
+        elif directive == "RESUME":
+            with _state_lock:
+                app_state["execution_paused"] = False
+            logger.info("SOVEREIGN DIRECTIVE: RESUME — execution engine resumed")
+            report("alpha_execution", "ack", {"directive": "RESUME", "status": "applied", "paused": False})
+        elif directive == "STATUS":
+            with _state_lock:
+                snap = {
+                    "directive": "STATUS",
+                    "paused": app_state.get("execution_paused", False),
+                    "auto_execute": app_state.get("auto_execute", False),
+                    "trades_today": app_state.get("trades_today", 0),
+                    "total_trades": app_state.get("total_trades", 0),
+                    "alpaca_reachable": app_state.get("alpaca_reachable"),
+                }
+            report("alpha_execution", "status", snap)
+            logger.info("SOVEREIGN DIRECTIVE: STATUS — reported back")
+        elif directive == "FLUSH":
+            with _state_lock:
+                app_state["trades_today"] = 0
+                app_state["first_exec_failed"] = False
+            logger.info("SOVEREIGN DIRECTIVE: FLUSH — daily trade counter reset")
+            report("alpha_execution", "ack", {"directive": "FLUSH", "status": "applied"})
+        else:
+            logger.warning("SOVEREIGN DIRECTIVE: unrecognized '%s'", directive[:100])
+            report("alpha_execution", "ack", {"directive": directive[:100], "status": "unrecognized"})
+
+    def _poll_sovereign_instructions() -> None:
+        """Poll SOVEREIGN inbox every 60s for mid-session directives."""
+        try:
+            instr = get_instructions("alpha_execution")
+            if instr:
+                logger.info("Alpha Execution: %d instruction(s) from SOVEREIGN", len(instr))
+                for _i in instr:
+                    _dispatch_sovereign_instruction(_i)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Alpha Execution: SOVEREIGN poll error: %s", exc)
+
+    from apscheduler.triggers.interval import IntervalTrigger
+    scheduler.add_job(
+        func             = _poll_sovereign_instructions,
+        trigger          = IntervalTrigger(seconds=60),
+        id               = "sovereign_poll",
+        replace_existing = True,
+    )
     scheduler.start()
     app_state["scheduler"] = scheduler
     logger.info("Alpha Execution ready")
+    report("alpha_execution", "status", {"event": "started", "auto_execute": os.getenv("NEXUS_AUTO_EXECUTE", "false")})
+    _instr = get_instructions("alpha_execution")
+    if _instr:
+        logger.info("Alpha Execution: %d instruction(s) from SOVEREIGN on startup", len(_instr))
+        for _i in _instr:
+            _dispatch_sovereign_instruction(_i)
     yield
     scheduler.shutdown(wait=False)
     logger.info("Alpha Execution stopped")
 
 
 def _run_exit_monitor() -> None:
-    """Scheduled exit monitor tick."""
+    """Scheduled exit monitor tick. Updates app_state for /exit-monitor/status."""
     if not _is_market_hours():
         return
+    app_state["exit_monitor_last_run_at"] = datetime.now(ET).isoformat()
+    app_state["exit_monitor_run_count"]  += 1
     try:
         events = evaluate_exits(
             db_path         = settings.alpha_db_path,
@@ -131,9 +388,12 @@ def _run_exit_monitor() -> None:
             bot_token       = settings.telegram_bot_token,
             chat_id         = settings.ahmed_chat_id,
         )
+        app_state["exit_monitor_last_event_count"] = len(events)
+        app_state["exit_monitor_last_error"]       = None
         if events:
             logger.info("Exit monitor: %d events", len(events))
     except Exception as e:
+        app_state["exit_monitor_last_error"] = str(e)[:200]
         logger.error("Exit monitor failed: %s", e)
 
 
@@ -179,14 +439,47 @@ class ExecuteRequest(BaseModel):
 
 @app.get("/health")
 def health() -> JSONResponse:
-    """Health check. Always 200."""
+    """Health check with real Alpaca connectivity probe and VIX brake status."""
+    # Probe Alpaca — real connectivity check, not just a ping
+    try:
+        acct = _get_alpaca().get_account()
+        alpaca_ok = acct.get("status") == "ACTIVE"
+    except Exception:
+        alpaca_ok = False
+    with _state_lock:
+        app_state["alpaca_reachable"] = alpaca_ok
+
+    # VIX brake status — non-blocking, best effort
+    current_vix = _get_current_vix()
+    vix_brake_elevated = (current_vix is not None and current_vix >= VIX_BRAKE_ELEVATED)
+    vix_brake_full     = (current_vix is not None and current_vix >= VIX_BRAKE_FULL)
+    vix_brake_status   = (
+        "FULL_HALT"  if vix_brake_full else
+        "ELEVATED"   if vix_brake_elevated else
+        "CLEAR"      if current_vix is not None else
+        "UNKNOWN"
+    )
+
+    execution_valid = alpaca_ok and not app_state.get("execution_paused", False) and not vix_brake_full
     return JSONResponse({
-        "status":      "healthy",
-        "service":     "alpha-execution",
-        "version":     "3.0.0",
-        "trades_today": app_state["trades_today"],
-        "open_positions": count_open_positions(settings.alpha_db_path),
-        "uptime_since": app_state["start_time"],
+        "status":             "healthy" if execution_valid else "degraded",
+        "service":            "alpha-execution",
+        "version":            "3.0.0",
+        "trades_today":       app_state["trades_today"],
+        "open_positions":     count_open_positions(settings.alpha_db_path),
+        "uptime_since":       app_state["start_time"],
+        "execution_valid":    execution_valid,
+        "alpaca_reachable":   alpaca_ok,
+        "execution_paused":   app_state.get("execution_paused", False),
+        "first_exec_failed":  app_state.get("first_exec_failed", False),
+        "vix":                current_vix,
+        "vix_brake":          vix_brake_status,
+        "vix_brake_elevated": vix_brake_elevated,
+        "vix_brake_full":     vix_brake_full,
+        "max_positions":      MAX_CONCURRENT_POSITIONS,
+        "max_new_per_day":    MAX_NEW_PER_DAY,
+        "auto_execute":       app_state.get("auto_execute", False),
+        "mode":               app_state.get("mode", "dry_run"),
     })
 
 
@@ -212,6 +505,25 @@ def execute(
     """
     verify_secret(x_nexus_secret)
 
+    # First-failure pause gate — if execution has been paused, reject immediately
+    if app_state.get("execution_paused", False):
+        logger.warning("Alpha execution PAUSED — rejecting %s signal", body.ticker)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "executed": False,
+                "reason":   "Execution paused due to prior failure — manual resume required (/resume)",
+            },
+        )
+
+    # Pipeline Sentinel — execution received this signal
+    _ps_trace_id = f"{body.window_id}:{body.ticker}"
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+        _trace_hop(_ps_trace_id, "execution_received", "alpha-execution", body.ticker, "alpha")
+    except Exception:
+        pass
+
     # Cipher Finding 7+8: verdict whitelist — last line of defense.
     # OMNI's can_execute() is the first gate. This is the execution bridge gate.
     # Prevents CONDITIONAL or any non-executable verdict from reaching Alpaca
@@ -228,12 +540,37 @@ def execute(
             },
         )
 
+    # ── VIX Brake Gate ────────────────────────────────────────────────────────
+    # Check before any DB write or Alpaca call. Non-blocking Axiom probe.
+    current_vix = _get_current_vix()
+    vix_rejection = _check_vix_brake(current_vix, body.direction)
+    if vix_rejection:
+        logger.warning("VIX BRAKE FIRED for %s: %s", body.ticker, vix_rejection)
+        try:
+            import requests as _vix_req
+            _vix_req.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                json={"chat_id": settings.ahmed_chat_id, "text": f"🚨 VIX BRAKE\n{vix_rejection}\nTicker: {body.ticker}"},
+                timeout=5,
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=422,
+            content={"executed": False, "reason": vix_rejection, "vix_brake": True},
+        )
+
     alpaca = _get_alpaca()
 
     # ── Get Current Price (outside lock — network call, no state mutation) ────
     current_price = alpaca.get_latest_price(body.ticker)
     if not current_price:
         logger.warning("Cannot get price for %s — execution rejected", body.ticker)
+        _report_exec_event(
+            "execution_error", body.ticker, body.direction,
+            reason=f"Cannot fetch price for {body.ticker}",
+            pathway=body.pathway or "",
+        )
         return JSONResponse(
             status_code = 503,
             content     = {"executed": False, "reason": f"Cannot fetch price for {body.ticker}"},
@@ -241,15 +578,40 @@ def execute(
 
     # ── Resolve Spread Parameters ─────────────────────────────────────────────
     try:
-        spread = resolve_spread(
+        spread = resolve_available_contract(
             ticker        = body.ticker,
             direction     = body.direction,
             current_price = current_price,
+            alpaca_client = alpaca,
         )
     except ValueError as e:
+        _report_exec_event(
+            "execution_error", body.ticker, body.direction,
+            reason=f"Spread resolution failed: {str(e)[:200]}",
+            pathway=body.pathway or "",
+        )
         return JSONResponse(
             status_code = 422,
             content     = {"executed": False, "reason": str(e)},
+        )
+
+    # ── Earnings Gate ─────────────────────────────────────────────────────────
+    # Check after spread resolution (need expiration_date). Fires if earnings
+    # fall within expiration + EARNINGS_BLOCK_DAYS (5 days).
+    earnings_rejection = _check_earnings_gate(
+        body.ticker, spread.expiration_date, settings.polygon_api_key
+    )
+    if earnings_rejection:
+        logger.warning("EARNINGS GATE FIRED for %s: %s", body.ticker, earnings_rejection)
+        _report_exec_event(
+            "execution_rejected", body.ticker, body.direction,
+            reason=earnings_rejection,
+            pathway=body.pathway or "",
+            extra={"gate": "earnings"},
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"executed": False, "reason": earnings_rejection, "earnings_gate": True},
         )
 
     contracts = max(1, int(body.position_size_usd / (current_price * 100)))
@@ -266,6 +628,12 @@ def execute(
 
         if open_count >= MAX_CONCURRENT_POSITIONS:
             logger.info("Alpha execution blocked: max concurrent positions (%d)", MAX_CONCURRENT_POSITIONS)
+            _report_exec_event(
+                "execution_rejected", body.ticker, body.direction,
+                reason=f"Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})",
+                pathway=body.pathway or "",
+                extra={"gate": "concurrent_limit"},
+            )
             return JSONResponse(
                 status_code = 429,
                 content     = {
@@ -277,6 +645,12 @@ def execute(
 
         if today_count >= MAX_NEW_PER_DAY:
             logger.info("Alpha execution blocked: max new positions today (%d)", MAX_NEW_PER_DAY)
+            _report_exec_event(
+                "execution_rejected", body.ticker, body.direction,
+                reason=f"Max new positions today reached ({today_count}/{MAX_NEW_PER_DAY})",
+                pathway=body.pathway or "",
+                extra={"gate": "daily_limit"},
+            )
             return JSONResponse(
                 status_code = 429,
                 content     = {
@@ -306,6 +680,30 @@ def execute(
             verdict           = body.verdict,
         )
 
+    # ── AUTO_EXECUTE Gate — dry-run if kill-switch is off ──────────────────────
+    if not app_state.get("auto_execute", False):
+        order_preview = {
+            "ticker":           body.ticker,
+            "direction":        body.direction,
+            "verdict":          body.verdict,
+            "spread_details":   spread.__dict__ if hasattr(spread, "__dict__") else str(spread),
+            "current_price":    current_price,
+        }
+        logger.info("DRY_RUN: would have executed %s %s (verdict=%s)", body.ticker, body.direction, body.verdict)
+        if pending_id:
+            cancel_pending_position(settings.alpha_db_path, pending_id)
+        # Send dry-run Telegram alert
+        try:
+            import requests as _dr_req
+            _dr_req.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                json={"chat_id": settings.ahmed_chat_id, "text": f"[DRY RUN] Would execute: {body.ticker} {body.direction} | verdict={body.verdict} | price=${current_price}"},
+                timeout=5,
+            )
+        except Exception:
+            pass
+        return JSONResponse(content={"executed": False, "mode": "dry_run", "order_preview": order_preview})
+
     # ── Place Order via Alpaca OUTSIDE lock (network call) ────────────────────
     short_symbol = None
     long_symbol  = None
@@ -328,18 +726,68 @@ def execute(
         estimated_credit = round(current_price * 0.003, 2)   # ~0.3% of spot as floor
         order = alpaca.place_spread_order(
             legs        = legs,
+            qty         = contracts,
             order_type  = "limit",
             limit_debit = estimated_credit,
         )
         short_order_id = order.get("id")
         long_order_id  = order.get("id")   # spread is a single multi-leg order
         logger.info("Alpha spread order placed: %s | order_id=%s", spread.leg_description(), short_order_id)
+        try:
+            from pipeline_client import trace_hop as _trace_hop
+            _trace_hop(_ps_trace_id, "alpaca_submitted", "alpha-execution", body.ticker, "alpha")
+        except Exception:
+            pass
     except Exception as e:
         order_error = str(e)[:200]
         logger.error("Alpaca spread order FAILED for %s: %s — cancelling pending slot", body.ticker, e)
         # Cancel the reservation so the slot is freed for the next request.
         if pending_id:
             cancel_pending_position(settings.alpha_db_path, pending_id)
+        # Always report every Alpaca failure to SOVEREIGN — regardless of whether
+        # execution is already paused. SOVEREIGN needs the full error history.
+        _report_exec_event(
+            "execution_error", body.ticker, body.direction,
+            reason=f"Alpaca order placement failed: {order_error}",
+            pathway=body.pathway or "",
+            extra={"error": order_error, "gate": "alpaca_order"},
+        )
+        # First-failure pause: halt all execution and alert Ahmed immediately.
+        # One Alpaca failure may mean connectivity loss, account issue, or options
+        # routing problem — all are Tier 1. Do NOT continue submitting blind.
+        with _state_lock:
+            if not app_state.get("first_exec_failed", False):
+                app_state["first_exec_failed"] = True
+                app_state["execution_paused"]  = True
+                logger.critical(
+                    "FIRST EXECUTION FAILURE — pausing Alpha Execution. "
+                    "Ticker=%s Error=%s. Resume via /resume after diagnosis.",
+                    body.ticker, order_error,
+                )
+                report("alpha_execution", "alert", {
+                    "event":  "execution_paused",
+                    "ticker": body.ticker,
+                    "error":  order_error,
+                    "reason": "first_execution_failure",
+                })
+                try:
+                    import requests as _req
+                    _req.post(
+                        f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                        json={
+                            "chat_id": settings.ahmed_chat_id,
+                            "text": (
+                                f"🚨 ALPHA EXECUTION PAUSED\n"
+                                f"First live order failed — halting all execution.\n"
+                                f"Ticker: {body.ticker}\n"
+                                f"Error: {order_error}\n"
+                                f"Resume: POST /execute-engine/resume with auth header"
+                            ),
+                        },
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
         return JSONResponse(
             status_code = 503,
             content     = {
@@ -349,9 +797,54 @@ def execute(
             },
         )
 
+    # ── G10 SYS-3: OSI-Aware Fill Confirmation ───────────────────────────────
+    # Poll Alpaca to confirm fill before writing to DB.
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from shared.order_reconciler import OrderReconciler, FillStatus as _FillStatus
+    _reconciler = OrderReconciler(
+        alpaca_base_url    = ALPACA_PAPER_URL,
+        alpaca_key         = settings.alpaca_api_key,
+        alpaca_secret      = settings.alpaca_secret_key,
+        dry_run            = os.getenv("RECONCILE_ORDERS", "").lower() != "true",
+    )
+    _fill = _reconciler.confirm_fill(
+        order_id     = short_order_id or "",
+        ticker       = body.ticker,
+        expected_qty = float(contracts),
+    )
+    if _fill.status == _FillStatus.VOID:
+        logger.error(
+            "Trade VOID for %s: %s (elapsed: %.1fs)",
+            body.ticker, _fill.void_reason, _fill.elapsed_sec,
+        )
+        if pending_id:
+            cancel_pending_position(settings.alpha_db_path, pending_id)
+        _report_exec_event(
+            "execution_error", body.ticker, body.direction,
+            reason=f"Trade void: {_fill.void_reason}",
+            pathway=body.pathway or "",
+            extra={"error": _fill.void_reason, "gate": "fill_confirmation", "elapsed_sec": _fill.elapsed_sec},
+        )
+        try:
+            import requests as _vr
+            _vr.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                json={"chat_id": settings.ahmed_chat_id,
+                      "text": f"⚠️ VOID trade: {body.ticker} — {_fill.void_reason}"},
+                timeout=5,
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=503,
+            content={"status": "void", "reason": _fill.void_reason, "executed": False},
+        )
+
     # ── Alpaca confirmed — promote pending slot to open position ──────────────
     # Cipher Finding 1+2 fix: position_id was reserved inside the lock as 'pending'.
     # confirm_pending_position() sets status='open' + Alpaca fields. No new INSERT.
+    _confirmed_price = _fill.fill_price if _fill.fill_price is not None else current_price
     confirm_pending_position(
         db_path               = settings.alpha_db_path,
         position_id           = pending_id,
@@ -359,7 +852,7 @@ def execute(
         long_alpaca_order_id  = long_order_id or "",
         short_contract_symbol = short_symbol or "",
         long_contract_symbol  = long_symbol or "",
-        entry_price           = current_price,
+        entry_price           = _confirmed_price,
     )
     position_id = pending_id
 
@@ -370,6 +863,24 @@ def execute(
     with _state_lock:
         app_state["trades_today"] += 1
         app_state["total_trades"] += 1
+
+    # Pipeline Sentinel — Alpaca order confirmed, position live
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+        _trace_hop(_ps_trace_id, "alpaca_confirmed", "alpha-execution", body.ticker, "alpha")
+    except Exception:
+        pass
+
+    report("alpha_execution", "alert", {
+        "event":       "trade_placed",
+        "ticker":      body.ticker,
+        "direction":   body.direction,
+        "verdict":     body.verdict,
+        "order_id":    short_order_id or "",
+        "position_id": position_id,
+        "contracts":   contracts,
+        "size_usd":    body.position_size_usd,
+    })
 
     # ── Telegram Notification ────────────────────────────────────────────────
     _send_entry_notification(
@@ -405,15 +916,54 @@ def get_positions(x_nexus_secret: str = Header(default="")) -> JSONResponse:
     })
 
 
-@app.post("/resume")
-def resume_execution(x_nexus_secret: str = Header(default="")) -> JSONResponse:
-    """No-op resume endpoint for API parity with Prime Execution.
+@app.get("/exit-monitor/status")
+def exit_monitor_status(x_nexus_secret: str = Header(default="")) -> JSONResponse:
+    """
+    Return current exit monitor scheduler state.
 
-    Cipher P2-5 fix: Guardian Angel calls /resume on all execution services.
-    Alpha Execution has no execution_paused state — always returns resumed=True.
+    Reports last run timestamp, last event count, any errors, and scheduler job status.
+    The exit monitor runs every 1 min during market hours (9–15 ET) via APScheduler.
     """
     verify_secret(x_nexus_secret)
-    return JSONResponse({"resumed": True, "was_paused": False})
+    scheduler = app_state.get("scheduler")
+    next_run_at = None
+    scheduler_running = False
+    if scheduler:
+        scheduler_running = scheduler.running
+        try:
+            job = scheduler.get_job("exit_monitor")
+            if job and job.next_run_time:
+                next_run_at = job.next_run_time.isoformat()
+        except Exception:
+            pass
+
+    return JSONResponse({
+        "exit_monitor": {
+            "scheduler_running":  scheduler_running,
+            "schedule":           "every 1 min during market hours (09:00–15:59 ET)",
+            "last_run_at":        app_state.get("exit_monitor_last_run_at"),
+            "last_event_count":   app_state.get("exit_monitor_last_event_count", 0),
+            "last_error":         app_state.get("exit_monitor_last_error"),
+            "run_count":          app_state.get("exit_monitor_run_count", 0),
+            "next_run_at":        next_run_at,
+        }
+    })
+
+
+@app.post("/resume")
+def resume_execution(x_nexus_secret: str = Header(default="")) -> JSONResponse:
+    """Resume execution after a failure-triggered pause.
+
+    Clears execution_paused and first_exec_failed flags so new orders can proceed.
+    Guardian Angel calls this endpoint on recovery.
+    """
+    verify_secret(x_nexus_secret)
+    with _state_lock:
+        was_paused = app_state.get("execution_paused", False)
+        app_state["execution_paused"]  = False
+        app_state["first_exec_failed"] = False
+    logger.info("Alpha execution RESUMED (was_paused=%s)", was_paused)
+    return JSONResponse({"resumed": True, "was_paused": was_paused})
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

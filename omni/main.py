@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -74,15 +75,164 @@ ET = pytz.timezone("America/New_York")
 settings       = load_settings()
 _auto_execute  = os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true"
 logger.info("OMNI: NEXUS_AUTO_EXECUTE=%s", _auto_execute)
+
+# ── SOVEREIGN Directive State ─────────────────────────────────────────────────
+_sovereign_halted: bool = False   # HALT directive suspends concordance synthesis
+
+
+def _dispatch_sovereign_instruction(instr: dict) -> None:
+    """Execute a SOVEREIGN instruction. Supported: HALT, RESUME, STATUS, FLUSH."""
+    global _sovereign_halted
+
+    raw = instr.get("message", "").strip()
+    directive = raw.split(":", 1)[0].strip().upper() if ":" in raw else raw.upper()
+
+    logger.info("SOVEREIGN directive received — raw: %s", raw[:200])
+
+    if directive == "HALT":
+        _sovereign_halted = True
+        logger.warning("SOVEREIGN DIRECTIVE: HALT — synthesis suspended")
+        report("omni", "ack", {"directive": "HALT", "status": "applied", "halted": True})
+    elif directive == "RESUME":
+        _sovereign_halted = False
+        logger.info("SOVEREIGN DIRECTIVE: RESUME — synthesis resumed")
+        report("omni", "ack", {"directive": "RESUME", "status": "applied", "halted": False})
+    elif directive == "STATUS":
+        with _state_lock:
+            snap = {
+                "directive": "STATUS",
+                "halted": _sovereign_halted,
+                "auto_execute": _auto_execute,
+                "syntheses_today": app_state.get("syntheses_today", 0),
+                "go_verdicts_today": app_state.get("go_verdicts_today", 0),
+                "last_synthesis_time": app_state.get("last_synthesis_time"),
+            }
+        report("omni", "status", snap)
+        logger.info("SOVEREIGN DIRECTIVE: STATUS — reported back")
+    elif directive == "FLUSH":
+        with _state_lock:
+            app_state["syntheses_today"] = 0
+            app_state["go_verdicts_today"] = 0
+            app_state["p4_dispatched_windows"] = set()
+            app_state["synthesized_concordances"] = set()
+        logger.info("SOVEREIGN DIRECTIVE: FLUSH — daily counters and dedup sets cleared")
+        report("omni", "ack", {"directive": "FLUSH", "status": "applied"})
+    else:
+        logger.warning("SOVEREIGN DIRECTIVE: unrecognized '%s'", directive[:100])
+        report("omni", "ack", {"directive": directive[:100], "status": "unrecognized"})
 _state_lock    = threading.Lock()   # Pass B fix (V6): guards app_state counter mutations
 app_state = {
     "settings":          settings,
     "start_time":        datetime.now(ET).isoformat(),
     "syntheses_today":   0,
     "go_verdicts_today": 0,
+    "last_synthesis_time": None,       # Cipher fix: track last synthesis timestamp for silence detection
     "p4_dispatched_windows": set(),  # INV-15: (ticker, window_id) pairs — max 1 P4 per ticker per window
     "synthesized_concordances": set(),  # Dedup: (ticker, window_id, direction, system, pathway) — max 1 synthesis per concordance pathway per window [GENESIS 2026-04-20]
 }
+
+# ── Synthesis Silence Detector ────────────────────────────────────────────────
+# Cipher fix: background thread monitors synthesis activity during market hours.
+# If no synthesis fires in SILENCE_THRESHOLD_MIN minutes during open hours,
+# alert Ahmed + Sovereign so the issue is caught immediately — not 2.5h later.
+_SILENCE_THRESHOLD_MIN = 20   # alert after 20 min silence during market hours
+_silence_alerted = False       # rate-limit: one alert per silence episode
+
+
+def _is_market_hours() -> bool:
+    """Return True if current ET time is within market hours (9:30–16:00 Mon–Fri)."""
+    now = datetime.now(ET)
+    if now.weekday() >= 5:  # Saturday/Sunday
+        return False
+    market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
+def _synthesis_silence_watcher() -> None:
+    """
+    Background daemon thread: detect OMNI synthesis silence during market hours.
+
+    Polls every 60s. If no synthesis has fired in _SILENCE_THRESHOLD_MIN minutes
+    while the market is open, sends a Telegram alert to Ahmed and posts to Sovereign
+    via the message bus. Resets the alert flag after synthesis resumes.
+    """
+    global _silence_alerted
+    while True:
+        try:
+            time.sleep(60)
+            if not _is_market_hours():
+                _silence_alerted = False  # reset so alert fires fresh next open
+                continue
+
+            with _state_lock:
+                last_ts = app_state["last_synthesis_time"]
+
+            if last_ts is None:
+                # No synthesis since startup — check how long we've been running
+                startup_str = app_state["start_time"]
+                try:
+                    startup_dt = datetime.fromisoformat(startup_str)
+                    elapsed_min = (datetime.now(ET) - startup_dt).total_seconds() / 60
+                except Exception:
+                    elapsed_min = 0
+                if elapsed_min < _SILENCE_THRESHOLD_MIN:
+                    continue  # still warming up
+                # Running long enough with zero syntheses — treat as silence
+                silent_min = elapsed_min
+            else:
+                silent_min = (time.time() - last_ts) / 60
+
+            if silent_min >= _SILENCE_THRESHOLD_MIN:
+                if not _silence_alerted:
+                    _silence_alerted = True
+                    logger.critical(
+                        "OMNI SILENCE DETECTED: no synthesis in %.0f min during market hours",
+                        silent_min,
+                    )
+                    # Alert Ahmed via Telegram
+                    try:
+                        import requests as _req
+                        _req.post(
+                            f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                            json={
+                                "chat_id":    settings.ahmed_chat_id,
+                                "parse_mode": "HTML",
+                                "text": (
+                                    f"🚨 <b>OMNI SILENCE ALERT</b>\n"
+                                    f"No synthesis in <b>{silent_min:.0f} minutes</b> during market hours.\n"
+                                    f"Synthesis loop may be stalled. Check OMNI immediately."
+                                ),
+                            },
+                            timeout=8,
+                        )
+                    except Exception as _te:
+                        logger.error("Silence alert Telegram failed: %s", _te)
+                    # Also notify Sovereign via message bus
+                    try:
+                        import requests as _req
+                        _req.post(
+                            "http://192.168.1.141:9999/send",
+                            json={
+                                "from": "omni",
+                                "to":   "sovereign",
+                                "message": (
+                                    f"OMNI SILENCE ALERT: no synthesis in {silent_min:.0f} min "
+                                    "during market hours. Synthesis loop may be stalled."
+                                ),
+                            },
+                            timeout=3,
+                        )
+                    except Exception:
+                        pass
+            else:
+                # Synthesis is flowing — reset alert flag so next silence episode fires
+                if _silence_alerted:
+                    logger.info("OMNI silence resolved — synthesis resumed")
+                _silence_alerted = False
+
+        except Exception as _watcher_exc:
+            logger.error("Silence watcher error: %s", _watcher_exc)
 
 
 def verify_secret(secret_header: str) -> None:
@@ -198,11 +348,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
     # ─────────────────────────────────────────────────────────────────────────
 
+    # Cipher fix: start synthesis silence watcher as background daemon thread
+    _watcher_thread = threading.Thread(
+        target=_synthesis_silence_watcher, daemon=True, name="synthesis-silence-watcher"
+    )
+    _watcher_thread.start()
+    logger.info("OMNI synthesis silence watcher started (threshold: %d min)", _SILENCE_THRESHOLD_MIN)
+
     logger.info("OMNI service ready — Quad Intelligence active")
     report("omni", "status", {"event": "started"})
     _instr = get_instructions("omni")
     if _instr:
         logger.info("OMNI: %d instruction(s) from SOVEREIGN on startup", len(_instr))
+        for _i in _instr:
+            _dispatch_sovereign_instruction(_i)
     yield
     logger.info("OMNI service stopped")
 
@@ -300,13 +459,16 @@ class ConcordancePayload(BaseModel):
 @app.get("/health")
 def health() -> JSONResponse:
     """Health check. Always returns 200. No auth required."""
+    _last_ts = app_state["last_synthesis_time"]
+    _silence_min = round((time.time() - _last_ts) / 60, 1) if _last_ts else None
     return JSONResponse({
-        "status":             "healthy",
-        "service":            "omni",
-        "version":            "3.0.0",
-        "syntheses_today":    app_state["syntheses_today"],
-        "go_verdicts_today":  app_state["go_verdicts_today"],
-        "uptime_since":       app_state["start_time"],
+        "status":              "healthy",
+        "service":             "omni",
+        "version":             "3.0.0",
+        "syntheses_today":     app_state["syntheses_today"],
+        "go_verdicts_today":   app_state["go_verdicts_today"],
+        "uptime_since":        app_state["start_time"],
+        "last_synthesis_min_ago": _silence_min,   # Cipher fix: silence visibility
     })
 
 
@@ -342,6 +504,21 @@ def receive_concordance(
     # Replaces the original `active_secret = x or y; verify_secret(active_secret)` pattern
     # which validated both against nexus_secret — broken on secret rotation.
     verify_concordance_auth(x_nexus_secret, x_nexus_prime_secret)
+
+    # Poll SOVEREIGN for any mid-session instructions (deduped via watermark)
+    _instr = get_instructions("omni")
+    if _instr:
+        logger.info("OMNI: %d instruction(s) from SOVEREIGN this cycle", len(_instr))
+        for _i in _instr:
+            _dispatch_sovereign_instruction(_i)
+
+    # Halt gate
+    if _sovereign_halted:
+        ticker_hint = body.ticker if hasattr(body, 'ticker') else '?'
+        logger.warning("OMNI: SOVEREIGN HALT active — rejecting concordance for %s", ticker_hint)
+        report("omni", "status", {"event": "concordance_rejected", "reason": "sovereign_halt"})
+        from fastapi.responses import JSONResponse as _JSONResponse
+        return _JSONResponse(status_code=503, content={"status": "halted", "reason": "SOVEREIGN HALT active"})
 
     concordance = body.model_dump()
     _pathway = concordance.get("pathway", "alpha")
@@ -392,7 +569,7 @@ def receive_concordance(
             logger.info(
                 "Concordance dedup — already synthesized %s/%s pathway=%s window=%s",
                 _ticker, concordance.get("direction", ""), _pathway, _win_id,
-            )
+            )  # noqa: E501
             return JSONResponse(
                 status_code=200,
                 content={
@@ -417,6 +594,38 @@ def receive_concordance(
         concordance["weighted_score"],
     )
 
+    # Cipher fix: wrap entire synthesis in try/except so that any unhandled
+    # exception rolls back the dedup key — allowing the concordance to be
+    # retried rather than silently dropped forever.
+    try:
+        return _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
+    except Exception as _synthesis_exc:
+        logger.critical(
+            "OMNI synthesis FAILED for %s/%s — rolling back dedup key: %s",
+            _ticker, _pathway, _synthesis_exc, exc_info=True,
+        )
+        with _state_lock:
+            app_state["synthesized_concordances"].discard(_conc_key)
+        raise
+
+
+def _run_synthesis(
+    _conc_key: tuple,
+    _trace_id: str,
+    _ticker: str,
+    _pathway: str,
+    _win_id: str,
+    concordance: dict,
+) -> JSONResponse:
+    """
+    Execute the full synthesis pipeline for a concordance signal.
+
+    Extracted from receive_concordance so the dedup rollback wrapper can catch
+    any unhandled exception and discard the key — allowing retry on failure.
+
+    Cipher fix 2026-04-22: synthesis errors no longer permanently block the
+    concordance key. If this function raises, the caller rolls back _conc_key.
+    """
     # Pipeline Sentinel — OMNI synthesis starting
     try:
         from pipeline_client import trace_hop as _trace_hop
@@ -441,6 +650,43 @@ def receive_concordance(
     if oracle_ctx is None:
         logger.warning("ORACLE context unavailable for %s — brains will operate with degraded context",
                        concordance["ticker"])
+
+    # ── Step 3b: Fetch THESIS macro context for strategic intelligence ─────────
+    # THESIS provides macro posture, sizing multiplier, and gate results.
+    # If is_fallback=True, CHRONICLE is down — alert SOVEREIGN and continue
+    # with conservative defaults (0.75 sizing). Never halt synthesis.
+    thesis_ctx = None
+    _thesis_url = os.environ.get("THESIS_URL", "http://localhost:8060")
+    try:
+        import requests as _req
+        _resp = _req.get(f"{_thesis_url}/thesis/current-context", timeout=5)
+        if _resp.status_code == 200:
+            thesis_ctx = _resp.json()
+            if thesis_ctx.get("is_fallback", True):
+                logger.warning(
+                    "OMNI: THESIS returned fallback context — "
+                    "CHRONICLE may be down. Applying conservative defaults."
+                )
+                try:
+                    _req.post(
+                        "http://192.168.1.141:9999/send",
+                        json={
+                            "from": "omni",
+                            "to": "sovereign",
+                            "message": (
+                                "OMNI BLIND-FLIGHT ALERT: THESIS returned fallback context. "
+                                "CHRONICLE may be down. Trading conservatively at 0.75 sizing "
+                                "until resolved."
+                            ),
+                        },
+                        timeout=3,
+                    )
+                except Exception as _alert_exc:
+                    logger.error("OMNI: failed to alert SOVEREIGN about blind-flight: %s", _alert_exc)
+        else:
+            logger.warning("OMNI: THESIS returned HTTP %d — using no thesis context", _resp.status_code)
+    except Exception as _thesis_exc:
+        logger.warning("OMNI: THESIS unreachable — %s. Proceeding without thesis context.", _thesis_exc)
 
     # ── Step 4: Build context ─────────────────────────────────────────────────
     context = build_context(concordance, axiom_result, regime, oracle_ctx)
@@ -499,6 +745,7 @@ def receive_concordance(
 
     with _state_lock:                          # Pass B fix (V6): thread-safe counter
         app_state["syntheses_today"] += 1
+        app_state["last_synthesis_time"] = time.time()  # Cipher fix: track for silence detection
 
     # ── Step 8: Route to execution ────────────────────────────────────────────
     execution_ok = None

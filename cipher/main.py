@@ -1,0 +1,374 @@
+"""
+main.py — Cipher Agent Service
+
+FastAPI service that receives ticker pools from Axiom, analyzes each ticker
+for options trading quality using Claude, and submits qualifying picks to
+Alpha Buffer and Prime Buffer.
+
+Port: 9001
+Auth: X-Nexus-Secret header on inbound requests
+"""
+
+import logging
+import os
+import secrets
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, Optional, Union
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from shared.log_setup import configure_service_logging
+from shared.sovereign_comms import get_instructions, report
+
+import pytz
+import uvicorn
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from analyzer import AGENT_NAME, analyze
+from buffer_client import submit_to_alpha, submit_to_prime
+from config import Settings, load_settings
+from database import (
+    complete_window,
+    get_stats,
+    get_today_picks,
+    has_submitted_today,
+    init_db,
+    is_duplicate_window,
+    record_pick,
+    record_window_received,
+)
+from oracle_client import fetch_context
+from telegram import alert_brain_down, alert_submission_failed
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+configure_service_logging("cipher")
+logger = logging.getLogger("cipher.main")
+ET = pytz.timezone("America/New_York")
+
+# ── Application State ─────────────────────────────────────────────────────────
+_settings: Optional[Settings] = None
+_consecutive_brain_failures: int = 0
+BRAIN_ALERT_THRESHOLD = 3
+
+# ── SOVEREIGN Directive State ─────────────────────────────────────────────────
+_sovereign_halted: bool = False          # True = SOVEREIGN has suspended analysis
+_score_threshold_override: Optional[float] = None  # None = use default from settings
+
+
+def _dispatch_sovereign_instruction(instr: dict) -> None:
+    """
+    Execute a SOVEREIGN instruction received from the message bus.
+    Supported directives:
+      HALT                   — suspend pool analysis immediately
+      RESUME                 — re-enable pool analysis
+      STATUS                 — push current agent status back to SOVEREIGN
+      SET_THRESHOLD:<float>  — override minimum score threshold
+      FLUSH                  — reset consecutive brain-failure counter
+    Unknown directives are acknowledged and logged.
+    """
+    global _sovereign_halted, _score_threshold_override, _consecutive_brain_failures
+
+    raw = instr.get("message", "").strip()
+    # Strip optional prefix added by sovereign_comms (e.g. "AUTONOMOUS: {...}")
+    directive = raw.split(":", 1)[0].strip().upper() if ":" in raw else raw.upper()
+    rest = raw.split(":", 1)[1].strip() if ":" in raw else ""
+
+    logger.info("SOVEREIGN directive received — raw: %s", raw[:200])
+
+    if directive == "HALT":
+        _sovereign_halted = True
+        logger.warning("SOVEREIGN DIRECTIVE: HALT — pool analysis suspended")
+        report("cipher", "ack", {"directive": "HALT", "status": "applied", "halted": True})
+
+    elif directive == "RESUME":
+        _sovereign_halted = False
+        logger.info("SOVEREIGN DIRECTIVE: RESUME — pool analysis resumed")
+        report("cipher", "ack", {"directive": "RESUME", "status": "applied", "halted": False})
+
+    elif directive == "STATUS":
+        stats = get_stats(_settings.db_path) if _settings else {}
+        report("cipher", "status", {
+            "directive": "STATUS",
+            "halted": _sovereign_halted,
+            "brain_failures": _consecutive_brain_failures,
+            "threshold_override": _score_threshold_override,
+            **stats,
+        })
+        logger.info("SOVEREIGN DIRECTIVE: STATUS — reported back to bus")
+
+    elif directive == "SET_THRESHOLD":
+        try:
+            val = float(rest)
+            _score_threshold_override = val
+            logger.info("SOVEREIGN DIRECTIVE: SET_THRESHOLD — threshold set to %.1f", val)
+            report("cipher", "ack", {"directive": "SET_THRESHOLD", "value": val, "status": "applied"})
+        except ValueError:
+            logger.warning("SOVEREIGN DIRECTIVE: SET_THRESHOLD — invalid value: %s", rest)
+            report("cipher", "ack", {"directive": "SET_THRESHOLD", "value": rest, "status": "invalid"})
+
+    elif directive == "FLUSH":
+        _consecutive_brain_failures = 0
+        logger.info("SOVEREIGN DIRECTIVE: FLUSH — brain failure counter reset")
+        report("cipher", "ack", {"directive": "FLUSH", "status": "applied"})
+
+    else:
+        logger.warning("SOVEREIGN DIRECTIVE: unrecognized directive '%s' — ignoring", directive[:100])
+        report("cipher", "ack", {"directive": directive[:100], "status": "unrecognized"})
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize settings and database on startup."""
+    global _settings
+    _settings = load_settings()
+    init_db(_settings.db_path)
+    logger.info("Cipher agent started on port %d", _settings.port)
+    report("cipher", "status", {"event": "started", "port": _settings.port})
+    _instr = get_instructions("cipher")
+    if _instr:
+        logger.info("Cipher: %d instruction(s) from SOVEREIGN on startup", len(_instr))
+        for _i in _instr:
+            _dispatch_sovereign_instruction(_i)
+    yield
+    logger.info("Cipher agent shutting down")
+
+
+app = FastAPI(title="Cipher Agent", version="1.0.0", lifespan=lifespan)
+
+
+# ── Request / Response Models ─────────────────────────────────────────────────
+class PoolPayload(BaseModel):
+    """Incoming pool push from Axiom."""
+    pool: list
+    count: int
+    window_id: str
+    updated_at: str
+    market_open: bool = True
+    regime: dict = {}
+    coherence_summary: Union[list, dict] = []   # Axiom sends dict; list accepted for legacy
+    coherence_available: bool = False
+    echo_chamber_risk: list = []
+    cycle_patterns: list = []
+    pattern_intelligence_available: bool = False
+    oracle_warmed: bool = False
+
+    model_config = {"extra": "ignore"}  # tolerate any future Axiom payload additions
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def _check_auth(provided: Optional[str]) -> None:
+    """Verify X-Nexus-Secret header. Raises 401 on failure."""
+    if not provided or not secrets.compare_digest(provided, _settings.nexus_secret):
+        logger.warning("Unauthorized request — invalid or missing X-Nexus-Secret")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ── Analysis Worker (runs in background thread) ───────────────────────────────
+def _analyze_pool(payload: dict) -> None:
+    """
+    Analyze all tickers in the pool and submit qualifying picks.
+    Runs in a background thread so /receive-pool returns immediately.
+    """
+    global _consecutive_brain_failures
+
+    window_id: str = payload["window_id"]
+    pool: list = payload["pool"]
+    regime: dict = payload.get("regime", {})
+
+    # Poll SOVEREIGN for any mid-session instructions (deduped via watermark)
+    _instr = get_instructions("cipher")
+    if _instr:
+        logger.info("Cipher: %d instruction(s) from SOVEREIGN this cycle", len(_instr))
+        for _i in _instr:
+            _dispatch_sovereign_instruction(_i)
+
+    # Halt gate — SOVEREIGN can suspend analysis via HALT directive
+    if _sovereign_halted:
+        logger.warning("Cipher: SOVEREIGN HALT active — skipping pool analysis for window %s", window_id)
+        report("cipher", "status", {"event": "pool_skipped", "reason": "sovereign_halt", "window_id": window_id})
+        complete_window(_settings.db_path, window_id, 0, 0)
+        return
+
+    analyzed = 0
+    submitted = 0
+
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+    except Exception:
+        _trace_hop = None  # type: ignore[assignment]
+
+    try:
+        # --- Fetch all Oracle contexts concurrently ---
+        valid_tickers = [t for t in pool if isinstance(t, str)]
+
+        def _fetch_ticker(ticker: str):
+            return ticker, fetch_context(ticker, _settings.oracle_url, _settings.oracle_headers())
+
+        contexts: dict = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_fetch_ticker, t): t for t in valid_tickers}
+            for future in as_completed(futures):
+                try:
+                    ticker, ctx = future.result()
+                    contexts[ticker] = ctx
+                except Exception as e:
+                    ticker = futures[future]
+                    logger.warning("Oracle fetch error for %s: %s", ticker, e)
+                    contexts[ticker] = None
+
+        logger.info("Window %s — Oracle fetch complete: %d/%d contexts retrieved",
+                    window_id, sum(1 for c in contexts.values() if c), len(valid_tickers))
+
+        for ticker in valid_tickers:
+            # Pipeline Sentinel — agent received this ticker
+            if _trace_hop:
+                _trace_hop(f"{window_id}:{ticker}", "agent_received", "cipher", ticker, "alpha")
+
+            # Use pre-fetched context
+            context = contexts.get(ticker)
+            if context is None:
+                logger.warning("Skipping %s — ORACLE context unavailable", ticker)
+                analyzed += 1
+                continue
+
+            # Run Cipher analysis
+            result = analyze(ticker, context, regime, _settings.anthropic_api_key)
+            analyzed += 1
+
+            if result is None:
+                _consecutive_brain_failures += 1
+                logger.warning(
+                    "Brain failure for %s (consecutive: %d) — skipping submission",
+                    ticker, _consecutive_brain_failures,
+                )
+                if _consecutive_brain_failures >= BRAIN_ALERT_THRESHOLD:
+                    alert_brain_down(
+                        _settings.telegram_bot_token,
+                        _settings.telegram_chat_id,
+                        _consecutive_brain_failures,
+                    )
+                    report("cipher", "alert", {"event": "brain_down", "consecutive_failures": _consecutive_brain_failures})
+                    _consecutive_brain_failures = 0
+                continue
+
+            # Reset brain failure counter on success
+            _consecutive_brain_failures = 0
+
+            direction: str = result["direction"]
+            score: float = result["score"]
+            reasoning: str = result["reasoning"]
+
+            # Submit to buffers (buffer deduplicates per window via UNIQUE constraint)
+            alpha_ok = submit_to_alpha(
+                ticker, AGENT_NAME, direction, score, reasoning,
+                _settings.alpha_buffer_url, _settings.alpha_headers(),
+            )
+            prime_ok = submit_to_prime(
+                ticker, AGENT_NAME, direction, score, reasoning,
+                _settings.prime_buffer_url, _settings.prime_headers(),
+            )
+
+            if alpha_ok or prime_ok:
+                submitted += 1
+                record_pick(
+                    _settings.db_path, window_id, ticker, direction, score,
+                    reasoning, alpha_ok, prime_ok,
+                )
+
+            # Alert on persistent submission failures
+            if score >= 58 and not alpha_ok:
+                alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Alpha")
+            if score >= 63 and not prime_ok:
+                alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Prime")
+
+    except Exception as e:
+        logger.error("_analyze_pool crashed for window %s at analyzed=%d: %s", window_id, analyzed, e)
+        report("cipher", "incident", {"event": "pool_crash", "window_id": window_id, "error": str(e)[:200]})
+    finally:
+        complete_window(_settings.db_path, window_id, analyzed, submitted)
+        logger.info(
+            "Window %s complete — analyzed=%d submitted=%d",
+            window_id, analyzed, submitted,
+        )
+        report("cipher", "status", {"event": "window_complete", "window_id": window_id, "analyzed": analyzed, "submitted": submitted})
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.post("/receive-pool", status_code=200)
+async def receive_pool(
+    payload: PoolPayload,
+    x_nexus_secret: Optional[str] = Header(None, alias="X-Nexus-Secret"),
+) -> JSONResponse:
+    """
+    Receive a ticker pool from Axiom.
+    Returns 200 immediately — analysis runs in a background thread.
+    """
+    _check_auth(x_nexus_secret)
+
+    window_id = payload.window_id
+
+    # Duplicate window guard
+    if is_duplicate_window(_settings.db_path, window_id):
+        logger.info("Duplicate window %s — skipping", window_id)
+        return JSONResponse({"status": "duplicate", "window_id": window_id})
+
+    record_window_received(_settings.db_path, window_id, payload.count)
+
+    # Launch analysis in background thread
+    thread = threading.Thread(
+        target=_analyze_pool,
+        args=(payload.model_dump(),),
+        daemon=True,
+        name=f"cipher-{window_id}",
+    )
+    thread.start()
+
+    logger.info(
+        "Pool received — window=%s tickers=%d regime=%s",
+        window_id, payload.count, payload.regime.get("classification", "?"),
+    )
+    return JSONResponse({"status": "accepted", "window_id": window_id, "agent": AGENT_NAME})
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    """Service health check — no auth required."""
+    stats = get_stats(_settings.db_path) if _settings else {}
+    return JSONResponse({
+        "status": "ok",
+        "agent": AGENT_NAME,
+        "port": _settings.port if _settings else 9001,
+        "brain_failures": _consecutive_brain_failures,
+        **stats,
+    })
+
+
+@app.get("/picks/today")
+async def picks_today(
+    x_nexus_secret: Optional[str] = Header(None, alias="X-Nexus-Secret"),
+) -> JSONResponse:
+    """Return all picks submitted today (ET). Auth required."""
+    _check_auth(x_nexus_secret)
+    picks = get_today_picks(_settings.db_path)
+    return JSONResponse({"agent": AGENT_NAME, "count": len(picks), "picks": picks})
+
+
+@app.get("/stats")
+async def stats(
+    x_nexus_secret: Optional[str] = Header(None, alias="X-Nexus-Secret"),
+) -> JSONResponse:
+    """Return aggregate session statistics. Auth required."""
+    _check_auth(x_nexus_secret)
+    return JSONResponse({"agent": AGENT_NAME, **get_stats(_settings.db_path)})
+
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    s = load_settings()
+    uvicorn.run("main:app", host="0.0.0.0", port=s.port, log_level="info")
