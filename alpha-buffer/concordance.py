@@ -210,9 +210,11 @@ def _try_p2(
     }
 
     if len(qualifying) < 2:
-        logger.debug(
-            "P2 not formed for %s/%s — only %d agents with score ≥ %.1f",
-            ticker, direction, len(qualifying), MIN_SCORE_P2,
+        logger.warning(
+            "P2 not formed for %s/%s — only %d/%d agents score ≥ %.1f (scores: %s). "
+            "If this fires repeatedly, agent scoring calibration may need review.",
+            ticker, direction, len(qualifying), len(agent_scores), MIN_SCORE_P2,
+            {a: s for a, s in agent_scores.items()},
         )
         return None
 

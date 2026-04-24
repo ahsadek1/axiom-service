@@ -521,6 +521,23 @@ def execute(
     """
     verify_secret(x_nexus_secret)
 
+    # Market hours gate — never submit orders outside 9:30 AM – 4:00 PM ET.
+    # Prevents after-hours order submission caused by service restarts, stale
+    # queue flushes, or OMNI signals that arrive outside trading hours.
+    # _is_market_hours() is used by the exit monitor but was previously absent here.
+    if not _is_market_hours():
+        logger.warning(
+            "Alpha execution rejected: outside market hours — ticker=%s window=%s",
+            body.ticker, body.window_id,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "executed": False,
+                "reason":   "Outside market hours (9:30 AM – 4:00 PM ET, weekdays only)",
+            },
+        )
+
     # First-failure pause gate — if execution has been paused, reject immediately
     if app_state.get("execution_paused", False):
         logger.warning("Alpha execution PAUSED — rejecting %s signal", body.ticker)
@@ -606,6 +623,26 @@ def execute(
             reason=f"Spread resolution failed: {str(e)[:200]}",
             pathway=body.pathway or "",
         )
+        logger.warning("SPREAD RESOLUTION FAILED for %s/%s: %s", body.ticker, body.direction, e)
+        # Alert Ahmed — GO verdict reached execution but no tradeable contract exists
+        try:
+            import requests as _sr
+            _sr.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                json={
+                    "chat_id": settings.ahmed_chat_id,
+                    "text": (
+                        f"⚠️ <b>SPREAD RESOLUTION FAILED</b>\n"
+                        f"Ticker: <b>{body.ticker}</b> | {body.direction} | {body.pathway}\n"
+                        f"Verdict was GO — but no tradeable contract found.\n"
+                        f"Reason: {str(e)[:200]}"
+                    ),
+                    "parse_mode": "HTML",
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass
         return JSONResponse(
             status_code = 422,
             content     = {"executed": False, "reason": str(e)},
@@ -739,7 +776,10 @@ def execute(
             {"symbol": long_symbol,  "side": "buy",  "ratio_qty": 1},
         ]
         # Use limit orders for spreads — market orders carry unacceptable slippage risk.
-        estimated_credit = round(current_price * 0.003, 2)   # ~0.3% of spot as floor
+        # Credit floor: 1.5% of spot price, minimum $0.50 per contract.
+        # Paper account options spreads require realistic credit to achieve fills.
+        # Previous 0.3% (~$0.60 for NVDA) was too low — orders never filled.
+        estimated_credit = max(round(current_price * 0.015, 2), 0.50)
         order = alpaca.place_spread_order(
             legs        = legs,
             qty         = contracts,
@@ -929,6 +969,58 @@ def get_positions(x_nexus_secret: str = Header(default="")) -> JSONResponse:
     return JSONResponse({
         "count":     len(positions),
         "positions": positions,
+    })
+
+
+@app.get("/trades")
+def get_trades_summary(x_nexus_secret: str = Header(default="")) -> JSONResponse:
+    """
+    Return Alpha execution summary for SOVEREIGN observability.
+
+    Exposes: session trades, Alpaca orders submitted/filled/rejected,
+    open positions, and buying power state.  SOVEREIGN polls this at
+    market open, midday, and close every session.
+    """
+    verify_secret(x_nexus_secret)
+
+    import sqlite3 as _sqlite3
+    orders_submitted = 0
+    orders_filled = 0
+    orders_rejected = 0
+    buying_power_used = 0.0
+    try:
+        conn = _sqlite3.connect(settings.alpha_db_path)
+        conn.row_factory = _sqlite3.Row
+        rows = conn.execute(
+            "SELECT status, position_size_usd FROM positions WHERE DATE(opened_at)=DATE('now')"
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            orders_submitted += 1
+            st = (row["status"] or "").lower()
+            if st in ("open", "closed", "partial_exit"):
+                orders_filled += 1
+            elif "reject" in st or "fail" in st:
+                orders_rejected += 1
+            buying_power_used += float(row["position_size_usd"] or 0)
+    except Exception:
+        pass
+
+    open_pos = count_open_positions(settings.alpha_db_path)
+
+    return JSONResponse({
+        "service":                "alpha-execution",
+        "session_date":           __import__("datetime").date.today().isoformat(),
+        "go_verdicts":            app_state.get("trades_today", 0),
+        "alpaca_orders_submitted": orders_submitted,
+        "alpaca_orders_filled":   orders_filled,
+        "alpaca_orders_rejected": orders_rejected,
+        "open_positions_count":   open_pos,
+        "buying_power_used_usd":  round(buying_power_used, 2),
+        "execution_paused":       app_state.get("execution_paused", False),
+        "auto_execute":           app_state.get("auto_execute", False),
+        "alpaca_reachable":       app_state.get("alpaca_reachable", False),
+        "vix_brake":              app_state.get("vix_brake_status", "UNKNOWN"),
     })
 
 
