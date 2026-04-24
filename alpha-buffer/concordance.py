@@ -271,47 +271,117 @@ def _weighted_score(agent_scores: dict[str, float]) -> float:
 
 def _detect_echo_chamber(agent_reasoning: dict[str, str]) -> bool:
     """
-    Detect if agents are likely citing the same source (echo chamber).
+    Detect if agents are literally copying each other's analysis (true echo chamber).
 
-    Heuristic: if 2+ agent reasoning strings share more than 60% of their
-    significant word tokens, flag as potential echo chamber.
-    Note: OMNI's o3-mini does deeper echo chamber detection during synthesis.
-    This is a fast pre-filter only.
+    Two-stage detection:
+      Stage 1 (structural) — Primary signal. If two reasoning strings are within
+        10% of each other in length AND share the same first 8 words, that is a
+        strong indicator of copied/templated analysis. Flags immediately.
+      Stage 2 (vocabulary) — Secondary signal. If non-domain word overlap ≥80%
+        across reasonings that each have ≥15 significant words. Threshold is 80%
+        (not 60%) to avoid false positives from agents independently analyzing
+        the same stock and naturally using the same financial vocabulary.
+
+    Agents receive the same ORACLE-pre-warmed data from Axiom. Legitimate
+    independent analysis will share domain vocabulary (ticker, sector, technical
+    terms, macro context). This detector must NOT fire on vocabulary overlap alone
+    — it must require structural evidence of copying.
+
+    Note: OMNI's o3-mini does deeper echo chamber analysis during synthesis.
+    This is a fast pre-filter for obvious cases only.
 
     Args:
         agent_reasoning: Dict mapping agent name to reasoning text.
 
     Returns:
-        True if echo chamber is suspected.
+        True if structural evidence of copied/echo analysis is detected.
     """
     reasonings = [r.lower() for r in agent_reasoning.values() if r and len(r) > 30]
     if len(reasonings) < 2:
         return False
 
-    # Extract significant words (>4 chars, not stopwords)
+    # ── Stage 1: Structural similarity (primary signal) ───────────────────────
+    # If two strings have the same opening words AND similar length → likely copied
+    for i in range(len(reasonings)):
+        for j in range(i + 1, len(reasonings)):
+            a_words = reasonings[i].split()
+            b_words = reasonings[j].split()
+
+            # Same first 8 words
+            if len(a_words) >= 8 and len(b_words) >= 8:
+                if a_words[:8] == b_words[:8]:
+                    # Also check length similarity (within 10%)
+                    longer  = max(len(reasonings[i]), len(reasonings[j]))
+                    shorter = min(len(reasonings[i]), len(reasonings[j]))
+                    if shorter / longer >= 0.90:
+                        logger.warning(
+                            "Echo chamber (structural): identical opening + similar length "
+                            "between agent reasonings"
+                        )
+                        return True
+
+    # ── Stage 2: Non-domain vocabulary overlap (secondary signal) ────────────
+    # Expanded stopwords: generic English + comprehensive financial domain terms.
+    # Any word that two agents will naturally share when analyzing the same stock
+    # must be in this list so it doesn’t count as overlap evidence.
     stopwords = {
+        # Generic English
         "with", "that", "this", "from", "have", "will", "been",
         "their", "which", "than", "when", "into", "also", "both",
-        "stock", "trade", "ticker", "bullish", "bearish", "option",
+        "about", "above", "after", "before", "being", "below",
+        "could", "during", "other", "should", "these", "those",
+        "through", "under", "while", "would", "there", "where",
+        "given", "shows", "across",
+        # Directional / technical
+        "bullish", "bearish", "momentum", "support", "resistance",
+        "trend", "breakout", "oversold", "overbought", "upside",
+        "downside", "reversal", "consolidation", "technical",
+        "moving", "average", "signal", "setup", "pattern", "channel",
+        "range", "highs", "lows", "pivot", "target", "level", "levels",
+        "price", "volume", "above", "below", "recent",
+        # Fundamental
+        "earnings", "revenue", "growth", "margin", "catalyst",
+        "guidance", "estimate", "quarter", "annual", "sector",
+        "industry", "analyst", "rating", "upgrade", "downgrade",
+        "report", "results", "outlook", "forecast", "valuation",
+        # Macro / market structure
+        "rates", "yields", "inflation", "federal", "reserve",
+        "economic", "volatility", "uncertainty", "regime",
+        "conditions", "market", "markets", "macro", "broader",
+        # Option-specific
+        "strike", "expiry", "premium", "spread", "credit", "debit",
+        "theta", "delta", "gamma", "vega", "contracts", "options",
+        "calls", "expiration", "implied",
+        # Generic finance
+        "strong", "position", "entry", "trade", "stock", "equity",
+        "index", "score", "conviction", "confidence", "thesis",
+        "ticker", "option", "shares", "trading", "currently",
+        "continue", "remains", "showing", "suggest", "suggests",
     }
 
     def significant_words(text: str) -> set[str]:
+        """Extract non-domain content words that indicate unique analysis."""
         return {
             w for w in text.split()
             if len(w) > 4 and w.isalpha() and w not in stopwords
         }
 
-    # Check each pair
     word_sets = [significant_words(r) for r in reasonings]
+
     for i in range(len(word_sets)):
         for j in range(i + 1, len(word_sets)):
-            a, b    = word_sets[i], word_sets[j]
-            if not a or not b:
+            a, b = word_sets[i], word_sets[j]
+
+            # Minimum vocabulary guard: skip if either set is too small.
+            # Small sets produce false positives (e.g. 3 shared words out of 5 = 60%).
+            if len(a) < 15 or len(b) < 15:
                 continue
+
             overlap = len(a & b) / min(len(a), len(b))
-            if overlap >= 0.60:
+            if overlap >= 0.80:  # 80% threshold (was 60% — too aggressive for domain vocab)
                 logger.warning(
-                    "Echo chamber: %.0f%% word overlap between agent reasonings", overlap * 100
+                    "Echo chamber (vocabulary): %.0f%% non-domain word overlap "
+                    "between agent reasonings", overlap * 100
                 )
                 return True
 

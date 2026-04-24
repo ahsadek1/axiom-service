@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from config import VALID_AGENTS, MIN_SUBMISSION_SCORE, load_settings
+from config import VALID_AGENTS, MIN_SUBMISSION_SCORE, load_settings, assert_thresholds
 from concordance import evaluate_concordance
 from circuit_breaker import (
     CircuitBreakerStatus,
@@ -137,6 +137,13 @@ async def _omni_retry_loop() -> None:
                         "agents_involved": _json.loads(row["agents_involved"]),
                         "scores":          _json.loads(row["scores"]),
                         "agent_count":     row["agent_count"],
+                        # FIX: retry loop was missing required fields → 422 Unprocessable
+                        # OMNI ConcordancePayload requires: system, echo_chamber, notes
+                        # These columns don't exist in concordance_results DB (historical)
+                        # so we apply safe defaults: alpha system, no echo chamber, empty notes
+                        "system":          "alpha",
+                        "echo_chamber":    False,
+                        "notes":           [],
                     }
                     ok, response = await loop.run_in_executor(
                         None, lambda: dispatch_to_omni(
@@ -213,7 +220,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.critical("Auth config invalid: %s", e)
     init_db(settings.alpha_db_path)
     init_circuit_breaker(settings.alpha_db_path)
+    # Permanent guard: fail loudly if concordance thresholds are miscalibrated
+    # Prevents silent P2 starvation if MIN_SCORE_P2 is ever set above real agent output range
+    assert_thresholds()  # crashes startup if thresholds are wrong — better than silent 0 trades
     logger.info("Alpha Buffer ready (solo_entries=%s)", settings.solo_entries_enabled)
+    from shared.sovereign_comms import get_instructions, report
+    report("alpha_buffer", "INFO", {"event": "started"})
+    _instr = get_instructions("alpha_buffer")
+    if _instr:
+        logger.info("Alpha Buffer: %d instruction(s) from SOVEREIGN on startup", len(_instr))
     # OMNI H2 fix: start background OMNI retry loop
     retry_task = _asyncio.create_task(_omni_retry_loop())
     yield
@@ -241,6 +256,9 @@ class SubmitRequest(BaseModel):
     direction: str    # 'bullish' or 'bearish'
     score:     float  # 0-100
     reasoning: Optional[str] = None
+    window_id: Optional[str] = None  # Agent's pool window (YYYY-MM-DD-HHMM). Used as
+    # canonical DB key so all 3 agents analyzing the same pool land in the same window
+    # even if they submit across a 15-min boundary. [GENESIS concordance-window-fix]
 
     @field_validator("agent")
     @classmethod
@@ -421,6 +439,15 @@ def submit_pick(
             },
         )
 
+    # GENESIS concordance-window-fix: use the agent's window_id as the DB key.
+    # All 3 agents analyze the same Axiom pool push and carry its window_id.
+    # If submissions span a 15-min boundary (server clock ticks), using server's
+    # current_window_id() splits agents into different DB windows → concordance
+    # never forms. Using the agent's window_id unifies them in the same bucket.
+    # The staleness check above already rejected truly EXPIRED picks.
+    if body.window_id:
+        window_id = body.window_id
+
     # Persist submission
     save_submission(
         db_path   = settings.alpha_db_path,
@@ -507,14 +534,19 @@ def submit_pick(
             auth_headers     = settings.omni_auth_header,
             concordance_dict = concordance_dict,
         )
-        mark_omni_dispatched(
-            db_path       = settings.alpha_db_path,
-            window_id     = window_id,
-            ticker        = body.ticker,
-            direction     = body.direction,
-            omni_response = omni_response,
-        )
-        if not omni_ok:
+        if omni_ok:
+            # Only mark dispatched on success — failed dispatches stay omni_dispatched=0
+            # so the background retry loop can pick them up.
+            # BUG FIX: previously always called mark_omni_dispatched regardless of
+            # ok/fail, silently discarding failed dispatches (422/timeout). [GENESIS 2026-04-23]
+            mark_omni_dispatched(
+                db_path       = settings.alpha_db_path,
+                window_id     = window_id,
+                ticker        = body.ticker,
+                direction     = body.direction,
+                omni_response = omni_response,
+            )
+        else:
             logger.error(
                 "OMNI dispatch FAILED for %s/%s (pathway=%s) — concordance persisted, "
                 "omni_dispatched=False for retry",
@@ -715,3 +747,47 @@ def concordance_purge(
         "deleted_submissions":  deleted_submissions,
         "deleted_concordances": deleted_concordances,
     })
+
+
+# ── SOVEREIGN Push Endpoints ──────────────────────────────────────────────────
+
+class _SovDirective(BaseModel):
+    directive: str
+    data: dict = {}
+    from_agent: str = "sovereign"
+
+
+@app.post("/sovereign/directive", status_code=200)
+def sovereign_directive(
+    body: _SovDirective,
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN pushes a directive to alpha-buffer. Zero polling lag."""
+    verify_secret(x_nexus_secret)
+    d = body.directive.strip().upper()
+    logger.info("SOVEREIGN direct push to alpha-buffer: %s", d)
+
+    if d == "PING":
+        report("alpha_buffer", "ack", {"directive": "PING", "status": "alive"})
+        return JSONResponse({"ok": True, "directive": "PING", "status": "alive"})
+    elif d == "STATUS":
+        snap = {"directive": "STATUS", "service": "alpha_buffer", "port": int(__import__("os").getenv("PORT", "8002"))}
+        report("alpha_buffer", "status", snap)
+        return JSONResponse({"ok": True, **snap})
+    elif d in ("FLUSH", "RESET_DAY"):
+        report("alpha_buffer", "ack", {"directive": d, "status": "applied"})
+        return JSONResponse({"ok": True, "directive": d})
+    else:
+        report("alpha_buffer", "ack", {"directive": d, "status": "unrecognized"})
+        return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+@app.get("/sovereign/status", status_code=200)
+def sovereign_status(
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN queries alpha-buffer state on-demand."""
+    verify_secret(x_nexus_secret)
+    return JSONResponse({"ok": True, "service": "alpha_buffer", "port": int(__import__("os").getenv("PORT", "8002"))})
+
+

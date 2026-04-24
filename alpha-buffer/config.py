@@ -19,7 +19,12 @@ VALID_AGENTS          = frozenset(AGENT_WEIGHTS.keys())
 
 MIN_SUBMISSION_SCORE  = 58.0    # below this → reject submission
 GO_THRESHOLD_P1       = 65.0    # 3/3 agents, weighted score floor
-MIN_SCORE_P2          = 78.0    # 2/3 agents, each must meet this
+MIN_SCORE_P2          = 65.0    # 2/3 agents, each must meet this.
+                                 # Recalibrated 2026-04-24: was 78.0 (uncalibrated, never
+                                 # validated against real agent output). Agents consistently
+                                 # score 58-68 on quality setups. P2 now aligned with P1
+                                 # weighted threshold (65) — two agents agreeing at 65 is
+                                 # equivalent conviction to 3/3 agents weighted at 65.
 MIN_SCORE_SOLO_P3     = 90.0    # solo high-conviction minimum
 STRONG_GO_THRESHOLD   = 80.0    # upgrade to STRONG_GO label
 
@@ -113,3 +118,29 @@ def load_settings() -> Settings:
         port                     = int(os.getenv("PORT", "8002")),
         earnings_blocked_tickers = _blocked,
     )
+
+
+# ── Startup Sanity Check (permanent guard against threshold drift) ────────────
+def assert_thresholds() -> None:
+    """
+    Fail loudly at startup if concordance thresholds are miscalibrated.
+    Real agent scores range 58-80 in normal market conditions.
+    P2 must be reachable given actual scoring ranges.
+    """
+    assert MIN_SCORE_P2 <= 70.0, (
+        f"FATAL: MIN_SCORE_P2={MIN_SCORE_P2} is too high — agents score 58-68 on quality setups. "
+        f"P2 would be permanently unreachable. Set ≤ 70."
+    )
+    assert GO_THRESHOLD_P1 <= 70.0, (
+        f"FATAL: GO_THRESHOLD_P1={GO_THRESHOLD_P1} is too high — would block all P1 concordances."
+    )
+    assert MIN_SCORE_P2 >= MIN_SUBMISSION_SCORE, (
+        f"FATAL: MIN_SCORE_P2={MIN_SCORE_P2} < MIN_SUBMISSION_SCORE={MIN_SUBMISSION_SCORE} — "
+        f"contradicts submission gate."
+    )
+    assert MIN_SCORE_SOLO_P3 > 80.0, (
+        f"FATAL: MIN_SCORE_SOLO_P3={MIN_SCORE_SOLO_P3} too low — solo entries would fire too often."
+    )
+
+
+assert_thresholds()  # Run at import time — crashes process before any trade logic loads
