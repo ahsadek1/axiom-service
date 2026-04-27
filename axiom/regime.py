@@ -30,7 +30,9 @@ class Regime:
     alpha_debit_allowed: bool
     prime_allowed: bool
     alpha_credit_daily_cap: Optional[int]   # None = no cap
-    prime_daily_cap: Optional[int]          # None = no cap
+    prime_daily_cap: Optional[int]          # None = no cap — NOTE: currently unenforced downstream.
+                                            # prime-execution enforces MAX_NEW_PER_DAY in config.py instead.
+                                            # TODO: wire prime_daily_cap → prime-execution /execute gate.
     alpha_size_mult: float                  # sizing multiplier for Alpha
     is_estimated: bool                      # True if VIX was estimated (FRED down)
 
@@ -191,7 +193,11 @@ def classify_regime_v2(macro_data: Dict[str, Any]) -> Regime:
     # ── Extract raw values ─────────────────────────────────────────────────────
     vix: float = float(macro_data.get("vix") or 20.0)
     hy_spread: Optional[float] = _to_float(macro_data.get("hy_spread_bps") or macro_data.get("hy_spread"))
-    yield_curve: Optional[float] = _to_float(macro_data.get("yield_spread_bps") or macro_data.get("yield_curve_bps"))
+    yield_curve: Optional[float] = _to_float(
+        macro_data.get("yield_spread_bps") or
+        macro_data.get("yield_curve_bps") or
+        macro_data.get("yield_spread")   # MacroData field name from ORACLE
+    )
     put_call: Optional[float] = _to_float(macro_data.get("put_call_ratio"))
     is_estimated: bool = bool(macro_data.get("is_estimated", False))
 

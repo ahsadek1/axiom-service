@@ -18,7 +18,13 @@ EXIT_HARD_BACKSTOP_PCT       = -0.18  # -18% absolute backstop (technical stop p
 
 # ── Position Limits ───────────────────────────────────────────────────────────
 MAX_CONCURRENT_POSITIONS = 10
-MAX_NEW_PER_DAY          = 5
+# MAX_NEW_PER_DAY: hard ceiling on cumulative new entries per calendar day.
+# Set to 10 — provides headroom for intraday high-throughput windows while
+# capping runaway frequency. The concurrent cap (MAX_CONCURRENT_POSITIONS)
+# is the primary safeguard; this is the secondary daily ceiling.
+# History: was 5 (too tight for intraday close+reopen), raised to 50 (too loose),
+# settled at 10 (right balance — approved by Ahmed 2026-04-27).
+MAX_NEW_PER_DAY          = 10
 
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 ALPACA_DATA_URL  = "https://data.alpaca.markets"
