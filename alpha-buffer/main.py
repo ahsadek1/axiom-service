@@ -183,23 +183,21 @@ async def _omni_retry_loop() -> None:
 
 
 def _alert_lost_concordance(row: dict) -> None:
-    """Send Telegram alert when a concordance exhausts all OMNI dispatch retries."""
+    """Notify SOVEREIGN + Discord when a concordance exhausts all OMNI dispatch retries."""
     try:
-        import requests as _req
-        msg = (
-            f"⚠️ <b>LOST CONCORDANCE — OMNI Dispatch Failed (3 retries)</b>\n"
-            f"Ticker: {row['ticker']} {row['direction'].upper()}\n"
-            f"Pathway: {row['pathway']} | Window: {row['window_id']}\n"
-            f"Verdict: {row['verdict']} | Score: {row['weighted_score']:.1f}\n\n"
-            f"Concordance is permanently unexecuted. Manual review required."
-        )
-        _req.post(
-            f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-            json={"chat_id": settings.ahmed_chat_id, "text": msg, "parse_mode": "HTML"},
-            timeout=5,
+        from shared.notification_router import notify_warn as _nw
+        _nw(
+            "alpha-buffer",
+            "LOST CONCORDANCE — OMNI Dispatch Failed (3 retries)",
+            (
+                f"Pathway: {row['pathway']} | Window: {row['window_id']}\n"
+                f"Verdict: {row['verdict']} | Score: {row['weighted_score']:.1f}\n"
+                f"Concordance is permanently unexecuted."
+            ),
+            ticker=row['ticker'],
         )
     except Exception as e:
-        logger.error("Lost concordance alert failed: %s", e)
+        logger.error("Lost concordance notification failed: %s", e)
 
 
 @asynccontextmanager

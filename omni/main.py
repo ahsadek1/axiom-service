@@ -19,7 +19,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
@@ -41,6 +41,7 @@ from database import (
 from execution_router import calculate_position_size, route_to_execution
 from quad_intelligence import run_all_brains
 from synthesis import build_context, compute_verdict, _maybe_alert_brain_degradation
+from psychology_overlay import apply_psychology_overlay, PsychologyOverlayResult
 import oracle_client
 from telegram import send_axiom_block_alert, send_synthesis_card
 
@@ -149,6 +150,50 @@ def _is_market_hours() -> bool:
     return market_open <= now <= market_close
 
 
+def _check_canary_gate() -> Optional[str]:
+    """
+    CANARY gate check: read today's canary_status.json.
+
+    Returns None if trading is cleared (pass or canary not applicable).
+    Returns a block reason string if canary failed and synthesis should be blocked.
+
+    Policy:
+    - status=PASS    -> allow (trading cleared)
+    - status=RUNNING -> allow (canary mid-run, don't block)
+    - status=FAIL    -> BLOCK (canary explicitly failed today)
+    - not run yet    -> allow (log only, don't hard-block on missing file)
+    """
+    import json as _json
+    import os as _os
+    canary_path = "/Users/ahmedsadek/nexus/data/canary_status.json"
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        if not _os.path.exists(canary_path):
+            logger.info("OMNI CANARY: status file not found -- allowing synthesis (canary not yet run)")
+            return None
+        with open(canary_path) as _f:
+            data = _json.load(_f)
+        file_date = data.get("date", "")
+        if file_date != today:
+            logger.info(
+                "OMNI CANARY: status file is stale (%s, today=%s) -- allowing synthesis",
+                file_date, today,
+            )
+            return None
+        status = data.get("status", "")
+        if status == "PASS":
+            return None   # Trading cleared
+        if status == "RUNNING":
+            return None   # Canary mid-run -- don't block
+        if status == "FAIL":
+            detail = data.get("detail", "unknown failure")
+            return f"CANARY FAILED today ({today}): {detail}"
+        return None   # Unknown status -- allow
+    except Exception as e:
+        logger.warning("OMNI CANARY: gate check failed (%s) -- allowing synthesis", e)
+        return None
+
+
 def _synthesis_silence_watcher() -> None:
     """
     Background daemon thread: detect OMNI synthesis silence during market hours.
@@ -192,22 +237,11 @@ def _synthesis_silence_watcher() -> None:
                     )
                     # Alert Ahmed via Telegram
                     try:
-                        import requests as _req
-                        _req.post(
-                            f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                            json={
-                                "chat_id":    settings.ahmed_chat_id,
-                                "parse_mode": "HTML",
-                                "text": (
-                                    f"🚨 <b>OMNI SILENCE ALERT</b>\n"
-                                    f"No synthesis in <b>{silent_min:.0f} minutes</b> during market hours.\n"
-                                    f"Synthesis loop may be stalled. Check OMNI immediately."
-                                ),
-                            },
-                            timeout=8,
-                        )
+                        from shared.notification_router import notify_escalate as _ne
+                        _ne("omni", "OMNI SILENCE ALERT",
+                            f"No synthesis in {silent_min:.0f} minutes during market hours. Synthesis loop may be stalled.")
                     except Exception as _te:
-                        logger.error("Silence alert Telegram failed: %s", _te)
+                        logger.error("Silence alert notification failed: %s", _te)
                     # Also notify Sovereign via message bus
                     try:
                         import requests as _req
@@ -569,6 +603,21 @@ def receive_concordance(
         from fastapi.responses import JSONResponse as _JSONResponse
         return _JSONResponse(status_code=503, content={"status": "halted", "reason": "SOVEREIGN HALT active"})
 
+    # CANARY gate: if today's canary failed, block synthesis and alert
+    _canary_block = _check_canary_gate()
+    if _canary_block:
+        ticker_hint = getattr(body, 'ticker', '?')
+        logger.error(
+            "OMNI: CANARY GATE — synthesis blocked for %s: %s",
+            ticker_hint, _canary_block,
+        )
+        report("omni", "status", {"event": "concordance_rejected", "reason": "canary_failed", "detail": _canary_block})
+        from fastapi.responses import JSONResponse as _JSONResponse
+        return _JSONResponse(
+            status_code=503,
+            content={"status": "canary_blocked", "reason": _canary_block},
+        )
+
     concordance = body.model_dump()
     _pathway = concordance.get("pathway", "alpha")
     _ticker  = concordance["ticker"]
@@ -767,6 +816,11 @@ def _run_synthesis(
             chat_id          = settings.ahmed_chat_id,
         )
 
+    # ── Step 5b: Market Participant Psychology Overlay ────────────────────────
+    # Applied after compute_verdict — adjusts sizing only, never changes verdict.
+    # oracle_ctx is already available from Step 3 above.
+    verdict, psychology_overlay = apply_psychology_overlay(verdict, oracle_ctx)
+
     # ── Step 6: Calculate position size ──────────────────────────────────────
     position_size = calculate_position_size(
         base_size   = BASE_POSITION_SIZE,
@@ -790,6 +844,7 @@ def _run_synthesis(
         verdict              = verdict.verdict,
         verdict_notes        = " | ".join(verdict.notes),
         axiom_result         = axiom_result,
+        psychology_overlay   = psychology_overlay.to_dict() if psychology_overlay else None,
     )
 
     with _state_lock:                          # Pass B fix (V6): thread-safe counter
@@ -844,13 +899,14 @@ def _run_synthesis(
 
     if verdict.verdict in ("GO", "STRONG_GO"):
         send_synthesis_card(
-            bot_token     = settings.telegram_bot_token,
-            chat_id       = settings.ahmed_chat_id,
-            concordance   = concordance,
-            verdict       = verdict,
-            brain_results = brain_results,
-            position_size = position_size,
-            execution_ok  = execution_ok,
+            bot_token          = settings.telegram_bot_token,
+            chat_id            = settings.ahmed_chat_id,
+            concordance        = concordance,
+            verdict            = verdict,
+            brain_results      = brain_results,
+            position_size      = position_size,
+            execution_ok       = execution_ok,
+            psychology_overlay = psychology_overlay,
         )
     elif verdict.verdict == "CONDITIONAL":
         # CONDITIONAL = system degradation or borderline result. Alert Ahmed briefly.
@@ -1054,22 +1110,14 @@ def send_conditional_alert(
         brains_resp: Number of brains that responded.
         notes:       Synthesis notes explaining the conditional.
     """
-    import requests
     reason = notes[0] if notes else "borderline or degraded"
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id":    chat_id,
-                "parse_mode": "HTML",
-                "text": (
-                    f"⚠️ <b>OMNI CONDITIONAL — {ticker}</b>\n"
-                    f"Pathway: {pathway} | Brains: {brains_resp}/4 responded | GO votes: {votes_go}/4\n"
-                    f"Reason: {reason}\n"
-                    f"<i>No trade executed. Monitor quad intelligence health.</i>"
-                ),
-            },
-            timeout=8,
+        from shared.notification_router import notify_warn as _nw
+        _nw(
+            "omni",
+            f"OMNI CONDITIONAL — {ticker}",
+            f"Pathway: {pathway} | Brains: {brains_resp}/4 responded | GO votes: {votes_go}/4\nReason: {reason}\nNo trade executed.",
+            ticker=ticker,
         )
     except Exception:
         pass

@@ -490,19 +490,13 @@ def _run_startup_reconciliation() -> None:
                 len(closed_ids), summary,
             )
             try:
-                import requests as _req
-                _req.post(
-                    f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                    json={
-                        "chat_id": settings.ahmed_chat_id,
-                        "text": (
-                            f"🔄 <b>Alpha Execution — Startup Reconciliation</b>\n"
-                            f"Closed {len(closed_ids)} stale position(s):\n"
-                            + "\n".join(f"  • {s}" for s in closed_ids)
-                        ),
-                        "parse_mode": "HTML",
-                    },
-                    timeout=5,
+                import sys as _sys
+                _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+                from shared.notification_router import notify_warn as _nw
+                _nw(
+                    "alpha-execution",
+                    "Alpha Execution — Startup Reconciliation",
+                    f"Closed {len(closed_ids)} stale position(s):\n" + "\n".join(f"  • {s}" for s in closed_ids),
                 )
             except Exception:
                 pass
@@ -757,12 +751,8 @@ def execute(
     if vix_rejection:
         logger.warning("VIX BRAKE FIRED for %s: %s", body.ticker, vix_rejection)
         try:
-            import requests as _vix_req
-            _vix_req.post(
-                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                json={"chat_id": settings.ahmed_chat_id, "text": f"🚨 VIX BRAKE\n{vix_rejection}\nTicker: {body.ticker}"},
-                timeout=5,
-            )
+            from shared.notification_router import notify_warn as _nw
+            _nw("alpha-execution", "VIX BRAKE", vix_rejection, ticker=body.ticker)
         except Exception:
             pass
         return JSONResponse(
@@ -803,20 +793,12 @@ def execute(
         logger.warning("SPREAD RESOLUTION FAILED for %s/%s: %s", body.ticker, body.direction, e)
         # Alert Ahmed — GO verdict reached execution but no tradeable contract exists
         try:
-            import requests as _sr
-            _sr.post(
-                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                json={
-                    "chat_id": settings.ahmed_chat_id,
-                    "text": (
-                        f"⚠️ <b>SPREAD RESOLUTION FAILED</b>\n"
-                        f"Ticker: <b>{body.ticker}</b> | {body.direction} | {body.pathway}\n"
-                        f"Verdict was GO — but no tradeable contract found.\n"
-                        f"Reason: {str(e)[:200]}"
-                    ),
-                    "parse_mode": "HTML",
-                },
-                timeout=5,
+            from shared.notification_router import notify_warn as _nw
+            _nw(
+                "alpha-execution",
+                "SPREAD RESOLUTION FAILED",
+                f"Verdict was GO but no tradeable contract found.\nDirection: {body.direction} | Pathway: {body.pathway}\nReason: {str(e)[:200]}",
+                ticker=body.ticker,
             )
         except Exception:
             pass
@@ -947,12 +929,10 @@ def execute(
             cancel_pending_position(settings.alpha_db_path, pending_id)
         # Send dry-run Telegram alert
         try:
-            import requests as _dr_req
-            _dr_req.post(
-                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                json={"chat_id": settings.ahmed_chat_id, "text": f"[DRY RUN] Would execute: {body.ticker} {body.direction} | verdict={_verdict} | price=${current_price}"},
-                timeout=5,
-            )
+            from shared.notification_router import notify_info as _ni
+            _ni("alpha-execution", "[DRY RUN] Would execute",
+                f"{body.direction} | verdict={_verdict} | price=${current_price}",
+                ticker=body.ticker)
         except Exception:
             pass
         return JSONResponse(content={"executed": False, "mode": "dry_run", "order_preview": order_preview})
@@ -1167,13 +1147,8 @@ def execute(
             extra={"error": _fill.void_reason, "gate": "fill_confirmation", "elapsed_sec": _fill.elapsed_sec},
         )
         try:
-            import requests as _vr
-            _vr.post(
-                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                json={"chat_id": settings.ahmed_chat_id,
-                      "text": f"⚠️ VOID trade: {body.ticker} — {_fill.void_reason}"},
-                timeout=5,
-            )
+            from shared.notification_router import notify_warn as _nw
+            _nw("alpha-execution", "VOID trade", _fill.void_reason, ticker=body.ticker)
         except Exception:
             pass
         return JSONResponse(
@@ -1249,13 +1224,11 @@ def execute(
                 extra={"gate": "post_confirm_position_check", "position_id": position_id},
             )
             try:
-                import requests as _pc_req
-                _pc_req.post(
-                    f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                    json={"chat_id": settings.ahmed_chat_id,
-                          "text": f"⚠️ PHANTOM POSITION DETECTED: {body.ticker} — fill confirmed but zero Alpaca legs. Position #{position_id} auto-closed."},
-                    timeout=5,
-                )
+                from shared.notification_router import notify_escalate as _ne
+                _ne("alpha-execution",
+                    "PHANTOM POSITION DETECTED",
+                    f"Fill confirmed but zero Alpaca legs. Position #{position_id} auto-closed.",
+                    ticker=body.ticker)
             except Exception:
                 pass
             # Return 503 — the order technically filled but left no position
@@ -1572,25 +1545,21 @@ def _send_entry_notification(
     position_size_usd: float = 0.0,
     weighted_score: float = 0.0,
 ) -> None:
-    """Send trade opened Telegram notification."""
-    import requests
+    """Send trade opened notification via router (INFO — SOVEREIGN + Discord only)."""
     direction_emoji = "📈" if body.direction == "bullish" else "📉"
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id":    chat_id,
-                "text":       (
-                    f"{direction_emoji} <b>ALPHA TRADE OPENED — {body.ticker}</b>\n"
-                    f"Direction: {body.direction.upper()}\n"
-                    f"Spread: {spread.leg_description()}\n"
-                    f"Contracts: {contracts} | Size: ${position_size_usd:,.0f}\n"
-                    f"Pathway: {body.pathway} | Score: {weighted_score:.1f}\n"
-                    f"Position #{position_id}"
-                ),
-                "parse_mode": "HTML",
-            },
-            timeout=8,
+        from shared.notification_router import notify_info as _ni
+        _ni(
+            "alpha-execution",
+            f"{direction_emoji} ALPHA TRADE OPENED — {body.ticker}",
+            (
+                f"Direction: {body.direction.upper()}\n"
+                f"Spread: {spread.leg_description()}\n"
+                f"Contracts: {contracts} | Size: ${position_size_usd:,.0f}\n"
+                f"Pathway: {body.pathway} | Score: {weighted_score:.1f}\n"
+                f"Position #{position_id}"
+            ),
+            ticker=body.ticker,
         )
     except Exception:
         pass

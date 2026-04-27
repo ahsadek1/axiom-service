@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
 from alpaca_client import AlpacaClient
+from config import ALPACA_PAPER_URL
 from buffer_reporter import BufferReporter
 from config import MAX_CONCURRENT_POSITIONS, MAX_NEW_PER_DAY, load_settings
 from database import (
@@ -36,6 +37,7 @@ from database import (
     get_position_by_id,
     init_db,
     reserve_position_slot,
+    ticker_already_open,
     # save_position: replaced by reserve+confirm PENDING pattern (Cipher F1+F2 / OMNI H4)
 )
 from exit_monitor import evaluate_exits
@@ -58,7 +60,18 @@ app_state: dict = {
     "last_reconcile_at":           None,
     "last_reconcile_mismatches":   0,
     "was_paused_for_reconcile":    False,
+    "auto_execute":  os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true",
+    "mode":          "live" if os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true" else "dry_run",
+    # Exit monitor state (S10 fix)
+    "exit_monitor_last_run_at":      None,
+    "exit_monitor_last_event_count": 0,
+    "exit_monitor_last_error":       None,
+    "exit_monitor_run_count":        0,
 }
+if not app_state["auto_execute"]:
+    logger.warning("NEXUS_AUTO_EXECUTE=false — running in DRY_RUN mode. No Alpaca orders will be placed.")
+else:
+    logger.warning("NEXUS_AUTO_EXECUTE=true — LIVE TRADING MODE. Orders will be submitted to Alpaca.")
 # Lock for position-limit checks and DB writes during /execute
 _execute_lock = threading.Lock()
 # Separate lock for all app_state read-modify-write operations (adversarial fix #4)
@@ -92,7 +105,28 @@ def _is_market_hours() -> bool:
 @asynccontextmanager
 async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
     """Initialize DB and start exit monitor + reconciler scheduler."""
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from shared.db_guard import assert_unique_db_path  # S4: collision guard
+    assert_unique_db_path("prime-execution", settings.prime_db_path)
     logger.info("Prime Execution starting...")
+    # G9 SYS-2: Auth registry validation
+    from shared.auth_registry import validate_service_auth_config, AuthConfigError
+    try:
+        validate_service_auth_config("prime-execution")
+        logger.info("Auth registry validation passed for prime-execution")
+    except AuthConfigError as e:
+        logger.critical("Auth config invalid: %s", e)
+    # G11 SYS-4: Validate Alpaca API key at startup
+    from shared.api_key_validator import ApiKeyValidator
+    _validator = ApiKeyValidator()
+    _alpaca_result = _validator.validate_alpaca(
+        settings.alpaca_api_key, settings.alpaca_secret_key, ALPACA_PAPER_URL
+    )
+    if _alpaca_result.status == "failed":
+        logger.critical("API key probe: alpaca → FAILED (%s)", _alpaca_result.message)
+    else:
+        logger.info("API key probe: alpaca → %s (%s)", _alpaca_result.status, _alpaca_result.message)
     init_db(settings.prime_db_path)
 
     # OMNI H-NEW-1 fix: start AILS outcome retry worker
@@ -122,14 +156,22 @@ async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
     scheduler.start()
     app_state["scheduler"] = scheduler
     logger.info("Prime Execution ready")
+    from shared.sovereign_comms import get_instructions, report
+    report("prime_execution", "INFO", {"event": "started"})
+    _instr = get_instructions("prime_execution")
+    if _instr:
+        logger.info("Prime Execution: %d instruction(s) from SOVEREIGN on startup", len(_instr))
     yield
     scheduler.shutdown(wait=False)
     logger.info("Prime Execution stopped")
 
 
 def _run_exit_monitor() -> None:
+    """Scheduled exit monitor tick. Updates app_state for /exit-monitor/status."""
     if not _is_market_hours():
         return
+    app_state["exit_monitor_last_run_at"] = datetime.now(ET).isoformat()
+    app_state["exit_monitor_run_count"]  += 1
     try:
         events = evaluate_exits(
             db_path         = settings.prime_db_path,
@@ -138,9 +180,12 @@ def _run_exit_monitor() -> None:
             bot_token       = settings.telegram_bot_token,
             chat_id         = settings.ahmed_chat_id,
         )
+        app_state["exit_monitor_last_event_count"] = len(events)
+        app_state["exit_monitor_last_error"]       = None
         if events:
             logger.info("Prime exit monitor: %d events", len(events))
     except Exception as e:
+        app_state["exit_monitor_last_error"] = str(e)[:200]
         logger.error("Prime exit monitor failed: %s", e)
 
 
@@ -235,16 +280,28 @@ class TechnicalStopRequest(BaseModel):
 
 @app.get("/health")
 def health() -> JSONResponse:
-    """Health check. Always 200."""
+    """Health check with real Alpaca connectivity probe."""
+    try:
+        acct = _get_alpaca().get_account()
+        alpaca_ok = acct.get("status") == "ACTIVE"
+    except Exception:
+        alpaca_ok = False
+    with _state_lock:
+        app_state["alpaca_reachable"] = alpaca_ok if "alpaca_reachable" in app_state else alpaca_ok
+    execution_valid = alpaca_ok and not app_state.get("execution_paused", False)
     return JSONResponse({
-        "status":              "healthy",
+        "status":              "healthy" if execution_valid else "degraded",
         "service":             "prime-execution",
         "version":             "3.0.0",
         "trades_today":        app_state["trades_today"],
         "open_positions":      count_open_positions(settings.prime_db_path),
+        "execution_valid":     execution_valid,
+        "alpaca_reachable":    alpaca_ok,
         "execution_paused":    app_state["execution_paused"],
         "last_reconcile_at":   app_state["last_reconcile_at"],
         "uptime_since":        app_state["start_time"],
+        "auto_execute":        app_state.get("auto_execute", False),
+        "mode":                app_state.get("mode", "dry_run"),
     })
 
 
@@ -270,6 +327,30 @@ def execute(
         JSON with execution result and position details.
     """
     verify_secret(x_nexus_prime_secret)
+
+    # Market hours gate — never submit orders outside 9:30 AM – 4:00 PM ET.
+    # Prevents after-hours order submission caused by service restarts, stale
+    # queue flushes, or OMNI signals that arrive outside trading hours.
+    if not _is_market_hours():
+        logger.warning(
+            "Prime execution rejected: outside market hours — ticker=%s window=%s",
+            body.ticker, body.window_id,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "executed": False,
+                "reason":   "Outside market hours (9:30 AM – 4:00 PM ET, weekdays only)",
+            },
+        )
+
+    # Pipeline Sentinel — execution received this signal
+    _ps_trace_id = f"{body.window_id}:{body.ticker}"
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+        _trace_hop(_ps_trace_id, "execution_received", "prime-execution", body.ticker, "prime")
+    except Exception:
+        pass
 
     # Cipher Finding 7: verdict whitelist — execution bridge last-line gate.
     if body.verdict not in ("GO", "STRONG_GO"):
@@ -317,6 +398,22 @@ def execute(
         open_count  = count_open_positions(settings.prime_db_path)  # includes 'pending'
         today_count = count_new_positions_today(settings.prime_db_path)
 
+        # Per-ticker duplicate guard (2026-04-24): reject if ticker already open.
+        # Concordances fire per-window; a strong ticker can generate new P1 events
+        # in subsequent windows. Without this guard, the same ticker gets opened
+        # multiple times. Must be inside the lock to be race-condition safe.
+        if ticker_already_open(settings.prime_db_path, body.ticker):
+            logger.info(
+                "Prime execution blocked: %s already has an open position", body.ticker
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "executed": False,
+                    "reason":   f"{body.ticker} already has an open position — no duplicates allowed",
+                },
+            )
+
         if open_count >= MAX_CONCURRENT_POSITIONS:
             return JSONResponse(
                 status_code=429,
@@ -347,6 +444,27 @@ def execute(
     alpaca_order_id = None
     order_error     = None
 
+    # ── AUTO_EXECUTE Gate — dry-run if kill-switch is off ──────────────────────
+    if not app_state.get("auto_execute", False):
+        order_preview = {
+            "ticker":    body.ticker,
+            "direction": body.direction,
+            "qty":       shares,
+            "verdict":   body.verdict,
+        }
+        logger.info("DRY_RUN: would have executed %s %s (verdict=%s)", body.ticker, body.direction, body.verdict)
+        if pending_id:
+            cancel_pending_position(settings.prime_db_path, pending_id)
+        # Send dry-run Telegram alert
+        try:
+            from shared.notification_router import notify_info as _ni
+            _ni("prime-execution", "[DRY RUN] Would execute",
+                f"{body.direction} | verdict={body.verdict} | price=${current_price}",
+                ticker=body.ticker)
+        except Exception:
+            pass
+        return JSONResponse(content={"executed": False, "mode": "dry_run", "order_preview": order_preview})
+
     try:
         order           = alpaca.place_order(body.ticker, shares, side)
         alpaca_order_id = order.get("id")
@@ -354,6 +472,11 @@ def execute(
             "Prime order placed: %s %s %.0f shares @ ~$%.2f | order_id=%s",
             side.upper(), body.ticker, shares, current_price, alpaca_order_id,
         )
+        try:
+            from pipeline_client import trace_hop as _trace_hop
+            _trace_hop(_ps_trace_id, "alpaca_submitted", "prime-execution", body.ticker, "prime")
+        except Exception:
+            pass
     except Exception as e:
         order_error = str(e)[:200]
         logger.error("Alpaca order FAILED for %s: %s — cancelling pending slot", body.ticker, e)
@@ -366,17 +489,57 @@ def execute(
                      "position_id": None},
         )
 
+    # ── G10 SYS-3: OSI-Aware Fill Confirmation ───────────────────────────────
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from shared.order_reconciler import OrderReconciler, FillStatus as _FillStatus
+    _reconciler = OrderReconciler(
+        alpaca_base_url    = ALPACA_PAPER_URL,
+        alpaca_key         = settings.alpaca_api_key,
+        alpaca_secret      = settings.alpaca_secret_key,
+        dry_run            = os.getenv("RECONCILE_ORDERS", "").lower() != "true",
+    )
+    _fill = _reconciler.confirm_fill(
+        order_id     = alpaca_order_id or "",
+        ticker       = body.ticker,
+        expected_qty = float(shares),
+    )
+    if _fill.status == _FillStatus.VOID:
+        logger.error(
+            "Trade VOID for %s: %s (elapsed: %.1fs)",
+            body.ticker, _fill.void_reason, _fill.elapsed_sec,
+        )
+        if pending_id:
+            cancel_pending_position(settings.prime_db_path, pending_id)
+        try:
+            from shared.notification_router import notify_warn as _nw
+            _nw("prime-execution", "VOID trade", _fill.void_reason, ticker=body.ticker)
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=503,
+            content={"status": "void", "reason": _fill.void_reason, "executed": False},
+        )
+
     # ── Alpaca confirmed — promote pending slot to open position ─────────────
+    _confirmed_price = _fill.fill_price if _fill.fill_price is not None else current_price
     confirm_pending_position(
         db_path          = settings.prime_db_path,
         position_id      = pending_id,
         alpaca_order_id  = alpaca_order_id or "",
-        entry_price      = current_price,
+        entry_price      = _confirmed_price,
         shares_remaining = shares,
     )
     position_id = pending_id
     with _state_lock:
         app_state["trades_today"] += 1
+
+    # Pipeline Sentinel — Alpaca order confirmed, position live
+    try:
+        from pipeline_client import trace_hop as _trace_hop
+        _trace_hop(_ps_trace_id, "alpaca_confirmed", "prime-execution", body.ticker, "prime")
+    except Exception:
+        pass
 
     _notify_entry(settings.telegram_bot_token, settings.ahmed_chat_id,
                   body, position_id, shares, current_price, alpaca_order_id)
@@ -441,6 +604,93 @@ def get_positions(x_nexus_prime_secret: str = Header(default="")) -> JSONRespons
     })
 
 
+@app.get("/trades")
+def get_trades_summary(x_nexus_prime_secret: str = Header(default="")) -> JSONResponse:
+    """
+    Return Prime execution summary for SOVEREIGN observability.
+
+    Exposes: session go verdicts, Alpaca orders submitted/filled/rejected,
+    open positions, and buying power state.  SOVEREIGN polls this at
+    market open, midday, and close every session.
+    """
+    verify_secret(x_nexus_prime_secret)
+
+    # Count positions by status from DB
+    import sqlite3 as _sqlite3
+    orders_submitted = 0
+    orders_filled = 0
+    orders_rejected = 0
+    buying_power_used = 0.0
+    try:
+        conn = _sqlite3.connect(settings.prime_db_path)
+        conn.row_factory = _sqlite3.Row
+        rows = conn.execute(
+            "SELECT status, position_size_usd FROM positions WHERE DATE(opened_at)=DATE('now')"
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            orders_submitted += 1
+            st = row["status"]
+            if st in ("open", "closed", "partial_exit"):
+                orders_filled += 1
+            elif st == "rejected":
+                orders_rejected += 1
+            buying_power_used += float(row["position_size_usd"] or 0)
+    except Exception:
+        pass
+
+    open_positions = get_open_positions(settings.prime_db_path)
+
+    return JSONResponse({
+        "service":               "prime-execution",
+        "session_date":          __import__("datetime").date.today().isoformat(),
+        "go_verdicts":           app_state.get("trades_today", 0),
+        "alpaca_orders_submitted": orders_submitted,
+        "alpaca_orders_filled":  orders_filled,
+        "alpaca_orders_rejected": orders_rejected,
+        "open_positions_count":  len(open_positions),
+        "open_positions":        open_positions,
+        "buying_power_used_usd": round(buying_power_used, 2),
+        "execution_paused":      app_state.get("execution_paused", False),
+        "auto_execute":          app_state.get("auto_execute", False),
+        "alpaca_reachable":      app_state.get("alpaca_reachable", False),
+    })
+
+
+@app.get("/exit-monitor/status")
+def exit_monitor_status(x_nexus_prime_secret: str = Header(default="")) -> JSONResponse:
+    """
+    Return current Prime exit monitor scheduler state.
+
+    Reports last run timestamp, last event count, any errors, and scheduler job status.
+    The exit monitor runs every 1 min during market hours (9–15 ET) via APScheduler.
+    """
+    verify_secret(x_nexus_prime_secret)
+    scheduler = app_state.get("scheduler")
+    next_run_at = None
+    scheduler_running = False
+    if scheduler:
+        scheduler_running = scheduler.running
+        try:
+            job = scheduler.get_job("prime_exit_monitor")
+            if job and job.next_run_time:
+                next_run_at = job.next_run_time.isoformat()
+        except Exception:
+            pass
+
+    return JSONResponse({
+        "exit_monitor": {
+            "scheduler_running":  scheduler_running,
+            "schedule":           "every 1 min during market hours (09:00–15:59 ET)",
+            "last_run_at":        app_state.get("exit_monitor_last_run_at"),
+            "last_event_count":   app_state.get("exit_monitor_last_event_count", 0),
+            "last_error":         app_state.get("exit_monitor_last_error"),
+            "run_count":          app_state.get("exit_monitor_run_count", 0),
+            "next_run_at":        next_run_at,
+        }
+    })
+
+
 @app.post("/resume")
 def resume_execution(x_nexus_prime_secret: str = Header(default="")) -> JSONResponse:
     """Clear execution_paused flag.
@@ -475,23 +725,88 @@ def manual_reconcile(x_nexus_prime_secret: str = Header(default="")) -> JSONResp
     return JSONResponse(result)
 
 
+
+# ── SOVEREIGN Push Endpoints ──────────────────────────────────────────────────
+
+class _SovDirective(BaseModel):
+    directive: str
+    data: dict = {}
+    from_agent: str = "sovereign"
+
+
+@app.post("/sovereign/directive", status_code=200)
+def sovereign_directive(
+    body: _SovDirective,
+    x_nexus_prime_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN pushes a directive. Zero polling lag."""
+    verify_secret(x_nexus_prime_secret)
+    d = body.directive.strip().upper()
+    logger.info("SOVEREIGN direct push: %s", d)
+
+    if d == "PING":
+        report("prime_execution", "ack", {"directive": "PING", "status": "alive"})
+        return JSONResponse({"ok": True, "directive": "PING", "status": "alive"})
+    elif d == "HALT":
+        with _state_lock:
+            app_state["execution_paused"] = True
+        report("prime_execution", "ack", {"directive": "HALT", "status": "applied", "paused": True})
+        return JSONResponse({"ok": True, "directive": "HALT", "paused": True})
+    elif d == "RESUME":
+        with _state_lock:
+            app_state["execution_paused"] = False
+        report("prime_execution", "ack", {"directive": "RESUME", "status": "applied", "paused": False})
+        return JSONResponse({"ok": True, "directive": "RESUME", "paused": False})
+    elif d in ("FLUSH", "RESET_DAY"):
+        with _state_lock:
+            app_state["trades_today"] = 0
+        report("prime_execution", "ack", {"directive": d, "status": "applied"})
+        return JSONResponse({"ok": True, "directive": d})
+    elif d == "STATUS":
+        with _state_lock:
+            snap = {
+                "directive": "STATUS", "service": "prime_execution",
+                "paused": app_state.get("execution_paused", False),
+                "auto_execute": app_state.get("auto_execute", False),
+                "trades_today": app_state.get("trades_today", 0),
+            }
+        report("prime_execution", "status", snap)
+        return JSONResponse({"ok": True, **snap})
+    else:
+        report("prime_execution", "ack", {"directive": d, "status": "unrecognized"})
+        return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+@app.get("/sovereign/status", status_code=200)
+def sovereign_status(
+    x_nexus_prime_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN queries full prime-execution state on-demand."""
+    verify_secret(x_nexus_prime_secret)
+    with _state_lock:
+        return JSONResponse({
+            "ok": True, "service": "prime_execution",
+            "paused": app_state.get("execution_paused", False),
+            "auto_execute": app_state.get("auto_execute", False),
+            "trades_today": app_state.get("trades_today", 0),
+            "total_trades": app_state.get("total_trades", 0),
+            "port": int(__import__("os").getenv("PORT", "8006")),
+        })
+
+
 def _notify_entry(bot_token, chat_id, body, position_id, shares, price, order_id):
-    import requests
     emoji = "📈" if body.direction == "bullish" else "📉"
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id":    chat_id,
-                "parse_mode": "HTML",
-                "text": (
-                    f"{emoji} <b>PRIME TRADE OPENED — {body.ticker}</b>\n"
-                    f"Direction: {body.direction.upper()} | {shares:.0f} shares @ ${price:.2f}\n"
-                    f"Size: ${body.position_size_usd:,.0f} | Pathway: {body.pathway}\n"
-                    f"Score: {body.weighted_score:.1f} | Position #{position_id}"
-                ),
-            },
-            timeout=8,
+        from shared.notification_router import notify_info as _ni
+        _ni(
+            "prime-execution",
+            f"{emoji} PRIME TRADE OPENED — {body.ticker}",
+            (
+                f"Direction: {body.direction.upper()} | {shares:.0f} shares @ ${price:.2f}\n"
+                f"Size: ${body.position_size_usd:,.0f} | Pathway: {body.pathway}\n"
+                f"Score: {body.weighted_score:.1f} | Position #{position_id}"
+            ),
+            ticker=body.ticker,
         )
     except Exception:
         pass
