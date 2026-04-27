@@ -29,6 +29,7 @@ from buffer_reporter import BufferReporter
 from config import MAX_CONCURRENT_POSITIONS, MAX_NEW_PER_DAY, load_settings
 from database import (
     cancel_pending_position,
+    close_stale_position,
     confirm_pending_position,
     count_new_positions_today,
     count_open_positions,
@@ -90,6 +91,106 @@ def _get_alpaca() -> AlpacaClient:
     return AlpacaClient(settings.alpaca_api_key, settings.alpaca_secret_key)
 
 
+def _run_startup_reconciliation() -> None:
+    """
+    Startup reconciliation: close any DB-open positions absent from Alpaca.
+
+    Logic:
+      1. Fetch all DB positions with status IN ('open', 'pending').
+      2. Fetch all live positions from Alpaca (best-effort).
+      3. Build Alpaca ticker set.
+      4. For each DB position:
+         a. If window_id contains 'test' (case-insensitive) → always close;
+            test entries must never survive in production position tracking.
+         b. If ticker not in Alpaca live positions → close with reconcile reason.
+      5. Log and report to SOVEREIGN for each closed position.
+
+    Non-blocking: if Alpaca is unreachable, logs a warning and
+    skips the live-mismatch check. Test-window cleanup still runs.
+
+    GENESIS 2026-04-27: ported from alpha-execution startup reconciliation.
+    Closes the GAP-3 dangling position root cause permanently.
+    """
+    try:
+        db_positions = get_open_positions(settings.prime_db_path)
+
+        # Also include pending slots left by a previous crash
+        from database import get_conn as _get_conn
+        with _get_conn(settings.prime_db_path) as _conn:
+            _pending_rows = _conn.execute(
+                "SELECT * FROM positions WHERE status='pending'"
+            ).fetchall()
+        pending_positions = [dict(r) for r in _pending_rows]
+        all_db_positions  = db_positions + pending_positions
+
+        if not all_db_positions:
+            logger.info("Startup reconciliation: no open/pending positions in DB — nothing to check")
+            return
+
+        # Fetch live Alpaca tickers — best effort
+        alpaca_tickers = None  # None = unreachable; set() = reachable but empty
+        try:
+            alpaca         = _get_alpaca()
+            live           = alpaca.get_positions()
+            alpaca_tickers = {str(p.get("symbol", "")).upper() for p in live}
+            logger.info(
+                "Startup reconciliation: %d DB position(s), %d Alpaca position(s)",
+                len(all_db_positions), len(alpaca_tickers),
+            )
+        except Exception as alpaca_err:
+            logger.warning(
+                "Startup reconciliation: Alpaca unreachable (%s) — "
+                "will still close test-window entries; live-mismatch check skipped",
+                alpaca_err,
+            )
+
+        closed_ids: list = []
+        for pos in all_db_positions:
+            pos_id = pos["id"]
+            ticker = (pos.get("ticker") or "").upper()
+            window = (pos.get("window_id") or "")
+
+            # Rule A: test-window entries are NEVER production positions
+            if "test" in window.lower():
+                reason = f"reconciled_test_window: window_id='{window}' is a test entry"
+                close_stale_position(settings.prime_db_path, pos_id, reason)
+                closed_ids.append(f"#{pos_id} {ticker} (test window)")
+                logger.warning(
+                    "Startup reconciliation: closed test entry #%d %s window=%s",
+                    pos_id, ticker, window,
+                )
+                continue
+
+            # Rule B: DB position not in Alpaca live set → it leaked
+            if alpaca_tickers is not None and ticker not in alpaca_tickers:
+                reason = f"reconciled_missing_from_alpaca: ticker={ticker} not in live positions"
+                close_stale_position(settings.prime_db_path, pos_id, reason)
+                closed_ids.append(f"#{pos_id} {ticker} (not in Alpaca)")
+                logger.warning(
+                    "Startup reconciliation: closed leaked position #%d %s — not in Alpaca live set",
+                    pos_id, ticker,
+                )
+
+        if closed_ids:
+            from shared.sovereign_comms import report
+            report("prime_execution", "WARN", {
+                "event":       "startup_reconciliation",
+                "closed_count": len(closed_ids),
+                "closed":       closed_ids,
+                "action":      "Stale/test positions cleaned. Execution unblocked.",
+            })
+            logger.warning(
+                "Startup reconciliation: closed %d stale position(s): %s",
+                len(closed_ids), ", ".join(closed_ids),
+            )
+        else:
+            logger.info("Startup reconciliation: all DB positions confirmed in Alpaca — clean")
+
+    except Exception as e:
+        # Never block startup
+        logger.error("Startup reconciliation failed (non-fatal): %s", e)
+
+
 def _get_reporter() -> BufferReporter:
     return BufferReporter(settings.prime_buffer_url, settings.nexus_prime_secret)
 
@@ -128,6 +229,12 @@ async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
     else:
         logger.info("API key probe: alpaca → %s (%s)", _alpaca_result.status, _alpaca_result.message)
     init_db(settings.prime_db_path)
+
+    # GAP-3 fix: Startup reconciliation — close any DB-open positions absent from Alpaca.
+    # Prevents dangling 'open'/'pending' positions from blocking all future GO verdicts.
+    # Runs once synchronously before scheduler starts. Safe — non-blocking on Alpaca failure.
+    # GENESIS 2026-04-27.
+    _run_startup_reconciliation()
 
     # OMNI H-NEW-1 fix: start AILS outcome retry worker
     from ails_reporter import start_retry_worker as _start_ails_retry
@@ -497,7 +604,9 @@ def execute(
         alpaca_base_url    = ALPACA_PAPER_URL,
         alpaca_key         = settings.alpaca_api_key,
         alpaca_secret      = settings.alpaca_secret_key,
-        dry_run            = os.getenv("RECONCILE_ORDERS", "").lower() != "true",
+        # FIX (2026-04-27): was "!= true" (opt-in) — reconciler was always in dry_run.
+        # Now "== skip" (opt-out): reconciliation is ON by default, disabled only explicitly.
+        dry_run            = os.getenv("RECONCILE_ORDERS", "").lower() == "skip",
     )
     _fill = _reconciler.confirm_fill(
         order_id     = alpaca_order_id or "",
@@ -543,6 +652,30 @@ def execute(
 
     _notify_entry(settings.telegram_bot_token, settings.ahmed_chat_id,
                   body, position_id, shares, current_price, alpaca_order_id)
+
+    # Discord mirror — fill confirmed to #execution-monitoring
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+        from discord_client import post_to_discord as _disc
+        _disc(
+            channel     = "execution-monitoring",
+            title       = f"💎 PRIME FILL — {body.ticker}",
+            description = f"{body.direction.upper()} equity. {round(shares,2)} shares @ ${current_price:.2f}.",
+            color       = "teal",
+            fields      = [
+                {"name": "Ticker",    "value": body.ticker,                    "inline": True},
+                {"name": "Direction", "value": body.direction.upper(),         "inline": True},
+                {"name": "Shares",    "value": str(round(shares, 2)),          "inline": True},
+                {"name": "Price",     "value": f"${current_price:.2f}",        "inline": True},
+                {"name": "Size",      "value": f"${body.position_size_usd:,.0f}", "inline": True},
+                {"name": "Position",  "value": f"#{position_id}",              "inline": True},
+            ],
+            footer      = "Prime Execution",
+            agent       = "prime-execution",
+        )
+    except Exception as _disc_exc:
+        logger.warning(f"Discord push failed (non-fatal): {_disc_exc}")
 
     return JSONResponse({
         "executed":      True,
@@ -775,6 +908,52 @@ def sovereign_directive(
     else:
         report("prime_execution", "ack", {"directive": d, "status": "unrecognized"})
         return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+
+
+# ── GAP-006: /log_tail — Runtime log access (2026-04-27) ─────────────────────
+# Gives OMNI, integrity checker, and SOVEREIGN visibility into recent logs
+# without requiring SSH or Railway dashboard access. Authenticated.
+@app.get("/log_tail")
+def log_tail(
+    lines:                int = 50,
+    filter_str:           str = "",
+    x_nexus_prime_secret: str = Header(default=""),
+) -> JSONResponse:
+    """
+    Return the last N lines of the service stderr log.
+    Optional filter_str narrows to lines containing that string.
+    Max 200 lines per call to avoid abuse.
+    """
+    verify_secret(x_nexus_prime_secret)
+    import os as _os, pathlib as _pl
+    lines = min(lines, 200)
+    log_path = _os.getenv("STDERR_LOG_PATH", "")
+    if not log_path or not _pl.Path(log_path).exists():
+        candidates = [
+            "/Users/ahmedsadek/nexus/logs/alpha-execution/stderr.log",
+            "/Users/ahmedsadek/nexus/logs/prime-execution/stderr.log",
+            "/Users/ahmedsadek/nexus/logs/prime-execution/stderr.log",
+        ]
+        for c in candidates:
+            if _pl.Path(c).exists():
+                log_path = c
+                break
+    if not log_path or not _pl.Path(log_path).exists():
+        return JSONResponse({"ok": False, "error": "log file not found"})
+    try:
+        with open(log_path, "r", errors="replace") as _f:
+            all_lines = _f.readlines()
+        matched = [l for l in all_lines if filter_str.lower() in l.lower()] if filter_str else all_lines
+        tail = matched[-lines:]
+        return JSONResponse({
+            "ok": True, "log_path": log_path,
+            "lines": len(tail), "filter": filter_str or None,
+            "content": "".join(tail),
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
 
 
 @app.get("/sovereign/status", status_code=200)

@@ -8,6 +8,7 @@ Auth: X-Nexus-Secret header → NEXUS_WEBHOOK_SECRET.
 Port: 8005 (local), $PORT (Railway).
 """
 
+import asyncio
 import logging
 import os
 import secrets
@@ -122,6 +123,47 @@ else:
 _execute_lock = threading.Lock()
 _state_lock   = threading.Lock()  # OMNI M-NEW-3: guards app_state counter mutations
 _skipped_tickers: set = set()  # GAP-001: tickers skipped for session due to INVALID_PAYLOAD (422)
+
+# ── Token Bucket Rate Limiter — /execute endpoint ─────────────────────────────────────
+# Commercial-grade protection: max 10 /execute calls per 60s globally.
+# Protects against brute-force and runaway OMNI signal loops.
+# Pure Python — no external deps. GENESIS 2026-04-27 — GAP-5.
+import time as _time
+
+
+class _TokenBucket:
+    """Thread-safe token bucket rate limiter."""
+
+    def __init__(self, capacity: int, refill_rate: float) -> None:
+        """
+        Args:
+            capacity:    Max tokens (burst limit).
+            refill_rate: Tokens added per second.
+        """
+        self._capacity    = capacity
+        self._tokens      = float(capacity)
+        self._refill_rate = refill_rate
+        self._last_refill = _time.monotonic()
+        self._lock        = threading.Lock()
+
+    def consume(self, tokens: int = 1) -> bool:
+        """Return True if request is allowed, False if rate-limited."""
+        with self._lock:
+            now              = _time.monotonic()
+            elapsed          = now - self._last_refill
+            self._tokens     = min(
+                float(self._capacity),
+                self._tokens + elapsed * self._refill_rate,
+            )
+            self._last_refill = now
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+            return False
+
+
+# 10 requests per 60s burst; refill 1 token per 6s
+_execute_rate_limiter = _TokenBucket(capacity=10, refill_rate=1.0 / 6.0)
 
 
 def verify_secret(x_nexus_secret: str) -> None:
@@ -651,6 +693,19 @@ def execute(
     """
     verify_secret(x_nexus_secret)
 
+    # ── GAP-5: Rate Limit Gate ───────────────────────────────────────────────────
+    # Max 10 /execute calls per 60s. Blocks brute-force and runaway OMNI loops.
+    # GENESIS 2026-04-27.
+    if not _execute_rate_limiter.consume():
+        logger.warning(
+            "Rate limit exceeded on /execute — dropping request (ticker=%s)",
+            getattr(body, "ticker", "?"),
+        )
+        return JSONResponse(
+            status_code=429,
+            content={"executed": False, "reason": "Rate limit exceeded — max 10 requests per 60s"},
+        )
+
     # ── Normalize Optional fields to safe defaults ────────────────────────────
     # Some callers (Railway webhook omni_scanner, older OMNI versions) may omit
     # fields that are now Optional.  Apply defaults here so all downstream code
@@ -951,6 +1006,24 @@ def execute(
         long_symbol = _build_contract_symbol(
             spread.underlying, spread.expiration_date, spread.option_type, spread.long_strike
         )
+        # Pre-submission duplicate-leg guard (FIX 2026-04-27):
+        # If contract_resolver snaps both strikes to the same symbol, reject cleanly
+        # rather than sending a bad order to Alpaca and getting a 422 back.
+        if short_symbol == long_symbol:
+            logger.error(
+                "Duplicate-leg detected before order submission: "
+                "short=%s == long=%s for %s — rejecting order",
+                short_symbol, long_symbol, body.ticker,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "executed": False,
+                    "reason":   f"Duplicate spread legs: both legs resolved to {short_symbol}. "
+                                f"Contract resolver returned identical strikes.",
+                },
+            )
+
         legs = [
             {"symbol": short_symbol, "side": "sell", "ratio_qty": 1},
             {"symbol": long_symbol,  "side": "buy",  "ratio_qty": 1},
@@ -1064,19 +1137,32 @@ def execute(
             error_class = classify_error(e)
 
             # INVALID_PAYLOAD (422): never pause — skip ticker and continue immediately
+            # FIX (2026-04-27): /execute is a sync endpoint — asyncio.create_task() is
+            # unavailable here and raises NameError in a sync context.  Use
+            # threading.Thread to launch the async healer in its own event loop instead.
+            def _run_healer_sync(exc, ticker, app_state, state_lock, api_key, api_secret, skipped_tickers):
+                import asyncio as _asyncio
+                _asyncio.run(
+                    auto_heal_execution(
+                        exc=exc,
+                        ticker=ticker,
+                        app_state=app_state,
+                        state_lock=state_lock,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        skipped_tickers=skipped_tickers,
+                    )
+                )
+
             if error_class == ExecutionErrorClass.INVALID_PAYLOAD:
                 if body.ticker.upper() not in _skipped_tickers:
-                    asyncio.create_task(
-                        auto_heal_execution(
-                            exc=e,
-                            ticker=body.ticker,
-                            app_state=app_state,
-                            state_lock=_state_lock,
-                            api_key=settings.alpaca_api_key,
-                            api_secret=settings.alpaca_secret_key,
-                            skipped_tickers=_skipped_tickers,
-                        )
-                    )
+                    threading.Thread(
+                        target=_run_healer_sync,
+                        args=(e, body.ticker, app_state, _state_lock,
+                              settings.alpaca_api_key, settings.alpaca_secret_key,
+                              _skipped_tickers),
+                        daemon=True,
+                    ).start()
             else:
                 # All other errors: set paused flag first, then spawn healer
                 with _state_lock:
@@ -1096,17 +1182,13 @@ def execute(
                             "error":       order_error,
                             "error_class": error_class.value,
                         }, escalation=EscalationLevel.CRITICAL)
-                        asyncio.create_task(
-                            auto_heal_execution(
-                                exc=e,
-                                ticker=body.ticker,
-                                app_state=app_state,
-                                state_lock=_state_lock,
-                                api_key=settings.alpaca_api_key,
-                                api_secret=settings.alpaca_secret_key,
-                                skipped_tickers=_skipped_tickers,
-                            )
-                        )
+                        threading.Thread(
+                            target=_run_healer_sync,
+                            args=(e, body.ticker, app_state, _state_lock,
+                                  settings.alpaca_api_key, settings.alpaca_secret_key,
+                                  _skipped_tickers),
+                            daemon=True,
+                        ).start()
 
             return JSONResponse(
                 status_code=503,
@@ -1126,7 +1208,9 @@ def execute(
         alpaca_base_url    = ALPACA_PAPER_URL,
         alpaca_key         = settings.alpaca_api_key,
         alpaca_secret      = settings.alpaca_secret_key,
-        dry_run            = os.getenv("RECONCILE_ORDERS", "").lower() != "true",
+        # FIX (2026-04-27): was "!= true" (opt-in) — reconciler was always in dry_run.
+        # Now "== skip" (opt-out): reconciliation is ON by default, disabled only explicitly.
+        dry_run            = os.getenv("RECONCILE_ORDERS", "").lower() == "skip",
     )
     _fill = _reconciler.confirm_fill(
         order_id     = short_order_id or "",
@@ -1287,6 +1371,29 @@ def execute(
         position_size_usd=_position_size_usd,
         weighted_score=_weighted_score,
     )
+
+    # Discord mirror — fill confirmed to #execution-monitoring
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+        from discord_client import post_to_discord as _disc
+        _disc(
+            channel     = "execution-monitoring",
+            title       = f"⚡ ALPHA FILL — {body.ticker}",
+            description = f"{body.direction.upper()} spread executed. {contracts} contract(s) @ ${_position_size_usd:,.0f}.",
+            color       = "teal",
+            fields      = [
+                {"name": "Ticker",    "value": body.ticker,                   "inline": True},
+                {"name": "Direction", "value": body.direction.upper(),        "inline": True},
+                {"name": "Pathway",   "value": _verdict,                      "inline": True},
+                {"name": "Size",      "value": f"${_position_size_usd:,.0f}", "inline": True},
+                {"name": "Position",  "value": f"#{position_id}",             "inline": True},
+            ],
+            footer      = "Alpha Execution",
+            agent       = "alpha-execution",
+        )
+    except Exception as _disc_exc:
+        logger.warning(f"Discord push failed (non-fatal): {_disc_exc}")
 
     return JSONResponse({
         "executed":      True,
@@ -1471,6 +1578,52 @@ def sovereign_directive(
     else:
         report("alpha_execution", "ack", {"directive": d, "status": "unrecognized"})
         return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+
+
+# ── GAP-006: /log_tail — Runtime log access (2026-04-27) ─────────────────────
+# Gives OMNI, integrity checker, and SOVEREIGN visibility into recent logs
+# without requiring SSH or Railway dashboard access. Authenticated.
+@app.get("/log_tail")
+def log_tail(
+    lines:          int = 50,
+    filter_str:     str = "",
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """
+    Return the last N lines of the service stderr log.
+    Optional filter_str narrows to lines containing that string.
+    Max 200 lines per call to avoid abuse.
+    """
+    verify_secret(x_nexus_secret)
+    import os as _os, pathlib as _pl
+    lines = min(lines, 200)
+    log_path = _os.getenv("STDERR_LOG_PATH", "")
+    if not log_path or not _pl.Path(log_path).exists():
+        candidates = [
+            "/Users/ahmedsadek/nexus/logs/alpha-execution/stderr.log",
+            "/Users/ahmedsadek/nexus/logs/prime-execution/stderr.log",
+            "/Users/ahmedsadek/nexus/logs/alpha-execution/stderr.log",
+        ]
+        for c in candidates:
+            if _pl.Path(c).exists():
+                log_path = c
+                break
+    if not log_path or not _pl.Path(log_path).exists():
+        return JSONResponse({"ok": False, "error": "log file not found"})
+    try:
+        with open(log_path, "r", errors="replace") as _f:
+            all_lines = _f.readlines()
+        matched = [l for l in all_lines if filter_str.lower() in l.lower()] if filter_str else all_lines
+        tail = matched[-lines:]
+        return JSONResponse({
+            "ok": True, "log_path": log_path,
+            "lines": len(tail), "filter": filter_str or None,
+            "content": "".join(tail),
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
 
 
 @app.get("/sovereign/status", status_code=200)
