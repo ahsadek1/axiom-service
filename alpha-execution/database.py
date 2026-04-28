@@ -452,3 +452,25 @@ def set_long_alpaca_order_id(db_path: str, position_id: int, order_id: str) -> N
             "UPDATE positions SET long_alpaca_order_id=? WHERE id=?",
             (order_id, position_id),
         )
+
+
+def close_stale_position(db_path: str, position_id: int, reason: str) -> None:
+    """
+    Close a position without PnL data (used by startup reconciler for stale/leaked entries).
+    Added 2026-04-28 by OMNI — was imported in main.py but missing from database.py.
+    """
+    close_position(db_path, position_id, reason, pnl_pct=0.0, pnl_usd=0.0)
+
+
+def ticker_already_open(db_path: str, ticker: str) -> bool:
+    """
+    Return True if the ticker already has an open or pending position in the DB.
+    Used by the duplicate-guard lock in execute().
+    Added 2026-04-28 by OMNI — was imported in main.py but missing from database.py.
+    """
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM positions WHERE ticker=? AND status IN ('open','pending')",
+            (ticker.upper(),),
+        ).fetchone()
+    return (row["cnt"] if row else 0) > 0

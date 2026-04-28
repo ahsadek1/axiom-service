@@ -373,3 +373,17 @@ def log_reconciliation(
             (now, positions_db, positions_alpaca, mismatches,
              mismatch_details, 1 if execution_paused else 0),
         )
+
+
+def ticker_already_open(db_path: str, ticker: str) -> bool:
+    """
+    Return True if the ticker already has an open or pending position in the DB.
+    Used by the duplicate-guard lock in execute().
+    Added 2026-04-28 by OMNI — was imported in main.py but missing from database.py.
+    """
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM positions WHERE ticker=? AND status IN ('open','pending')",
+            (ticker.upper(),),
+        ).fetchone()
+    return (row["cnt"] if row else 0) > 0

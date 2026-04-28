@@ -180,3 +180,153 @@ def calculate_dte(expiration_date_str: str) -> int:
     expiry = date.fromisoformat(expiration_date_str)
     dte    = (expiry - date.today()).days
     return max(0, dte)
+
+
+def resolve_available_contract(
+    ticker:        str,
+    direction:     str,
+    current_price: float,
+    alpaca_client,           # alpaca_client.AlpacaClient instance
+) -> "SpreadParams":
+    """
+    Alpaca-aware spread resolver.
+
+    Resolves spread parameters, then validates contracts actually exist on Alpaca.
+    If the calculated expiry has no listed contracts, walks forward month-by-month
+    until a valid expiry is found. Snaps strikes to nearest available.
+
+    If the standard monthly third-Friday loop finds nothing (e.g. thinly-traded
+    names that only have weekly listings), falls back to querying ALL available
+    contracts for the ticker and selecting the nearest expiry >= target DTE.
+
+    Args:
+        ticker:         Underlying symbol.
+        direction:      'bullish' or 'bearish'.
+        current_price:  Current underlying price.
+        alpaca_client:  Live AlpacaClient for contract lookup.
+
+    Returns:
+        SpreadParams with verified, live Alpaca contract symbols.
+
+    Raises:
+        ValueError: If no valid contracts found.
+    """
+    from datetime import date, timedelta
+
+    option_type = "put" if direction == "bullish" else "call"
+    base = resolve_spread(ticker, direction, current_price)
+
+    # ── Step 1: Find nearest available expiry (third-Friday monthly loop) ────
+    expiry = None
+    candidate = date.fromisoformat(base.expiration_date)
+    for _ in range(3):   # try up to 3 consecutive monthly expirations
+        contracts = alpaca_client.get_option_contracts(
+            underlying      = ticker,
+            expiration_date = candidate.isoformat(),
+            option_type     = option_type,
+        )
+        if contracts:
+            expiry = candidate
+            break
+        # Advance one calendar month and recalculate third Friday
+        m = candidate.month + 1 if candidate.month < 12 else 1
+        y = candidate.year if candidate.month < 12 else candidate.year + 1
+        candidate = _third_friday(y, m)
+
+    if expiry is None:
+        # ── Fallback: query ALL available contracts (no expiry filter) ────────
+        # Handles thinly-traded names that only have weekly/near-term listings
+        # and miss the standard monthly third Fridays.
+        # Fix deployed 2026-04-28 by OMNI — root cause: KMI/COF/EPD only list
+        # weekly expirations; 3-month loop found nothing → SPREAD_RESOLUTION_FAILED.
+        target_date  = date.fromisoformat(base.expiration_date)
+        min_dte_date = date.today() + timedelta(days=21)  # never < 21 DTE
+        all_contracts = alpaca_client.get_option_contracts(
+            underlying  = ticker,
+            option_type = option_type,
+            limit       = 100,
+        )
+        available_expiries = sorted(set(
+            date.fromisoformat(c["expiration_date"])
+            for c in all_contracts
+            if c.get("expiration_date")
+        ))
+        # Pick nearest expiry >= target DTE and >= 21 DTE
+        eligible = [e for e in available_expiries if e >= target_date and e >= min_dte_date]
+        if not eligible:
+            eligible = [e for e in available_expiries if e >= min_dte_date]
+        if eligible:
+            expiry = eligible[0]
+            logger.warning(
+                "contract_resolver: %s %s — no standard monthly expiry found; "
+                "using nearest available: %s (fallback path)",
+                ticker, option_type, expiry
+            )
+        else:
+            raise ValueError(
+                f"No listed {option_type} contracts found for {ticker} within 3 months of target DTE"
+            )
+
+    # Re-resolve with confirmed expiry
+    spread = resolve_spread(ticker, direction, current_price, target_date=expiry)
+
+    # ── Step 2: Snap strikes to nearest available ─────────────────────────────
+    contracts = alpaca_client.get_option_contracts(
+        underlying      = ticker,
+        expiration_date = expiry.isoformat(),
+        option_type     = option_type,
+    )
+    if not contracts:
+        raise ValueError(f"No {option_type} contracts for {ticker} on {expiry}")
+
+    available_strikes = sorted(
+        float(c.get("strike_price", 0))
+        for c in contracts
+        if float(c.get("strike_price", 0)) > 0
+    )
+
+    def snap(target: float) -> float:
+        return min(available_strikes, key=lambda s: abs(s - target))
+
+    snapped_short = snap(spread.short_strike)
+    snapped_long  = snap(spread.long_strike)
+
+    # ── Duplicate-leg guard ───────────────────────────────────────────────────
+    if snapped_short == snapped_long or abs(snapped_short - snapped_long) < 1.0:
+        if len(available_strikes) < 2:
+            raise ValueError(
+                f"Only one strike available for {ticker} {option_type} on {expiry} — "
+                f"cannot construct a spread with two distinct legs"
+            )
+        idx = available_strikes.index(snapped_short)
+        if direction == "bullish":
+            if idx > 0:
+                snapped_long = available_strikes[idx - 1]
+            else:
+                snapped_short = available_strikes[idx + 1]
+                snapped_long  = available_strikes[idx]
+        else:
+            if idx < len(available_strikes) - 1:
+                snapped_long = available_strikes[idx + 1]
+            else:
+                snapped_short = available_strikes[idx - 1]
+                snapped_long  = available_strikes[idx]
+
+    if snapped_short == snapped_long:
+        raise ValueError(
+            f"Contract resolver could not produce distinct legs for {ticker} "
+            f"{direction} {option_type} on {expiry} — "
+            f"short={snapped_short} long={snapped_long}"
+        )
+
+    return SpreadParams(
+        underlying      = spread.underlying,
+        direction       = spread.direction,
+        option_type     = spread.option_type,
+        short_strike    = snapped_short,
+        long_strike     = snapped_long,
+        expiration_date = expiry.isoformat(),
+        target_dte      = (expiry - date.today()).days,
+        current_price   = current_price,
+        is_etf          = spread.is_etf,
+    )
