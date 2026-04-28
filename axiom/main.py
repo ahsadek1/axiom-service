@@ -23,7 +23,12 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from config import load_settings
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).parent.parent))
+from shared.sovereign_comms import get_instructions, report
+
+from config import load_settings, MAX_POSITIONS, MAX_RISK_PER_TRADE, MIN_DTE, MAX_DTE, VIX_PAUSE_THRESHOLD
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -49,6 +54,7 @@ app_state: dict = {
     "pool":                      [],
     "anchor_stocks":             [],
     "regime":                    None,
+    "regime_last_updated":       None,   # ISO timestamp — updated on every regime refresh
     "window_id":                 None,
     "last_vix":                  None,
     "tier2_consecutive_failures": 0,
@@ -105,6 +111,61 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error("Database initialization failed: %s", e)
         raise
 
+    # ── Startup regime classification ─────────────────────────────────────────
+    # Eliminates the REGIME_NOT_LOADED race condition: app_state["regime"] is
+    # normally None at boot and only set by the scheduler at 8:45 AM or 9:15 AM.
+    # Any /assess call before those jobs run (including post-restart during market
+    # hours) previously returned REGIME_NOT_LOADED → sizing_mult=0.0 → zero trades.
+    # Fix: classify regime immediately at startup so /assess is never gated on None.
+    try:
+        from data_sources import get_vix_with_fallback
+        from regime import classify_regime, classify_regime_v2
+        import oracle_client as _oracle_client
+
+        # Try ORACLE composite regime first (4-factor) — more accurate at startup.
+        # Fall back to VIX-only if ORACLE is unavailable (e.g. not yet started).
+        macro_data = None
+        try:
+            macro_data = _oracle_client.get_macro_data(timeout=4.0)
+        except Exception as _macro_err:
+            logger.warning("Startup ORACLE macro fetch failed: %s — using VIX-only", _macro_err)
+
+        if macro_data:
+            startup_regime = classify_regime_v2(macro_data)
+            app_state["regime"] = startup_regime
+            app_state["regime_last_updated"] = datetime.now(ET).isoformat()
+            logger.info(
+                "Startup regime classification (COMPOSITE) — VIX=%.1f, class=%s, score=%d",
+                startup_regime.vix,
+                startup_regime.classification,
+                startup_regime.composite_score,
+            )
+        else:
+            vix, is_estimated = get_vix_with_fallback(
+                settings.fred_api_key,
+                app_state.get("last_vix"),
+            )
+            app_state["last_vix"] = vix
+            startup_regime = classify_regime(vix, is_estimated)
+            app_state["regime"] = startup_regime
+            app_state["regime_last_updated"] = datetime.now(ET).isoformat()
+            logger.info(
+                "Startup regime classification (VIX-ONLY fallback) — VIX=%.1f, class=%s%s",
+                vix,
+                startup_regime.classification,
+                " (estimated)" if is_estimated else "",
+            )
+    except Exception as e:
+        # Non-fatal: log the failure but proceed. /assess will still gate on None
+        # until the scheduler fires — same as old behaviour, but at least startup
+        # succeeds and the window is minimised to the brief interval before the
+        # scheduler's first VIX fetch.
+        logger.warning(
+            "Startup regime classification failed: %s — /assess will block until "
+            "scheduler fires at 8:45 AM ET (REGIME_NOT_LOADED window open).",
+            e,
+        )
+
     # Start scheduler
     scheduler = create_scheduler(app_state)
     scheduler.start()
@@ -112,6 +173,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app_state["status"]    = "ready"
 
     logger.info("Axiom service ready — scheduler running %d jobs", len(scheduler.get_jobs()))
+    report("axiom", "INFO", {"event": "started", "port": int(os.getenv("PORT", "8001"))})
+    _instr = get_instructions("axiom")
+    if _instr:
+        logger.info("Axiom: %d instruction(s) from SOVEREIGN on startup", len(_instr))
 
     yield
 
@@ -149,15 +214,19 @@ def health() -> JSONResponse:
     regime   = app_state.get("regime")
     pool_size = len(app_state.get("pool", []))
 
+    regime_updated = app_state.get("regime_last_updated")
     return JSONResponse({
-        "status":          "healthy",
-        "service":         "axiom",
-        "version":         "4.0.0",
-        "pool_size":       pool_size,
-        "regime":          regime.classification if regime else "unknown",
-        "vix":             regime.vix if regime else None,
-        "submissions_open": _is_submissions_open(),
-        "uptime_since":    app_state.get("start_time"),
+        "status":               "healthy",
+        "service":              "axiom",
+        "version":              "4.0.0",
+        "pool_size":            pool_size,
+        "regime":               regime.classification if regime else "unknown",
+        "regime_source":        regime.regime_source if regime else "unknown",
+        "composite_score":      regime.composite_score if regime else None,
+        "vix":                  regime.vix if regime else None,
+        "regime_last_updated":  regime_updated,
+        "submissions_open":     _is_submissions_open(),
+        "uptime_since":         app_state.get("start_time"),
     })
 
 
@@ -356,6 +425,59 @@ def oracle_status(x_axiom_secret: str = Header(default="")) -> JSONResponse:
     })
 
 
+@app.post("/trigger-tier1")
+def trigger_tier1(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+    """
+    Manually trigger a Tier 1 anchor-stock scan.
+
+    Used by Guardian Angel when pool is empty during market hours,
+    and by the morning diagnostic if Axiom missed its scheduled run.
+    """
+    verify_secret(x_axiom_secret)
+    from scheduler import _run_tier1
+    import threading
+    try:
+        t = threading.Thread(target=_run_tier1, args=(app_state, "manual"), daemon=True)
+        t.start()
+        return JSONResponse({"status": "triggered", "message": "Tier 1 scan started in background"})
+    except Exception as e:
+        logger.error("Manual Tier 1 trigger failed: %s", e)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.post("/trigger-tier2")
+def trigger_tier2(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+    """
+    Manually trigger a Tier 2 pool refresh and agent push.
+
+    Used to recover missed windows after service restart, or to force
+    an immediate pool dispatch outside the normal 15-min schedule.
+    Bypasses the submissions_open gate so it works pre-market or
+    any time anchor_stocks are populated.
+
+    Root cause fix (2026-04-23): APScheduler cron jobs do not replay
+    missed fire times after a restart — this endpoint is the manual
+    recovery path when Axiom restarts between 8:30 and 9:15 AM ET.
+    """
+    verify_secret(x_axiom_secret)
+    from scheduler import _run_tier2_if_open
+    import threading
+
+    if not app_state.get("anchor_stocks"):
+        return JSONResponse(
+            {"status": "error", "message": "No anchor stocks — run /trigger-tier1 first"},
+            status_code=400,
+        )
+    try:
+        # force=True bypasses the market-hours gate so manual triggers work pre-market
+        t = threading.Thread(target=_run_tier2_if_open, args=(app_state, True), daemon=True)
+        t.start()
+        return JSONResponse({"status": "triggered", "message": "Tier 2 pool refresh started in background"})
+    except Exception as e:
+        logger.error("Manual Tier 2 trigger failed: %s", e)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
 @app.post("/premarket")
 def trigger_premarket(x_axiom_secret: str = Header(default="")) -> JSONResponse:
     """
@@ -372,6 +494,101 @@ def trigger_premarket(x_axiom_secret: str = Header(default="")) -> JSONResponse:
     except Exception as e:
         logger.error("Manual premarket trigger failed: %s", e)
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+
+# ── SOVEREIGN Push Endpoints ──────────────────────────────────────────────────
+
+class _SovDirective(BaseModel):
+    directive: str
+    data: dict = {}
+    from_agent: str = "sovereign"
+
+
+@app.post("/sovereign/directive", status_code=200)
+def sovereign_directive(
+    body: _SovDirective,
+    x_axiom_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN pushes a directive to Axiom. Zero polling lag."""
+    verify_secret(x_axiom_secret)
+    d = body.directive.strip().upper()
+    logger.info("SOVEREIGN direct push to axiom: %s", d)
+
+    if d == "PING":
+        report("axiom", "ack", {"directive": "PING", "status": "alive"})
+        return JSONResponse({"ok": True, "directive": "PING", "status": "alive"})
+    elif d == "STATUS":
+        regime = app_state.get("regime")
+        snap = {
+            "directive": "STATUS", "service": "axiom",
+            "status": app_state.get("status", "unknown"),
+            "regime": regime.classification if regime else None,
+            "pool_size": len(app_state.get("anchor_stocks", [])),
+            "port": int(__import__("os").getenv("PORT", "8001")),
+        }
+        report("axiom", "status", snap)
+        return JSONResponse({"ok": True, **snap})
+    elif d in ("FLUSH", "RESET_DAY"):
+        app_state["anchor_stocks"] = []
+        report("axiom", "ack", {"directive": d, "status": "applied"})
+        return JSONResponse({"ok": True, "directive": d})
+    else:
+        report("axiom", "ack", {"directive": d, "status": "unrecognized"})
+        return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
+
+
+@app.get("/limits", status_code=200)
+def get_limits(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+    """
+    Return the current system limits and circuit breaker thresholds.
+
+    Provides a single source of truth for all limit config.
+    All values defined in config.py — no silent defaults.
+
+    Returns:
+        Dict with max_positions, max_risk_per_trade, min_dte, max_dte,
+        vix_pause_threshold, and current regime state.
+    """
+    verify_secret(x_axiom_secret)
+
+    regime = app_state.get("regime")
+    vix    = regime.vix if regime else None
+
+    # Check if VIX pause is active
+    vix_paused = False
+    if vix is not None and vix >= VIX_PAUSE_THRESHOLD:
+        vix_paused = True
+    if regime and regime.classification == "CRISIS":
+        vix_paused = True
+
+    return JSONResponse({
+        "max_positions":       MAX_POSITIONS,
+        "max_risk_per_trade":  MAX_RISK_PER_TRADE,
+        "min_dte":             MIN_DTE,
+        "max_dte":             MAX_DTE,
+        "vix_pause_threshold": VIX_PAUSE_THRESHOLD,
+        "vix_current":         vix,
+        "vix_paused":          vix_paused,
+        "regime":              regime.classification if regime else "UNKNOWN",
+        "source":              "axiom-config",
+    })
+
+
+@app.get("/sovereign/status", status_code=200)
+def sovereign_status(
+    x_axiom_secret: str = Header(default=""),
+) -> JSONResponse:
+    """SOVEREIGN queries Axiom state on-demand."""
+    verify_secret(x_axiom_secret)
+    regime = app_state.get("regime")
+    return JSONResponse({
+        "ok": True, "service": "axiom",
+        "status": app_state.get("status", "unknown"),
+        "regime": regime.classification if regime else None,
+        "pool_size": len(app_state.get("anchor_stocks", [])),
+        "port": int(__import__("os").getenv("PORT", "8001")),
+    })
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -45,12 +45,23 @@ SP500_TICKERS = [
 NASDAQ100_TICKERS = []  # Merged into SP500_TICKERS above (deduplicated)
 
 
+# ── System Limits (Circuit Breaker Config) ──────────────────────────────────
+# These are the canonical values that Axiom exposes via /limits.
+# All services (Alpha, Prime, Guardian Angel) should read from here.
+MAX_POSITIONS        = 3       # Max concurrent positions across all systems
+MAX_RISK_PER_TRADE   = 1000.0  # Max $ risk per trade
+MIN_DTE              = 21      # Minimum days to expiration for options
+MAX_DTE              = 60      # Maximum days to expiration for options
+VIX_PAUSE_THRESHOLD  = 35.0    # VIX above this → pause all new entries
+
+
 @dataclass(frozen=True)
 class Settings:
     """All Axiom service configuration. Immutable after startup."""
 
     # Auth
     axiom_secret: str
+    nexus_secret: str          # outbound auth for agent webhooks
 
     # Data APIs
     polygon_api_key: str
@@ -102,6 +113,7 @@ def load_settings() -> Settings:
     """
     required = [
         "AXIOM_SECRET",
+        "NEXUS_SECRET",
         "POLYGON_API_KEY",
         "ALPHA_VANTAGE_KEY",
         "FRED_API_KEY",
@@ -125,6 +137,7 @@ def load_settings() -> Settings:
 
     return Settings(
         axiom_secret        = os.environ["AXIOM_SECRET"],
+        nexus_secret        = os.environ["NEXUS_SECRET"],
         polygon_api_key     = os.environ["POLYGON_API_KEY"],
         alpha_vantage_key   = os.environ["ALPHA_VANTAGE_KEY"],
         fred_api_key        = os.environ["FRED_API_KEY"],

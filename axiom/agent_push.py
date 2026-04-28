@@ -31,6 +31,7 @@ def push_pool_to_agents(
     bot_token: str,
     chat_id: str,
     window_id: str,
+    nexus_secret: str = "",
 ) -> dict[str, str]:
     """
     Push the updated pool to all agent webhooks in parallel.
@@ -55,6 +56,7 @@ def push_pool_to_agents(
                 agent_name,
                 url,
                 pool_payload,
+                nexus_secret,
             ): agent_name
             for agent_name, url in agent_webhooks.items()
         }
@@ -109,6 +111,7 @@ def _push_to_agent(
     agent_name: str,
     url: str,
     payload: dict,
+    nexus_secret: str = "",
 ) -> tuple[str, Optional[int]]:
     """
     Push pool payload to a single agent webhook.
@@ -129,7 +132,10 @@ def _push_to_agent(
             url,
             json=payload,
             timeout=PUSH_TIMEOUT_SECONDS,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Nexus-Secret": nexus_secret,
+            },
         )
         response_ms = int(time.time() * 1000) - start_ms
 
