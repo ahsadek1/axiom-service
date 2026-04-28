@@ -301,6 +301,17 @@ def close_position(db_path: str, position_id: int, reason: str, pnl_pct: float, 
         )
 
 
+def close_stale_position(db_path: str, position_id: int, reason: str) -> None:
+    """
+    Close a position without PnL data (used by startup reconciler for stale/leaked entries).
+    Sets pnl_pct=0, pnl_usd=0 since reconciled positions may not have exit prices.
+
+    Added 2026-04-28 by OMNI — was called from main.py startup reconciliation
+    but missing from database.py.
+    """
+    close_position(db_path, position_id, reason, pnl_pct=0.0, pnl_usd=0.0)
+
+
 def update_alpaca_order_id(db_path: str, position_id: int, order_id: str) -> None:
     """
     Update the Alpaca order ID on a pending position after successful placement.

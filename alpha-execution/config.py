@@ -27,6 +27,14 @@ EXIT_PARTIAL_SELL_FRACTION  = 0.50   # sell this fraction at trigger
 EXIT_TRAILING_STOP_PCT      = 0.15   # 15% trailing stop after partial exit
 EXIT_FULL_CLOSE_PCT         = 1.00   # +100% → close everything immediately
 
+# ── Earnings Block ───────────────────────────────────────────────────────────
+# Block trades when earnings fall within this many days of expiry.
+EARNINGS_BLOCK_DAYS = 5
+
+# ── VIX Brakes ───────────────────────────────────────────────────────────────
+VIX_BRAKE_ELEVATED = 25   # above this: reduce sizing
+VIX_BRAKE_FULL     = 35   # above this: block all new positions
+
 # ── Position Limits ───────────────────────────────────────────────────────────
 MAX_CONCURRENT_POSITIONS = 10
 MAX_NEW_PER_DAY          = 5
