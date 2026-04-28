@@ -102,6 +102,27 @@ class AlpacaClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    def get_orders(self, status: str = "open") -> list[dict]:
+        """
+        Fetch orders filtered by status.
+        Added 2026-04-28 by OMNI — called by reconciler but was missing.
+
+        Args:
+            status: 'open', 'closed', or 'all'.
+
+        Returns:
+            List of order dicts.
+        """
+        try:
+            data = self._get(
+                f"{ALPACA_PAPER_URL}/v2/orders",
+                params={"status": status, "limit": 100},
+            )
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning("get_orders failed (status=%s): %s", status, e)
+            return []
+
     def get_latest_price(self, symbol: str) -> Optional[float]:
         """Get latest trade price for a stock."""
         try:
