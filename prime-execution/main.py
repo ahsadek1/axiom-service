@@ -472,6 +472,25 @@ def execute(
             },
         )
 
+    # ── Long-Only Gate: Prime is equity-long only — reject bearish picks ──────
+    # Fix deployed 2026-04-28 by OMNI: bearish direction was being translated to
+    # Alpaca side='sell', which Alpaca rejects for fractional orders as a short-sell.
+    # Prime does not short equities. Bearish concordances are silently rejected here.
+    if body.direction == "bearish":
+        logger.warning(
+            "Prime execution rejected: bearish direction not supported (long-only system) "
+            "— ticker=%s pathway=%s",
+            body.ticker, body.pathway,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "executed": False,
+                "reason":   "Prime is long-only — bearish direction not supported. "
+                            "Bearish picks are not executed in Prime equity system.",
+            },
+        )
+
     # ── Reconciler pause check (read-only — no lock needed) ───────────────────
     if app_state.get("execution_paused"):
         return JSONResponse(
