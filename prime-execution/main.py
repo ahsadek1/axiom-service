@@ -186,6 +186,54 @@ def _run_startup_reconciliation() -> None:
         else:
             logger.info("Startup reconciliation: all DB positions confirmed in Alpaca — clean")
 
+        # ── 2026-04-28 FIX: Reverse orphan check ────────────────────────────────────────
+        # Alpaca may hold positions that have NO DB record (e.g. opened during a
+        # restart window where execution succeeded but DB write failed, or a
+        # previous reconciler incorrectly removed the DB entry while the Alpaca
+        # position survived).
+        # These orphaned Alpaca positions have NO exit monitoring — they are
+        # invisible to the exit monitor and will never be closed by Prime.
+        # Action: log critical alert + report to SOVEREIGN for each orphan.
+        # We do NOT auto-close them — only SOVEREIGN / Ahmed can decide exit.
+        # ───────────────────────────────────────────────────────────────────────────────
+        if alpaca_tickers is not None:
+            db_tickers = {(pos.get("ticker") or "").upper() for pos in all_db_positions}
+            try:
+                alpaca         = _get_alpaca()
+                live_full      = alpaca.get_positions()
+                alpaca_orphans = [
+                    p for p in live_full
+                    if str(p.get("symbol", "")).upper() not in db_tickers
+                ]
+                if alpaca_orphans:
+                    orphan_summaries = []
+                    for op in alpaca_orphans:
+                        sym   = str(op.get("symbol", "")).upper()
+                        qty   = op.get("qty", "?")
+                        entry = op.get("avg_entry_price", "?")
+                        pl    = op.get("unrealized_pl", "?")
+                        orphan_summaries.append(f"{sym} qty={qty} entry=${entry} pnl=${pl}")
+                        logger.critical(
+                            "REVERSE ORPHAN: Alpaca holds %s qty=%s entry=$%s pnl=$%s "
+                            "but NO DB record exists — exit monitoring BLIND.",
+                            sym, qty, entry, pl,
+                        )
+                    try:
+                        from shared.sovereign_comms import report as _sov_report
+                        _sov_report("prime_execution", "CRITICAL", {
+                            "event":   "reverse_orphan_detected",
+                            "orphans": orphan_summaries,
+                            "action":  "Alpaca positions exist with no DB record. "
+                                       "Exit monitoring is blind. Manual review required.",
+                        })
+                    except Exception as _re:
+                        logger.warning("Failed to notify SOVEREIGN of reverse orphan: %s", _re)
+                else:
+                    logger.info("Startup reconciliation: no reverse orphans — all Alpaca positions tracked in DB.")
+            except Exception as _oe:
+                logger.warning("Reverse orphan check failed (non-fatal): %s", _oe)
+        # ───────────────────────────────────────────────────────────────────────────────
+
     except Exception as e:
         # Never block startup
         logger.error("Startup reconciliation failed (non-fatal): %s", e)
@@ -242,12 +290,14 @@ async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
 
     scheduler = BackgroundScheduler(timezone=ET)
 
-    # Exit monitor every 5 min during market hours (approved Ahmed Sadek 2026-04-12)
-    # o3-mini Pass A flagged 15-min as CRITICAL for equity swing positions.
-    # 5-minute provides tight enough protection without options-level granularity.
+    # Exit monitor every 1 min during market hours (upgraded 2026-04-28 — commercial grade)
+    # Original: 15-min (CRITICAL per o3-mini Pass A). Fixed to 5-min 2026-04-12.
+    # Upgraded to 1-min 2026-04-28 to match alpha-execution standard.
+    # Rationale: swing equity can gap -18% in a single candle; 5-min = up to -25% before stop fires.
+    # 1-minute eliminates that gap entirely. Approved: Ahmed Sadek.
     scheduler.add_job(
         func    = lambda: _run_exit_monitor(),
-        trigger = CronTrigger(hour="9-15", minute="0,5,10,15,20,25,30,35,40,45,50,55", timezone=ET),
+        trigger = CronTrigger(hour="9-15", minute="*", timezone=ET),
         id      = "prime_exit_monitor",
         replace_existing=True,
     )
