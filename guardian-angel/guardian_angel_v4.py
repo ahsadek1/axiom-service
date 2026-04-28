@@ -2433,7 +2433,15 @@ class GuardianAngelV4:
         self._last_db_check_ts = now
 
         for svc in SERVICES:
-            db_path = str(Path(DATA_DIR) / svc["db"])
+            # Resolve DB path — ext_db (absolute) takes precedence over db (relative)
+            ext_db = svc.get("ext_db")
+            rel_db = svc.get("db")
+            if ext_db:
+                db_path = ext_db
+            elif rel_db:
+                db_path = str(Path(DATA_DIR) / rel_db)
+            else:
+                continue  # no DB for this service entry
             if not Path(db_path).exists():
                 continue
 
@@ -2445,7 +2453,7 @@ class GuardianAngelV4:
                 if not ok:
                     self._escalation.alert_tier4(
                         svc["name"],
-                        f"DB corruption in {svc['db']} — restore from backup required",
+                        f"DB corruption in {db_path} — restore from backup required",
                     )
             except sqlite3.Error as exc:
                 log.error("DB check failed for %s: %s", svc["name"], exc)
