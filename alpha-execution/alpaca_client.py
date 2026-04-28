@@ -247,8 +247,8 @@ class AlpacaClient:
     def get_option_contracts(
         self,
         underlying:      str,
-        expiration_date: str,
-        option_type:     str,   # 'call' or 'put'
+        expiration_date: Optional[str] = None,
+        option_type:     str = "put",   # 'call' or 'put'
         strike_price_lte: Optional[float] = None,
         strike_price_gte: Optional[float] = None,
         limit:           int = 20,
@@ -258,7 +258,8 @@ class AlpacaClient:
 
         Args:
             underlying:       Stock or ETF symbol.
-            expiration_date:  Target expiry in 'YYYY-MM-DD' format.
+            expiration_date:  Target expiry in 'YYYY-MM-DD' format. Optional —
+                              if omitted, returns all available expirations.
             option_type:      'call' or 'put'.
             strike_price_lte: Maximum strike filter.
             strike_price_gte: Minimum strike filter.
@@ -269,10 +270,11 @@ class AlpacaClient:
         """
         params: dict = {
             "underlying_symbols": underlying,
-            "expiration_date":    expiration_date,
             "type":               option_type,
             "limit":              limit,
         }
+        if expiration_date is not None:
+            params["expiration_date"] = expiration_date
         if strike_price_lte:
             params["strike_price_lte"] = str(strike_price_lte)
         if strike_price_gte:
