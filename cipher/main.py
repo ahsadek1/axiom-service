@@ -33,6 +33,10 @@ from pydantic import BaseModel
 from analyzer import AGENT_NAME, analyze
 from buffer_client import submit_to_alpha, submit_to_prime
 from config import Settings, load_settings
+from shared.decision_log import (
+    log_decision,
+    SUBMITTED, REJECTED, BRAIN_FAIL, ORACLE_MISS, HALTED as DL_HALTED,
+)
 from database import (
     complete_window,
     get_stats,
@@ -242,6 +246,9 @@ def _analyze_pool(payload: dict) -> None:
     if _sovereign_halted:
         logger.warning("Cipher: SOVEREIGN HALT active — skipping pool analysis for window %s", window_id)
         report("cipher", "status", {"event": "pool_skipped", "reason": "sovereign_halt", "window_id": window_id})
+        # Audit: log every ticker in this pool as HALTED
+        for ticker in [t for t in payload.get("pool", []) if isinstance(t, str)]:
+            log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, DL_HALTED)
         complete_window(_settings.db_path, window_id, 0, 0)
         return
 
@@ -284,6 +291,7 @@ def _analyze_pool(payload: dict) -> None:
             context = contexts.get(ticker)
             if context is None:
                 logger.warning("Skipping %s — ORACLE context unavailable", ticker)
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, ORACLE_MISS)
                 analyzed += 1
                 continue
 
@@ -297,6 +305,7 @@ def _analyze_pool(payload: dict) -> None:
                     "Brain failure for %s (consecutive: %d) — skipping submission",
                     ticker, _consecutive_brain_failures,
                 )
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, BRAIN_FAIL)
                 if _consecutive_brain_failures >= BRAIN_ALERT_THRESHOLD:
                     alert_brain_down(
                         _settings.telegram_bot_token,
@@ -314,6 +323,9 @@ def _analyze_pool(payload: dict) -> None:
             score: float = result["score"]
             reasoning: str = result["reasoning"]
 
+            import json as _json
+            _regime_json = _json.dumps(regime) if regime else None
+
             # Submit to buffers (buffer deduplicates per window via UNIQUE constraint)
             alpha_ok = submit_to_alpha(
                 ticker, AGENT_NAME, direction, score, reasoning,
@@ -329,6 +341,21 @@ def _analyze_pool(payload: dict) -> None:
                 record_pick(
                     _settings.db_path, window_id, ticker, direction, score,
                     reasoning, alpha_ok, prime_ok,
+                )
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, SUBMITTED,
+                    direction=direction, score=score,
+                    threshold=58.0,  # alpha threshold (lower bound)
+                    reasoning=reasoning, alpha_submitted=alpha_ok,
+                    prime_submitted=prime_ok, regime=_regime_json,
+                )
+            else:
+                # Analyzed and scored but below threshold or buffer rejected
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
+                    direction=direction, score=score,
+                    threshold=58.0,
+                    reasoning=reasoning, regime=_regime_json,
                 )
 
             # Alert on persistent submission failures

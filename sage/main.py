@@ -31,6 +31,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from analyzer import AGENT_NAME, analyze
+from shared.decision_log import (
+    log_decision,
+    SUBMITTED, REJECTED, BRAIN_FAIL, ORACLE_MISS, HALTED as DL_HALTED,
+)
 from buffer_client import submit_to_alpha, submit_to_prime
 from config import Settings, load_settings
 from database import (
@@ -280,6 +284,7 @@ def _analyze_pool(payload: dict) -> None:
             context = contexts.get(ticker)
             if context is None:
                 logger.warning("Skipping %s — ORACLE context unavailable", ticker)
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, ORACLE_MISS)
                 analyzed += 1
                 continue
 
@@ -295,6 +300,7 @@ def _analyze_pool(payload: dict) -> None:
                     "Brain failure for %s (consecutive: %d) — skipping submission",
                     ticker, _consecutive_brain_failures,
                 )
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, BRAIN_FAIL)
                 if _consecutive_brain_failures >= BRAIN_ALERT_THRESHOLD:
                     alert_brain_down(_settings.telegram_bot_token, _settings.telegram_chat_id, _consecutive_brain_failures)
                     report("sage", "alert", {"event": "brain_down", "consecutive_failures": _consecutive_brain_failures}, escalation=EscalationLevel.CRITICAL)
@@ -315,6 +321,19 @@ def _analyze_pool(payload: dict) -> None:
                 [round(c[0], 1) for c in top_picks],
             )
 
+        import json as _json
+        _regime_json = _json.dumps(regime) if regime else None
+
+        # Log candidates that were scored but didn't make the top-N cut (REJECTED by cap)
+        top_tickers = {c[1] for c in top_picks}
+        for score, ticker, direction, reasoning in candidates:
+            if ticker not in top_tickers:
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, regime=_regime_json,
+                )
+
         # --- Phase 3: Submit top picks ---
         for score, ticker, direction, reasoning in top_picks:
             alpha_ok = submit_to_alpha(
@@ -330,6 +349,18 @@ def _analyze_pool(payload: dict) -> None:
                 submitted += 1
                 _submitted_today.add(ticker)  # Mark as submitted for today
                 record_pick(_settings.db_path, window_id, ticker, direction, score, reasoning, alpha_ok, prime_ok)
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, SUBMITTED,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, alpha_submitted=alpha_ok,
+                    prime_submitted=prime_ok, regime=_regime_json,
+                )
+            else:
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, regime=_regime_json,
+                )
 
             if score >= 58 and not alpha_ok:
                 alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Alpha")

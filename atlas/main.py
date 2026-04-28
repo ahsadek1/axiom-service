@@ -30,6 +30,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from analyzer import AGENT_NAME, analyze
+from shared.decision_log import (
+    log_decision,
+    SUBMITTED, REJECTED, BRAIN_FAIL, ORACLE_MISS, HALTED as DL_HALTED,
+)
 from buffer_client import submit_to_alpha, submit_to_prime
 from config import Settings, load_settings
 from database import (
@@ -253,6 +257,7 @@ def _analyze_pool(payload: dict) -> None:
             context = contexts.get(ticker)
             if not context:
                 logger.warning("Oracle context unavailable for %s — skipping", ticker)
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, ORACLE_MISS)
                 continue
 
             result = analyze(ticker, context, regime, echo_chamber_risk, _settings.gemini_api_key)
@@ -264,6 +269,7 @@ def _analyze_pool(payload: dict) -> None:
                     "Brain failure for %s (consecutive: %d) — skipping submission",
                     ticker, _consecutive_brain_failures,
                 )
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, BRAIN_FAIL)
                 if _consecutive_brain_failures >= BRAIN_ALERT_THRESHOLD:
                     alert_brain_down(_settings.telegram_bot_token, _settings.telegram_chat_id, _consecutive_brain_failures)
                     report("atlas", "alert", {"event": "brain_down", "consecutive_failures": _consecutive_brain_failures}, escalation=EscalationLevel.CRITICAL)
@@ -275,6 +281,9 @@ def _analyze_pool(payload: dict) -> None:
             direction: str = result["direction"]
             score: float = result["score"]
             reasoning: str = result["reasoning"]
+
+            import json as _json
+            _regime_json = _json.dumps(regime) if regime else None
 
             # Submit to buffers (buffer deduplicates per window via UNIQUE constraint)
             alpha_ok = submit_to_alpha(
@@ -289,6 +298,18 @@ def _analyze_pool(payload: dict) -> None:
             if alpha_ok or prime_ok:
                 submitted += 1
                 record_pick(_settings.db_path, window_id, ticker, direction, score, reasoning, alpha_ok, prime_ok)
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, SUBMITTED,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, alpha_submitted=alpha_ok,
+                    prime_submitted=prime_ok, regime=_regime_json,
+                )
+            else:
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, regime=_regime_json,
+                )
 
             if score >= 58 and not alpha_ok:
                 alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Alpha")
