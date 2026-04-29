@@ -20,6 +20,8 @@ from typing import AsyncGenerator, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
+from shared.service_state import ServiceStateWriter as _StateWriter
+_svc_state = _StateWriter("alpha-execution")  # GAP-002: durable state across restarts
 
 
 def _report_exec_event(
@@ -122,7 +124,16 @@ else:
 # Thread-safe lock for position-limit checks + app_state mutations
 _execute_lock = threading.Lock()
 _state_lock   = threading.Lock()  # OMNI M-NEW-3: guards app_state counter mutations
-_skipped_tickers: set = set()  # GAP-001: tickers skipped for session due to INVALID_PAYLOAD (422)
+_skipped_tickers: set = set()    # GAP-001: tickers skipped for session due to INVALID_PAYLOAD (422)
+_ticker_fail_counts: dict = {}   # GAP-CB: consecutive execution failures per ticker
+_TICKER_FAIL_THRESHOLD = 3       # GAP-CB: auto-skip after this many consecutive failures
+
+# GAP-002: Restore durable state from prior session
+_prior_state = _svc_state.restore()
+if _prior_state.get("execution_paused"):    app_state["execution_paused"] = True
+if _prior_state.get("trades_today"):        app_state["trades_today"] = int(_prior_state["trades_today"])
+if _prior_state.get("skipped_tickers"):     _skipped_tickers.update(_prior_state["skipped_tickers"])
+if _prior_state.get("ticker_fail_counts"):  _ticker_fail_counts.update(_prior_state["ticker_fail_counts"])
 
 # ── Token Bucket Rate Limiter — /execute endpoint ─────────────────────────────────────
 # Commercial-grade protection: max 10 /execute calls per 60s globally.
@@ -660,6 +671,8 @@ def health() -> JSONResponse:
         "execution_paused":      app_state.get("execution_paused", False),
         "first_exec_failed":     app_state.get("first_exec_failed", False),
         "skipped_tickers":       list(_skipped_tickers),  # GAP-001: 422-skipped tickers this session
+        "ticker_fail_counts":    dict(_ticker_fail_counts),  # GAP-CB: consecutive failures per ticker
+        "circuit_breaker_threshold": _TICKER_FAIL_THRESHOLD,
         "vix":                   current_vix,
         "vix_brake":          vix_brake_status,
         "vix_brake_elevated": vix_brake_elevated,
@@ -1169,6 +1182,7 @@ def execute(
                     if not app_state.get("first_exec_failed", False):
                         app_state["first_exec_failed"] = True
                         app_state["execution_paused"]  = True
+                        _svc_state.write("execution_paused", True)  # GAP-002
                         logger.critical(
                             "EXECUTION ERROR — pausing and spawning auto-healer. "
                             "Ticker=%s class=%s error=%s",
@@ -1189,6 +1203,33 @@ def execute(
                                   _skipped_tickers),
                             daemon=True,
                         ).start()
+
+            # GAP-CB: Circuit breaker — track consecutive failures per ticker
+            _ticker = body.ticker.upper()
+            with _state_lock:
+                _ticker_fail_counts[_ticker] = _ticker_fail_counts.get(_ticker, 0) + 1
+                fail_count = _ticker_fail_counts[_ticker]
+                _svc_state.write("ticker_fail_counts", _ticker_fail_counts)  # GAP-002
+                if fail_count >= _TICKER_FAIL_THRESHOLD:
+                    _skipped_tickers.add(_ticker)
+                    _svc_state.write("skipped_tickers", list(_skipped_tickers))  # GAP-002
+                    logger.critical(
+                        "CIRCUIT BREAKER TRIPPED: %s failed execution %dx — "
+                        "auto-added to session skip list",
+                        _ticker, fail_count,
+                    )
+                    from shared.sovereign_comms import report as _cb_report, EscalationLevel as _EL
+                    _cb_report("alpha_execution", "alert", {
+                        "event":      "circuit_breaker_tripped",
+                        "ticker":     _ticker,
+                        "fail_count": fail_count,
+                        "action":     "ticker_skipped_for_session",
+                    }, escalation=_EL.CRITICAL)
+                else:
+                    logger.warning(
+                        "CIRCUIT BREAKER: %s execution fail %d/%d",
+                        _ticker, fail_count, _TICKER_FAIL_THRESHOLD,
+                    )
 
             return JSONResponse(
                 status_code=503,
@@ -1257,6 +1298,10 @@ def execute(
     # for audit/display only. Storing the wrong value doesn't affect exits
     # but causes confusion in DB inspection and reporting.
     _confirmed_price = _fill.fill_price if _fill.fill_price is not None else 0.0
+    # GAP-CB: Reset circuit breaker on successful execution
+    with _state_lock:
+        _ticker_fail_counts.pop(body.ticker.upper(), None)
+
     confirm_pending_position(
         db_path               = settings.alpha_db_path,
         position_id           = pending_id,
@@ -1624,6 +1669,35 @@ def log_tail(
         })
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.get("/admin/reconciler-status", status_code=200)
+def admin_reconciler_status(
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """
+    Returns reconciler state for the Nexus dashboard.
+
+    Dashboard checks: recon_ok = data is not None and not data.get('execution_paused').
+    This endpoint provides that signal directly from live app_state.
+    """
+    verify_secret(x_nexus_secret)
+    with _state_lock:
+        paused       = app_state.get("execution_paused", False)
+        alpaca_ok    = app_state.get("alpaca_reachable", False)
+        trades_today = app_state.get("trades_today", 0)
+        first_failed = app_state.get("first_exec_failed", False)
+
+    reconciler_healthy = alpaca_ok and not paused and not first_failed
+
+    return JSONResponse({
+        "status":            "healthy" if reconciler_healthy else "degraded",
+        "execution_paused":  paused,
+        "alpaca_reachable":  alpaca_ok,
+        "first_exec_failed": first_failed,
+        "trades_today":      trades_today,
+        "service":           "alpha-execution",
+    })
 
 
 @app.get("/sovereign/status", status_code=200)
