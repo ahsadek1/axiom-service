@@ -27,6 +27,11 @@ from alpaca_client import AlpacaClient
 from config import ALPACA_PAPER_URL
 from buffer_reporter import BufferReporter
 from config import MAX_CONCURRENT_POSITIONS, MAX_NEW_PER_DAY, load_settings
+import sys as _sys_p
+import os.path as _osp
+_sys_p.path.insert(0, _osp.join(_osp.dirname(_osp.abspath(__file__)), ".."))
+from shared.service_state import ServiceStateWriter as _ServiceStateWriter
+_svc_state = _ServiceStateWriter("prime-execution")
 from database import (
     cancel_pending_position,
     close_stale_position,
@@ -73,6 +78,13 @@ if not app_state["auto_execute"]:
     logger.warning("NEXUS_AUTO_EXECUTE=false — running in DRY_RUN mode. No Alpaca orders will be placed.")
 else:
     logger.warning("NEXUS_AUTO_EXECUTE=true — LIVE TRADING MODE. Orders will be submitted to Alpaca.")
+
+# GAP-002: Restore durable state from prior session
+_prior_state_p = _svc_state.restore()
+if _prior_state_p.get("execution_paused"):        app_state["execution_paused"] = True
+if _prior_state_p.get("trades_today"):             app_state["trades_today"] = int(_prior_state_p["trades_today"])
+if _prior_state_p.get("was_paused_for_reconcile"): app_state["was_paused_for_reconcile"] = True
+
 # Lock for position-limit checks and DB writes during /execute
 _execute_lock = threading.Lock()
 # Separate lock for all app_state read-modify-write operations (adversarial fix #4)
@@ -161,13 +173,48 @@ def _run_startup_reconciliation() -> None:
                 )
                 continue
 
-            # Rule B: DB position not in Alpaca live set → it leaked
+            # Rule B: DB position not in Alpaca live set → potential phantom
+            # GAP-004 Option C: Order-centric verification before closing.
+            # Before declaring this a phantom, verify via the ORDER that placed it.
+            # If the order says "filled", the position is REAL — Alpaca's /positions
+            # API just hasn't propagated yet (up to 2s lag on equities).
+            # Only close if the order itself confirms no fill, or order not found.
             if alpaca_tickers is not None and ticker not in alpaca_tickers:
+                order_id = (pos.get("alpaca_order_id") or "").strip()
+                order_confirms_fill = False
+
+                if order_id:
+                    try:
+                        alpaca_order = alpaca.get_order(order_id)
+                        if alpaca_order:
+                            order_status = alpaca_order.get("status", "")
+                            filled_qty   = float(alpaca_order.get("filled_qty") or 0)
+                            if order_status == "filled" and filled_qty > 0:
+                                order_confirms_fill = True
+                                logger.info(
+                                    "GAP-004: %s (pos #%d) not in Alpaca /positions "
+                                    "but order %s is FILLED (qty=%.1f) — position is REAL, "
+                                    "skipping phantom close (Alpaca position API lag)",
+                                    ticker, pos_id, order_id[:8], filled_qty,
+                                )
+                    except Exception as _oc_err:
+                        logger.debug(
+                            "GAP-004 order check failed for %s: %s — defaulting to position check",
+                            ticker, _oc_err,
+                        )
+
+                if order_confirms_fill:
+                    # Position is real — order says filled. Don't close it.
+                    # It will appear in /positions on next reconciler cycle.
+                    continue
+
+                # Order not found, not filled, or no order_id — genuine phantom
                 reason = f"reconciled_missing_from_alpaca: ticker={ticker} not in live positions"
                 close_stale_position(settings.prime_db_path, pos_id, reason)
                 closed_ids.append(f"#{pos_id} {ticker} (not in Alpaca)")
                 logger.warning(
-                    "Startup reconciliation: closed leaked position #%d %s — not in Alpaca live set",
+                    "Startup reconciliation: closed leaked position #%d %s — "
+                    "not in Alpaca live set and order does not confirm fill",
                     pos_id, ticker,
                 )
 
@@ -701,6 +748,15 @@ def execute(
 
     # ── Alpaca confirmed — promote pending slot to open position ─────────────
     _confirmed_price = _fill.fill_price if _fill.fill_price is not None else current_price
+    # GAP-004 Option C: Record confirmed order status in logs for audit trail.
+    # The order_id is already stored in confirm_pending_position as alpaca_order_id.
+    # Any future reconciler check can verify via /orders/{order_id} — this is
+    # the source of truth that survives Alpaca /positions propagation lag.
+    logger.info(
+        "GAP-004: Position %s (id=%d) confirmed via order %s — "
+        "order-centric tracking active (immune to /positions lag)",
+        body.ticker, pending_id, (alpaca_order_id or "?")[:12],
+    )
     confirm_pending_position(
         db_path          = settings.prime_db_path,
         position_id      = pending_id,
@@ -711,6 +767,7 @@ def execute(
     position_id = pending_id
     with _state_lock:
         app_state["trades_today"] += 1
+    _svc_state.write("trades_today", app_state["trades_today"])  # GAP-002
 
     # Pipeline Sentinel — Alpaca order confirmed, position live
     try:

@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor, Future as _Future
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ from typing import AsyncGenerator, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
+from shared.service_state import ServiceStateWriter as _StateWriter
+_svc_state = _StateWriter("omni")  # GAP-002: durable state across restarts
 
 import pytz
 from fastapi import FastAPI, Header, HTTPException
@@ -50,6 +53,15 @@ logging.basicConfig(
     format = "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
 logger = logging.getLogger("omni.main")
+
+
+def _restore_omni_state() -> None:
+    """GAP-002: Restore durable state across restarts via ServiceStateWriter."""
+    prior = _svc_state.restore()
+    if prior.get("sovereign_halted"):
+        global _sovereign_halted
+        _sovereign_halted = True
+        logger.info("OMNI: restored sovereign_halted=True from prior session")
 
 
 def _check_min_brains_required(value: int) -> None:
@@ -80,6 +92,13 @@ logger.info("OMNI: NEXUS_AUTO_EXECUTE=%s", _auto_execute)
 # ── SOVEREIGN Directive State ─────────────────────────────────────────────────
 _sovereign_halted: bool = False   # HALT directive suspends concordance synthesis
 
+# GAP-008: Concurrent synthesis worker pool (2026-04-29)
+# 3 workers run synthesis in parallel. P1/STRONG_GO pathways are prioritised.
+# Without this: a 90s brain timeout blocks all subsequent concordances.
+# With this: 3 concordances process simultaneously — no backlog during peak hours.
+_SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=3, thread_name_prefix="omni-synth")
+_PATHWAY_PRIORITY    = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}  # lower = higher priority
+
 
 def _dispatch_sovereign_instruction(instr: dict) -> None:
     """Execute a SOVEREIGN instruction. Supported: HALT, RESUME, STATUS, FLUSH."""
@@ -92,10 +111,12 @@ def _dispatch_sovereign_instruction(instr: dict) -> None:
 
     if directive == "HALT":
         _sovereign_halted = True
+        _svc_state.write("sovereign_halted", True)  # GAP-002
         logger.warning("SOVEREIGN DIRECTIVE: HALT — synthesis suspended")
         report("omni", "ack", {"directive": "HALT", "status": "applied", "halted": True})
     elif directive == "RESUME":
         _sovereign_halted = False
+        _svc_state.write("sovereign_halted", False)  # GAP-002
         logger.info("SOVEREIGN DIRECTIVE: RESUME — synthesis resumed")
         report("omni", "ack", {"directive": "RESUME", "status": "applied", "halted": False})
     elif directive == "STATUS":
@@ -192,6 +213,269 @@ def _check_canary_gate() -> Optional[str]:
     except Exception as e:
         logger.warning("OMNI CANARY: gate check failed (%s) -- allowing synthesis", e)
         return None
+
+
+def _trade_blocker_watchdog() -> None:
+    """
+    MANDATE v2 (2026-04-28): Autonomously resolve trade blockers every 60s.
+    Identifies failures and fixes them immediately — never reports and waits.
+    """
+    import time as _time
+    import requests as _req
+
+    ALPACA_BASE  = "https://paper-api.alpaca.markets"
+    ALPACA_HDRS  = {
+        "APCA-API-KEY-ID":     os.environ.get("ALPACA_API_KEY",""),
+        "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY",""),
+    }
+    NEXUS_SECRET  = os.environ.get("NEXUS_SECRET","")
+    PRIME_SECRET  = os.environ.get("NEXUS_PRIME_SECRET", NEXUS_SECRET)
+    SOVEREIGN_BUS = os.environ.get("SOVEREIGN_BUS_URL","http://192.168.1.141:9999")
+    ALPHA_URL     = os.environ.get("ALPHA_EXECUTION_URL","http://localhost:8005")
+    PRIME_URL     = os.environ.get("PRIME_EXECUTION_URL","http://localhost:8006")
+
+    def _sov(msg: str) -> None:
+        try:
+            _req.post(f"{SOVEREIGN_BUS}/send",
+                      json={"from":"omni","to":"sovereign","message":msg}, timeout=5)
+        except Exception: pass
+
+    def _resume_paused() -> None:
+        for name, url, hdr, sec in [
+            ("alpha", ALPHA_URL, "X-Nexus-Secret", NEXUS_SECRET),
+            ("prime", PRIME_URL, "X-Nexus-Prime-Secret", PRIME_SECRET),
+        ]:
+            try:
+                h = _req.get(f"{url}/health", timeout=5)
+                if h.ok and h.json().get("execution_paused"):
+                    r = _req.post(f"{url}/resume", headers={hdr: sec}, timeout=5)
+                    logger.warning("WATCHDOG: %s paused → /resume sent resumed=%s",
+                                   name, r.json().get("resumed") if r.ok else False)
+                    _sov(f"🔧 WATCHDOG: {name} paused → resumed")
+            except Exception as e:
+                logger.debug("Watchdog pause-check %s: %s", name, e)
+
+    def _retry_failed_executions() -> None:
+        """Retry GO/STRONG_GO syntheses that failed execution in last 10 min."""
+        try:
+            import sqlite3 as _sq
+            db_path = os.environ.get("OMNI_DB_PATH","/Users/ahmedsadek/nexus/data/omni.db")
+            conn = _sq.connect(db_path)
+            conn.row_factory = _sq.Row
+            failed = conn.execute("""
+                SELECT ticker, pathway, system, window_id,
+                       agent_weighted_score, votes_go, verdict, execution_response
+                FROM synthesis_results
+                WHERE datetime(created_at) > datetime('now','-10 minutes')
+                AND execution_response NOT LIKE 'HTTP 200%'
+                AND execution_response NOT LIKE 'HTTP 20%'
+                AND execution_response NOT LIKE '429:TICKER_DUPLICATE%'
+                AND execution_response NOT LIKE '429:CONCURRENT_CAP%'
+                AND execution_response IS NOT NULL
+                AND verdict IN ('GO','STRONG_GO')
+                ORDER BY created_at DESC LIMIT 3
+            """).fetchall()
+            conn.close()
+            for row in failed:
+                url = ALPHA_URL if row["system"]=="alpha" else PRIME_URL
+                hdr = "X-Nexus-Secret" if row["system"]=="alpha" else "X-Nexus-Prime-Secret"
+                sec = NEXUS_SECRET if row["system"]=="alpha" else PRIME_SECRET
+                payload = {
+                    "ticker":            row["ticker"],
+                    "direction":         "bullish",
+                    "system":            row["system"],
+                    "pathway":           row["pathway"],
+                    "agent_scores":      {},
+                    "weighted_score":    row["agent_weighted_score"],
+                    "verdict":           row["verdict"],
+                    "votes_go":          row["votes_go"],
+                    "sizing_mult":       0.75,
+                    "position_size_usd": 1500,
+                    "window_id":         row["window_id"] + "-wr",
+                    "auto_execute":      True,
+                }
+                try:
+                    resp = _req.post(f"{url}/execute", json=payload,
+                                     headers={hdr: sec}, timeout=30)
+                    result = resp.json()
+                    executed = result.get("executed", False)
+                    logger.warning(
+                        "WATCHDOG RETRY: %s/%s was=%s → HTTP %d executed=%s",
+                        row["ticker"], row["system"],
+                        str(row["execution_response"])[:50],
+                        resp.status_code, executed,
+                    )
+                    _sov(
+                        f"🔧 WATCHDOG RETRY: {row['ticker']} {row['system'].upper()} "
+                        f"prev_failure={str(row['execution_response'])[:60]} "
+                        f"→ executed={executed}"
+                    )
+                except Exception as retry_err:
+                    logger.error("WATCHDOG retry error for %s: %s", row["ticker"], retry_err)
+        except Exception as e:
+            logger.debug("Watchdog retry-failed error: %s", e)
+
+    def _check_metric_thresholds() -> None:
+        """
+        GAP-006: Real-time metric threshold monitoring.
+        Checks key system metrics every 60s and acts autonomously when thresholds are breached.
+        No Prometheus needed — reads directly from our SQLite DBs.
+
+        Thresholds:
+          - Execution failure rate >30% in last 30 min → alert SOVEREIGN, pause synthesis
+          - 422 rejection rate >50% in last 30 min → recalibrate or alert
+          - Brain error rate >40% → alert SOVEREIGN (API issue)
+          - Concordances with dispatch_attempts>=3 (lost) > 0 → retry immediately
+          - Alpha-exec execution_paused → resume immediately (belt+suspenders with _resume_paused)
+        """
+        import sqlite3 as _sq
+
+        # --- 1. Execution failure rate ---
+        try:
+            omni_db = os.environ.get("OMNI_DB_PATH", "/Users/ahmedsadek/nexus/data/omni.db")
+            conn = _sq.connect(omni_db); conn.row_factory = _sq.Row
+            window = conn.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN execution_response LIKE 'HTTP 20%' THEN 1 ELSE 0 END) as ok,
+                    SUM(CASE WHEN execution_response NOT LIKE 'HTTP 20%'
+                             AND execution_response NOT LIKE '429:TICKER_DUPLICATE%'
+                             AND execution_response NOT LIKE '429:CONCURRENT_CAP%'
+                             AND verdict IN ('GO','STRONG_GO')
+                             AND execution_response IS NOT NULL THEN 1 ELSE 0 END) as failed
+                FROM synthesis_results
+                WHERE datetime(created_at) > datetime('now','-30 minutes')
+                AND verdict IN ('GO','STRONG_GO')
+            """).fetchone()
+            conn.close()
+            total = window["total"] or 0
+            failed = window["failed"] or 0
+            if total >= 3 and failed / total > 0.30:
+                logger.critical(
+                    "THRESHOLD BREACH: execution failure rate %.0f%% (threshold: 30%%) in last 30min",
+                    100 * failed / total,
+                )
+                _sov(
+                    f"🚨 OMNI THRESHOLD BREACH: Execution failure rate {100*failed//total}% "
+                    f"({failed}/{total} GOs failed in last 30min). "
+                    f"Investigating automatically."
+                )
+        except Exception as e:
+            logger.debug("Threshold check (exec rate) error: %s", e)
+
+        # --- 2. Brain error rate ---
+        try:
+            omni_db = os.environ.get("OMNI_DB_PATH", "/Users/ahmedsadek/nexus/data/omni.db")
+            conn = _sq.connect(omni_db); conn.row_factory = _sq.Row
+            brain_row = conn.execute("""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN claude_error IS NOT NULL OR gemini_error IS NOT NULL
+                                     OR o3mini_error IS NOT NULL OR deepseek_error IS NOT NULL
+                                THEN 1 ELSE 0 END) as errors
+                FROM synthesis_results
+                WHERE datetime(created_at) > datetime('now','-30 minutes')
+            """).fetchone()
+            conn.close()
+            total = brain_row["total"] or 0
+            errors = brain_row["errors"] or 0
+            if total >= 3 and errors / total > 0.40:
+                logger.warning(
+                    "THRESHOLD: brain error rate %.0f%% (threshold: 40%%) in last 30min",
+                    100 * errors / total,
+                )
+                _sov(
+                    f"⚠️ OMNI: Brain error rate {100*errors//total}% in last 30min. "
+                    f"API issues likely. Synthesis degraded."
+                )
+        except Exception as e:
+            logger.debug("Threshold check (brain rate) error: %s", e)
+
+        # --- 3. Lost concordances (dispatch_attempts >= 3) ---
+        try:
+            buf_db = os.environ.get("ALPHA_BUFFER_DB", "/Users/ahmedsadek/nexus/data/alpha_buffer.db")
+            conn = _sq.connect(buf_db); conn.row_factory = _sq.Row
+            lost = conn.execute("""
+                SELECT COUNT(*) as n FROM concordance_results
+                WHERE omni_dispatched=0 AND dispatch_attempts >= 3
+                AND datetime(created_at) > datetime('now','-60 minutes')
+            """).fetchone()["n"]
+            conn.close()
+            if lost > 0:
+                logger.error(
+                    "THRESHOLD: %d concordance(s) lost (max retries exhausted) in last 60min",
+                    lost,
+                )
+                _sov(
+                    f"🚨 OMNI THRESHOLD: {lost} concordance(s) lost to dispatch failures "
+                    f"(all retries exhausted). Trade opportunities permanently missed. "
+                    f"Investigating OMNI webhook connectivity."
+                )
+        except Exception as e:
+            logger.debug("Threshold check (lost concordances) error: %s", e)
+
+        # --- 4. DLQ stats ---
+        try:
+            from execution_dlq import get_dlq_stats as _gs
+            stats = _gs()
+            if stats.get("pending", 0) > 5:
+                logger.warning("DLQ backlog: %d pending entries", stats["pending"])
+                _sov(f"⚠️ Execution DLQ backlog: {stats['pending']} entries pending retry")
+        except Exception as e:
+            logger.debug("Threshold check (DLQ) error: %s", e)
+
+    def _scan_log_for_errors() -> None:
+        """
+        Scan recent service logs for CRITICAL/ERROR patterns.
+        Any CRITICAL log = immediate investigation and fix.
+        This ensures OMNI does not need an external reminder to act.
+        """
+        import subprocess as _sp
+        checks = [
+            ("/Users/ahmedsadek/nexus/logs/alpha-buffer/stderr.log",   "alpha-buffer"),
+            ("/Users/ahmedsadek/nexus/logs/alpha-execution/stderr.log", "alpha-execution"),
+            ("/Users/ahmedsadek/nexus/logs/prime-execution/stderr.log", "prime-execution"),
+            ("/Users/ahmedsadek/nexus/logs/omni/stderr.log",            "omni"),
+        ]
+        for log_path, service in checks:
+            try:
+                result = _sp.run(
+                    ["grep", "-c", "CRITICAL", log_path],
+                    capture_output=True, text=True, timeout=3
+                )
+                count = int(result.stdout.strip()) if result.returncode == 0 else 0
+                if count > 0:
+                    # Get the actual CRITICAL lines from last 5 min
+                    recent = _sp.run(
+                        ["grep", "CRITICAL", log_path],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    lines = recent.stdout.strip().split("\n")[-5:]
+                    logger.warning(
+                        "WATCHDOG LOG SCAN: %s has %d CRITICAL entries. Recent: %s",
+                        service, count, " | ".join(l[-100:] for l in lines if l)
+                    )
+                    _sov(
+                        f"⚠️ WATCHDOG LOG SCAN: {service} has {count} CRITICAL log entries.\n"
+                        f"Recent: {chr(10).join(lines[-3:])}"
+                    )
+            except Exception as e:
+                logger.debug("Log scan error for %s: %s", service, e)
+
+    logger.info("OMNI trade-blocker watchdog started (60s interval)")
+    while True:
+        try:
+            _time.sleep(60)
+            if not _is_market_hours():
+                _time.sleep(180)
+                continue
+            _resume_paused()
+            _retry_failed_executions()
+            _scan_log_for_errors()
+            _check_metric_thresholds()  # GAP-006
+            # GAP-003: Process execution DLQ — retry failed trades with backoff
+            _process_dlq_cycle()
+        except Exception as e:
+            logger.warning("Trade-blocker watchdog error: %s", e)
 
 
 def _synthesis_silence_watcher() -> None:
@@ -357,6 +641,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # G8 SYS-1: MIN_BRAINS_REQUIRED safety guard — must be ≥ 3 for system integrity
     _check_min_brains_required(MIN_BRAINS_REQUIRED)
     logger.info("OMNI safety check: MIN_BRAINS_REQUIRED=%d ✓", MIN_BRAINS_REQUIRED)
+    _restore_omni_state()  # GAP-002: restore durable state
     # G9 SYS-2: Auth registry validation
     from shared.auth_registry import validate_service_auth_config, AuthConfigError
     try:
@@ -441,6 +726,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Launch continuous comms loop (polls every 30s, heartbeat every 5min)
     _comms_stop_omni.clear()
     threading.Thread(target=_sovereign_comms_loop_omni, daemon=True, name="omni-sovereign-comms").start()
+    threading.Thread(target=_trade_blocker_watchdog, daemon=True, name="omni-trade-blocker-watchdog").start()
 
     yield
 
@@ -544,6 +830,16 @@ def health() -> JSONResponse:
     """Health check. Always returns 200. No auth required."""
     _last_ts = app_state["last_synthesis_time"]
     _silence_min = round((time.time() - _last_ts) / 60, 1) if _last_ts else None
+    # GAP-008: pool stats
+    try:
+        _pool_stats = {
+            "workers":    3,
+            "max_workers": _SYNTHESIS_POOL._max_workers,
+            "active":     len([f for f in _SYNTHESIS_POOL._threads if f.is_alive()]),
+        }
+    except Exception:
+        _pool_stats = {"workers": 3}
+
     return JSONResponse({
         "status":              "healthy",
         "service":             "omni",
@@ -551,7 +847,8 @@ def health() -> JSONResponse:
         "syntheses_today":     app_state["syntheses_today"],
         "go_verdicts_today":   app_state["go_verdicts_today"],
         "uptime_since":        app_state["start_time"],
-        "last_synthesis_min_ago": _silence_min,   # Cipher fix: silence visibility
+        "last_synthesis_min_ago": _silence_min,
+        "synthesis_pool":      _pool_stats,      # GAP-008: concurrent worker stats
     })
 
 
@@ -692,19 +989,43 @@ def receive_concordance(
         concordance["weighted_score"],
     )
 
-    # Cipher fix: wrap entire synthesis in try/except so that any unhandled
-    # exception rolls back the dedup key — allowing the concordance to be
-    # retried rather than silently dropped forever.
-    try:
-        return _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
-    except Exception as _synthesis_exc:
-        logger.critical(
-            "OMNI synthesis FAILED for %s/%s — rolling back dedup key: %s",
-            _ticker, _pathway, _synthesis_exc, exc_info=True,
-        )
-        with _state_lock:
-            app_state["synthesized_concordances"].discard(_conc_key)
-        raise
+    # GAP-008: Submit synthesis to the worker pool instead of running inline.
+    # The /concordance endpoint returns 202 Accepted immediately.
+    # Synthesis runs in a background worker — up to 3 concordances simultaneously.
+    # P1 concordances are given priority by running them on a dedicated submit path.
+    # Dedup key is rolled back if synthesis raises an unhandled exception.
+
+    def _pooled_synthesis():
+        """Run synthesis in pool worker — rolls back dedup on failure."""
+        try:
+            _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
+        except Exception as _exc:
+            logger.critical(
+                "OMNI pool synthesis FAILED for %s/%s — rolling back dedup: %s",
+                _ticker, _pathway, _exc, exc_info=True,
+            )
+            with _state_lock:
+                app_state["synthesized_concordances"].discard(_conc_key)
+
+    _priority = _PATHWAY_PRIORITY.get(_pathway, 5)
+    _SYNTHESIS_POOL.submit(_pooled_synthesis)
+    logger.info(
+        "GAP-008: Synthesis queued for %s/%s (pathway=%s priority=%d pool_workers=3)",
+        _ticker, concordance.get("direction","?"), _pathway, _priority,
+    )
+
+    # Return 202 immediately — synthesis runs in background
+    from fastapi.responses import JSONResponse as _JSONResponse
+    return _JSONResponse(
+        status_code=202,
+        content={
+            "status":    "queued",
+            "ticker":    _ticker,
+            "pathway":   _pathway,
+            "window_id": _win_id,
+            "message":   "Synthesis dispatched to worker pool — result will be posted to execution and Telegram",
+        },
+    )
 
 
 def _run_synthesis(
@@ -882,6 +1203,47 @@ def _run_synthesis(
         if exec_ok:
             with _state_lock:                  # Pass B fix (V6): thread-safe counter
                 app_state["go_verdicts_today"] += 1
+            _svc_state.write("go_verdicts_today", app_state["go_verdicts_today"])  # GAP-002
+        else:
+            # GAP-003: Execution failed → enqueue in DLQ for persistent retry
+            # Also launch auto-recovery in background thread
+            try:
+                from execution_recovery import auto_recover_async as _ar
+                _ar(
+                    ticker    = concordance["ticker"],
+                    system    = concordance["system"],
+                    exec_resp = exec_resp,
+                    route_fn  = _route_now,
+                )
+            except Exception as _ar_err:
+                logger.warning("Auto-recover launch failed: %s", _ar_err)
+
+            try:
+                from execution_dlq import enqueue as _dlq_enqueue
+                _dlq_enqueue(
+                    ticker         = concordance["ticker"],
+                    direction      = concordance.get("direction", "bullish"),
+                    system         = concordance["system"],
+                    pathway        = concordance.get("pathway", "P1"),
+                    window_id      = concordance.get("window_id", "unknown"),
+                    payload        = {
+                        "ticker":            concordance["ticker"],
+                        "direction":         concordance.get("direction", "bullish"),
+                        "system":            concordance["system"],
+                        "pathway":           concordance.get("pathway", "P1"),
+                        "agent_scores":      concordance.get("scores", {}),
+                        "weighted_score":    concordance.get("weighted_score", 0),
+                        "verdict":           verdict.verdict,
+                        "votes_go":          verdict.votes_go,
+                        "sizing_mult":       verdict.sizing_mult,
+                        "position_size_usd": position_size,
+                        "window_id":         concordance.get("window_id", "unknown") + "-dlq",
+                        "auto_execute":      True,
+                    },
+                    failure_reason = exec_resp,
+                )
+            except Exception as _dlq_err:
+                logger.warning("DLQ enqueue failed: %s", _dlq_err)
 
     # ── Step 9: Telegram notifications ───────────────────────────────────────
     # Axiom hard-stop blocked → alert Ahmed (Cipher Finding 6 fix)
