@@ -363,12 +363,30 @@ def assess_stock(
             risk_score = 10.0
             sizing_mult = 0.0
 
-    # IVR-based strategy enforcement (item ④ OMNI 7AM diagnostic)
-    if body.strategy and body.strategy == "credit":
-        # Credit spreads need mid-to-high IVR to be worthwhile
-        # Low IVR credit trades have poor risk/reward
-        flags.append("Credit spread in potentially low IVR — verify IVR >= 30 before entry")
-        concerns.append("Credit spread strategy — verify IV percentile before sizing")
+    # IVR-based strategy enforcement — HARD GATES (Blocker 4 fix, 2026-04-29)
+    # Credit spreads require meaningful premium to have a viable risk/reward.
+    # Below MIN_IVR_CREDIT_SPREAD (30): credit is too thin — hard block.
+    # Debit spreads above MAX_IVR_DEBIT_SPREAD (70): overpaying premium — hard block.
+    if body.ivr is not None:
+        if body.strategy in ("credit", "bull_put_spread", "bear_call_spread", "iron_condor"):
+            if body.ivr < MIN_IVR_CREDIT_SPREAD:
+                hard_stops.append(
+                    f"IVR {body.ivr} below minimum {MIN_IVR_CREDIT_SPREAD} for credit spreads — "
+                    f"premium too thin for viable risk/reward"
+                )
+                risk_score = max(risk_score, 8.0)
+                sizing_mult = 0.0
+        elif body.strategy in ("debit", "bull_call_spread", "bear_put_spread"):
+            if body.ivr > MAX_IVR_DEBIT_SPREAD:
+                hard_stops.append(
+                    f"IVR {body.ivr} above maximum {MAX_IVR_DEBIT_SPREAD} for debit spreads — "
+                    f"overpaying premium, poor risk/reward"
+                )
+                risk_score = max(risk_score, 8.0)
+                sizing_mult = 0.0
+    elif body.strategy in ("credit", "bull_put_spread", "bear_call_spread", "iron_condor"):
+        # No IVR provided — flag it but don't hard block (IVR data may be unavailable)
+        flags.append("Credit spread submitted without IVR — verify IV percentile >= 30 before entry")
 
     # Not in current pool
     if pool and ticker not in pool:
