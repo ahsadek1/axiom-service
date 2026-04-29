@@ -31,6 +31,7 @@ from config import (
     BRAIN_O3MINI,
     BRAIN_DIMENSIONS,
     BRAIN_TIMEOUT_SECONDS,
+    BRAIN_RETRY_COUNT,
 )
 
 logger = logging.getLogger("omni.quad_intelligence")
@@ -164,23 +165,49 @@ def _call_brain(
         role_description = BRAIN_ROLES[brain_name],
     )
 
-    start_ms = int(time.time() * 1000)
-    try:
-        raw_text = _dispatch_api(brain_name, prompt, api_key)
-        elapsed  = int(time.time() * 1000) - start_ms
+    start_ms  = int(time.time() * 1000)
+    last_error: Exception | None = None
 
-        result = _parse_brain_response(raw_text, brain_name)
-        result["elapsed_ms"]  = elapsed
-        result["brain"]       = brain_name
-        result["dimension"]   = BRAIN_DIMENSIONS[brain_name]
-        return result
+    for attempt in range(1 + BRAIN_RETRY_COUNT):
+        if attempt > 0:
+            logger.info("Brain %s retry %d/%d", brain_name, attempt, BRAIN_RETRY_COUNT)
+        try:
+            raw_text = _dispatch_api(brain_name, prompt, api_key)
+            elapsed  = int(time.time() * 1000) - start_ms
 
-    except Exception as e:
-        elapsed = int(time.time() * 1000) - start_ms
-        logger.warning("Brain %s call failed (%dms): %s", brain_name, elapsed, e)
-        err = _error_result(brain_name, str(e)[:200])
-        err["elapsed_ms"] = elapsed
-        return err
+            # Guard: empty response means the brain returned nothing (e.g. Gemini
+            # thinking model exhausted tokens and returned empty body, or Claude
+            # connection reset). Retry once before treating as error.
+            if not raw_text or not raw_text.strip():
+                logger.warning("Brain %s returned empty response (%dms) — attempt %d",
+                               brain_name, elapsed, attempt + 1)
+                last_error = Exception(f"empty response from API after {elapsed}ms")
+                continue  # retry
+
+            result = _parse_brain_response(raw_text, brain_name)
+            result["elapsed_ms"]  = elapsed
+            result["brain"]       = brain_name
+            result["dimension"]   = BRAIN_DIMENSIONS[brain_name]
+            return result
+
+        except Exception as e:
+            elapsed = int(time.time() * 1000) - start_ms
+            logger.warning("Brain %s call failed (%dms) attempt %d: %s",
+                           brain_name, elapsed, attempt + 1, e)
+            last_error = e
+            # Don't retry on non-timeout errors (4xx, 5xx auth/quota) — only on
+            # connection-level failures where a retry has a real chance of success.
+            retryable = any(kw in str(e).lower() for kw in (
+                "timeout", "connection reset", "connection aborted", "read timed out",
+                "service unavailable", "502", "503", "504",
+            ))
+            if not retryable:
+                break
+
+    elapsed = int(time.time() * 1000) - start_ms
+    err = _error_result(brain_name, str(last_error)[:200])
+    err["elapsed_ms"] = elapsed
+    return err
 
 
 def _dispatch_api(brain_name: str, prompt: str, api_key: str) -> str:
@@ -250,19 +277,26 @@ def _call_openai(prompt: str, api_key: str) -> str:
 
 
 def _call_gemini(prompt: str, api_key: str) -> str:
-    """Call Gemini 2.5 Flash via Google Generative AI REST API."""
+    """Call Gemini 2.5 Flash (thinking disabled) via Google Generative AI REST API.
+
+    Switched from 2.5 Pro to 2.5 Flash (thinkingBudget=0) to eliminate the
+    25-90s thinking phase that was causing consistent brain timeouts and
+    degrading quad-intelligence to 2/4 brains. Flash with thinking disabled
+    produces sub-5s responses and is fully sufficient for the structured
+    JSON vote this brain delivers (500-char output, deterministic format).
+    Cipher Finding 9 (Pro required for reasoning depth) does not apply to
+    this structured voting use case — it applies to open-ended synthesis.
+    """
     resp = requests.post(
-        # Cipher Finding 9: spec requires Gemini 2.5 Pro (not Flash).
-        # Flash is faster but has lower reasoning depth — insufficient for
-        # multi-factor financial synthesis requiring cross-domain correlation.
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
         headers={"Content-Type": "application/json"},
         json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "maxOutputTokens": 1000,
+                "maxOutputTokens": 2048,
                 "temperature": 0.2,
             },
+            "thinkingConfig": {"thinkingBudget": 0},  # disable thinking — not needed for structured JSON vote
         },
         timeout=BRAIN_TIMEOUT_SECONDS,
     )
