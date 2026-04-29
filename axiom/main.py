@@ -207,6 +207,10 @@ class AssessRequest(BaseModel):
     ticker: str
     dte: Optional[int] = None         # Optional DTE for options — enforced against MIN_DTE/MAX_DTE
     strategy: Optional[str] = None    # Optional strategy type: "debit", "credit", "short", "long"
+    ivr: Optional[float] = None       # IV rank/percentile (0–100) — enforced against IVR credit/debit limits
+    proposed_usd: Optional[float] = None  # Proposed trade size in USD
+    strike: Optional[float] = None    # Short strike price
+    r2_score: Optional[float] = None  # R2 conviction score from OMNI
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
