@@ -174,7 +174,28 @@ def _run_reconciler_locked(
                     ticker,
                 )
                 continue
-            # DB says open, Alpaca has no position and no pending order — genuine mismatch
+
+            # GAP-004 Option C: Order-centric verification.
+            # Before flagging as a mismatch, verify the order status directly.
+            # A filled order = position is REAL but /positions hasn't propagated yet.
+            order_id = (pos.get("alpaca_order_id") or "").strip()
+            if order_id:
+                try:
+                    order_data = alpaca_client.get_order(order_id)
+                    if order_data:
+                        o_status   = order_data.get("status", "")
+                        o_filled   = float(order_data.get("filled_qty") or 0)
+                        if o_status == "filled" and o_filled > 0:
+                            logger.info(
+                                "GAP-004: %s order %s is FILLED — position real, "
+                                "skipping mismatch (Alpaca /positions propagation lag)",
+                                ticker, order_id[:8],
+                            )
+                            continue   # Not a mismatch — position is real
+                except Exception as _oc_err:
+                    logger.debug("GAP-004 order-check failed for %s: %s", ticker, _oc_err)
+
+            # DB says open, Alpaca has no position, order not filled — genuine mismatch
             mismatches.append(
                 f"{ticker} (pos_id={pos['id']}, order_id={pos.get('alpaca_order_id','?')}) "
                 f"in DB but not in Alpaca"

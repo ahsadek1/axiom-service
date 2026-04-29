@@ -17,9 +17,10 @@ NEXUS_SECRET  = "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d
 TG_BOT        = "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc"
 TG_HEALTH     = "-5184172590"
 TG_AHMED      = "8573754783"
-ALPHA_URL     = "https://worker-production-2060.up.railway.app"
-AXIOM_URL     = "https://axiom-production-334c.up.railway.app"
-PRIME_URL     = "https://nexus-prime-bot-production.up.railway.app"
+ALPHA_URL     = "https://worker-production-2060.up.railway.app"  # Railway alpha-execution v3.0.0
+AXIOM_URL     = "https://axiom-production-334c.up.railway.app"  # Railway axiom v4.0.0
+PRIME_URL     = "https://nexus-prime-bot-production.up.railway.app"  # Railway prime-scheduler v2.1.0
+PRIME_EXEC_URL = "http://localhost:8006"  # Local prime-execution v3.0.0 — reconciler lives here
 RAILWAY_TOKEN = "95959846-6306-47e7-a502-b7461514ffff"
 
 ISSUES   = []
@@ -209,7 +210,45 @@ def check_positions():
     except Exception as e:
         flag(f"⚠️ Position check failed: {e}", critical=False)
 
-# ── 6. Canceled order pattern detection — RECENT WINDOW ONLY ─────────────────
+# ── 6. Reconciler status check — Axiom Apr 29 fix ───────────────────────────
+def check_reconciler():
+    """
+    Check prime execution reconciler status.
+    Reconciler runs locally (localhost:8006) — checks position alignment
+    between DB and Alpaca every 30 min.
+    """
+    try:
+        r = requests.get(f"{PRIME_EXEC_URL}/health", timeout=8)
+        d = r.json()
+        paused    = d.get("execution_paused", False)
+        reconcile = d.get("last_reconcile_at")
+        alpaca    = d.get("alpaca_reachable", False)
+        
+        print(f"  Reconciler: paused={paused} last_reconcile={reconcile} alpaca={alpaca}")
+        
+        if paused:
+            flag("🔴 Reconciler: execution_paused=True — position mismatch active", critical=True)
+        if reconcile is None:
+            flag("⚠️ Reconciler: never run this session — may need manual trigger", critical=False)
+        elif alpaca is False:
+            flag("🔴 Reconciler: Alpaca unreachable — pausing execution", critical=True)
+        else:
+            # Check staleness: should run every 30 min during market hours
+            try:
+                rt = datetime.datetime.fromisoformat(reconcile.replace("Z","+00:00") if reconcile else "")
+                age_min = (datetime.datetime.now(datetime.timezone.utc) - rt).total_seconds() / 60
+                if age_min > 45:
+                    flag(f"⚠️ Reconciler: last run {age_min:.0f}min ago — may be stale (>45)", critical=False)
+            except Exception:
+                pass
+                
+        return True
+    except Exception as e:
+        flag(f"⚠️ Reconciler unreachable (local-only): {e}", critical=False)
+        return False
+
+
+# ── 7. Canceled order pattern detection — RECENT WINDOW ONLY ─────────────────
 # Only flag cancellations in the last 20 minutes. Historical/already-fixed issues
 # must not re-alert every cycle. Same issue should never fire twice in a row.
 def check_canceled_orders():
@@ -254,6 +293,7 @@ def main():
     check_alpha()
     check_axiom()
     check_prime()
+    check_reconciler()
     check_positions()
     check_canceled_orders()
 

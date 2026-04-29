@@ -16,7 +16,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import pytz
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -205,8 +205,8 @@ app = FastAPI(
 
 class AssessRequest(BaseModel):
     ticker: str
-    dte: int | None = None         # Optional DTE for options — enforced against MIN_DTE/MAX_DTE
-    strategy: str | None = None    # Optional strategy type: "debit", "credit", "short", "long"
+    dte: Optional[int] = None         # Optional DTE for options — enforced against MIN_DTE/MAX_DTE
+    strategy: Optional[str] = None    # Optional strategy type: "debit", "credit", "short", "long"
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
