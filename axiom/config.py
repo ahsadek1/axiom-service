@@ -48,11 +48,13 @@ NASDAQ100_TICKERS = []  # Merged into SP500_TICKERS above (deduplicated)
 # ── System Limits (Circuit Breaker Config) ──────────────────────────────────
 # These are the canonical values that Axiom exposes via /limits.
 # All services (Alpha, Prime, Guardian Angel) should read from here.
-MAX_POSITIONS        = 3       # Max concurrent positions across all systems
-MAX_RISK_PER_TRADE   = 1000.0  # Max $ risk per trade
-MIN_DTE              = 21      # Minimum days to expiration for options
-MAX_DTE              = 60      # Maximum days to expiration for options
-VIX_PAUSE_THRESHOLD  = 35.0    # VIX above this → pause all new entries
+MAX_POSITIONS          = 3       # Max concurrent positions across all systems
+MAX_RISK_PER_TRADE     = 1000.0  # Max $ risk per trade
+MIN_DTE                = 21      # Minimum days to expiration for options
+MAX_DTE                = 60      # Maximum days to expiration for options
+VIX_PAUSE_THRESHOLD    = 35.0    # VIX above this → pause all new entries
+MIN_IVR_CREDIT_SPREAD  = 30      # Minimum IV percentile for credit spreads (0-100)
+MAX_IVR_DEBIT_SPREAD   = 70      # Maximum IV percentile for debit spreads (0-100)
 
 
 @dataclass(frozen=True)

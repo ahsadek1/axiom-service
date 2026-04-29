@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import AsyncGenerator
 
 import pytz
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -28,7 +28,7 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).parent.parent))
 from shared.sovereign_comms import get_instructions, report
 
-from config import load_settings, MAX_POSITIONS, MAX_RISK_PER_TRADE, MIN_DTE, MAX_DTE, VIX_PAUSE_THRESHOLD
+from config import load_settings, MAX_POSITIONS, MAX_RISK_PER_TRADE, MIN_DTE, MAX_DTE, VIX_PAUSE_THRESHOLD, MIN_IVR_CREDIT_SPREAD, MAX_IVR_DEBIT_SPREAD
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -78,18 +78,22 @@ def current_window_id() -> str:
     return now.strftime(f"%Y-%m-%d-%H{mins:02d}")
 
 
-def verify_secret(x_axiom_secret: str) -> None:
+def verify_secret(request: Request) -> None:
     """
-    Verify the X-Axiom-Secret header matches the configured secret.
+    Verify either X-Axiom-Secret or X-Nexus-Secret header.
+    Accepts both header names (same secret value) for backward compatibility.
 
     Args:
-        x_axiom_secret: Value from X-Axiom-Secret header.
+        request: FastAPI Request object (extracts header from it).
 
     Raises:
         HTTPException: 403 if secret is missing or invalid.
     """
     import secrets as _sec
-    if not x_axiom_secret or not _sec.compare_digest(x_axiom_secret, settings.axiom_secret):
+    axiom_val = request.headers.get("X-Axiom-Secret") or request.headers.get("x-axiom-secret")
+    nexus_val = request.headers.get("X-Nexus-Secret") or request.headers.get("x-nexus-secret")
+    secret_val = axiom_val or nexus_val or ""
+    if not secret_val or not _sec.compare_digest(secret_val, settings.axiom_secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
@@ -201,6 +205,8 @@ app = FastAPI(
 
 class AssessRequest(BaseModel):
     ticker: str
+    dte: int | None = None         # Optional DTE for options — enforced against MIN_DTE/MAX_DTE
+    strategy: str | None = None    # Optional strategy type: "debit", "credit", "short", "long"
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -231,14 +237,14 @@ def health() -> JSONResponse:
 
 
 @app.get("/pool")
-def get_pool(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def get_pool(request: Request) -> JSONResponse:
     """
     Return the current live candidate pool.
 
     Returns:
         Pool payload with tickers, count, window_id, and regime.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
 
     # Adversarial fix #1: snapshot app_state under lock to avoid partial reads
     # during concurrent pool refresh from scheduler.
@@ -258,14 +264,14 @@ def get_pool(x_axiom_secret: str = Header(default="")) -> JSONResponse:
 
 
 @app.get("/regime")
-def get_regime(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def get_regime(request: Request) -> JSONResponse:
     """
     Return the current VIX regime classification.
 
     Returns:
         Regime dict with classification and all allowed flags.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
 
     regime = app_state.get("regime")
     if regime is None:
@@ -275,14 +281,14 @@ def get_regime(x_axiom_secret: str = Header(default="")) -> JSONResponse:
 
 
 @app.get("/anchor")
-def get_anchor(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def get_anchor(request: Request) -> JSONResponse:
     """
     Return the current Tier 1 anchor stocks.
 
     Returns:
         List of anchor stock tickers from the latest Tier 1 run.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
 
     anchors = app_state.get("anchor_stocks", [])
     return JSONResponse({
@@ -295,7 +301,7 @@ def get_anchor(x_axiom_secret: str = Header(default="")) -> JSONResponse:
 @app.post("/assess")
 def assess_stock(
     body: AssessRequest,
-    x_axiom_secret: str = Header(default=""),
+    request: Request,
 ) -> JSONResponse:
     """
     Run a per-stock risk assessment on demand.
@@ -309,7 +315,7 @@ def assess_stock(
     Returns:
         Risk assessment with score, sizing_mult, hard_stops, and concerns.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
 
     ticker    = body.ticker.upper().strip()
     window_id = app_state.get("window_id") or current_window_id()
@@ -346,10 +352,33 @@ def assess_stock(
     risk_score  = 2.0
     sizing_mult = 1.0
 
+    # DTE enforcement (hard block — item ③ OMNI 7AM diagnostic)
+    if body.dte is not None:
+        if body.dte < MIN_DTE:
+            hard_stops.append(f"DTE {body.dte}d below minimum {MIN_DTE}d — hard blocked")
+            risk_score = 10.0
+            sizing_mult = 0.0
+        elif body.dte > MAX_DTE:
+            hard_stops.append(f"DTE {body.dte}d above maximum {MAX_DTE}d — hard blocked")
+            risk_score = 10.0
+            sizing_mult = 0.0
+
+    # IVR-based strategy enforcement (item ④ OMNI 7AM diagnostic)
+    if body.strategy and body.strategy == "credit":
+        # Credit spreads need mid-to-high IVR to be worthwhile
+        # Low IVR credit trades have poor risk/reward
+        flags.append("Credit spread in potentially low IVR — verify IVR >= 30 before entry")
+        concerns.append("Credit spread strategy — verify IV percentile before sizing")
+
     # Not in current pool
     if pool and ticker not in pool:
         concerns.append(f"{ticker} not in current Axiom pool — submitted outside pool")
         risk_score += 1.0
+
+    # Strategy-specific risk (debit spreads in high IV = premium risk)
+    if body.strategy and body.strategy == "debit":
+        flags.append("Debit spread — verify IVR is not elevated before entry")
+        concerns.append("Debit spread — check IVR to avoid overpaying premium")
 
     # Regime-based risk
     if regime:
@@ -401,14 +430,14 @@ def assess_stock(
 
 
 @app.get("/oracle/status")
-def oracle_status(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def oracle_status(request: Request) -> JSONResponse:
     """
     Diagnostic endpoint — ORACLE integration status.
 
     Returns current ORACLE reachability, last pre-warm and coherence query
     timestamps, and current regime source.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
 
     import oracle_client
     reachable = oracle_client.health_check()
@@ -426,14 +455,14 @@ def oracle_status(x_axiom_secret: str = Header(default="")) -> JSONResponse:
 
 
 @app.post("/trigger-tier1")
-def trigger_tier1(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def trigger_tier1(request: Request) -> JSONResponse:
     """
     Manually trigger a Tier 1 anchor-stock scan.
 
     Used by Guardian Angel when pool is empty during market hours,
     and by the morning diagnostic if Axiom missed its scheduled run.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
     from scheduler import _run_tier1
     import threading
     try:
@@ -446,7 +475,7 @@ def trigger_tier1(x_axiom_secret: str = Header(default="")) -> JSONResponse:
 
 
 @app.post("/trigger-tier2")
-def trigger_tier2(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def trigger_tier2(request: Request) -> JSONResponse:
     """
     Manually trigger a Tier 2 pool refresh and agent push.
 
@@ -459,7 +488,7 @@ def trigger_tier2(x_axiom_secret: str = Header(default="")) -> JSONResponse:
     missed fire times after a restart — this endpoint is the manual
     recovery path when Axiom restarts between 8:30 and 9:15 AM ET.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
     from scheduler import _run_tier2_if_open
     import threading
 
@@ -479,13 +508,13 @@ def trigger_tier2(x_axiom_secret: str = Header(default="")) -> JSONResponse:
 
 
 @app.post("/premarket")
-def trigger_premarket(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def trigger_premarket(request: Request) -> JSONResponse:
     """
     Manually trigger the pre-market brief generation.
 
     Useful for testing or if the scheduled run was missed.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
 
     from scheduler import _run_premarket_brief
     try:
@@ -508,10 +537,10 @@ class _SovDirective(BaseModel):
 @app.post("/sovereign/directive", status_code=200)
 def sovereign_directive(
     body: _SovDirective,
-    x_axiom_secret: str = Header(default=""),
+    request: Request,
 ) -> JSONResponse:
     """SOVEREIGN pushes a directive to Axiom. Zero polling lag."""
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
     d = body.directive.strip().upper()
     logger.info("SOVEREIGN direct push to axiom: %s", d)
 
@@ -539,7 +568,7 @@ def sovereign_directive(
 
 
 @app.get("/limits", status_code=200)
-def get_limits(x_axiom_secret: str = Header(default="")) -> JSONResponse:
+def get_limits(request: Request) -> JSONResponse:
     """
     Return the current system limits and circuit breaker thresholds.
 
@@ -550,7 +579,7 @@ def get_limits(x_axiom_secret: str = Header(default="")) -> JSONResponse:
         Dict with max_positions, max_risk_per_trade, min_dte, max_dte,
         vix_pause_threshold, and current regime state.
     """
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
 
     regime = app_state.get("regime")
     vix    = regime.vix if regime else None
@@ -563,24 +592,26 @@ def get_limits(x_axiom_secret: str = Header(default="")) -> JSONResponse:
         vix_paused = True
 
     return JSONResponse({
-        "max_positions":       MAX_POSITIONS,
-        "max_risk_per_trade":  MAX_RISK_PER_TRADE,
-        "min_dte":             MIN_DTE,
-        "max_dte":             MAX_DTE,
-        "vix_pause_threshold": VIX_PAUSE_THRESHOLD,
-        "vix_current":         vix,
-        "vix_paused":          vix_paused,
-        "regime":              regime.classification if regime else "UNKNOWN",
-        "source":              "axiom-config",
+        "max_positions":           MAX_POSITIONS,
+        "max_risk_per_trade":      MAX_RISK_PER_TRADE,
+        "min_dte":                 MIN_DTE,
+        "max_dte":                 MAX_DTE,
+        "vix_pause_threshold":     VIX_PAUSE_THRESHOLD,
+        "min_ivr_credit_spread":   MIN_IVR_CREDIT_SPREAD,
+        "max_ivr_debit_spread":    MAX_IVR_DEBIT_SPREAD,
+        "vix_current":             vix,
+        "vix_paused":              vix_paused,
+        "regime":                  regime.classification if regime else "UNKNOWN",
+        "source":                  "axiom-config",
     })
 
 
 @app.get("/sovereign/status", status_code=200)
 def sovereign_status(
-    x_axiom_secret: str = Header(default=""),
+    request: Request,
 ) -> JSONResponse:
     """SOVEREIGN queries Axiom state on-demand."""
-    verify_secret(x_axiom_secret)
+    verify_secret(request)
     regime = app_state.get("regime")
     return JSONResponse({
         "ok": True, "service": "axiom",
@@ -606,3 +637,12 @@ def _is_submissions_open() -> bool:
     open_time  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return open_time <= now <= close_time
+
+@app.get("/trace")
+def trace_headers(request: Request) -> JSONResponse:
+    """Debug: returns all received headers. Requires valid auth."""
+    verify_secret(request)
+    return JSONResponse({
+        "headers": dict(request.headers),
+        "version": "4.0.0",
+    })
