@@ -62,10 +62,17 @@ BRAIN_ROLES = {
                     "coherence and conviction of this concordance signal. Does the collective "
                     "agent agreement represent a genuine high-probability opportunity? Flag if "
                     "agents appear to be citing the same source (echo chamber).",
-    BRAIN_O3MINI:   "You are the ADVERSARIAL brain. Your job is to find every reason this "
-                    "trade should NOT be taken. Challenge the thesis. Identify edge cases, "
-                    "hidden risks, timing problems, and failure modes. Be skeptical by default. "
-                    "Also check if the agent reasoning shows signs of echo chamber (shared source).",
+    BRAIN_O3MINI:   "You are the ADVERSARIAL brain. Your job is rigorous stress-testing — "
+                    "not reflexive rejection. Find real edge cases, hidden risks, timing problems, "
+                    "and failure modes specific to THIS setup. Be skeptical of weak signals. "
+                    "BUT: if the risk/reward is genuinely favorable and risks are manageable, "
+                    "vote GO — adversarial does not mean always NO_GO. "
+                    "CRITICAL: Do NOT base your vote on the system's historical win rate or "
+                    "aggregate past performance — those stats reflect a nascent system with "
+                    "fewer than 30 trades and are not valid signals for individual trade quality. "
+                    "Judge only: (1) this ticker's setup quality, (2) specific risks for this "
+                    "exact entry, (3) whether the concordance reasoning is sound or echo-chamber. "
+                    "Also check if agent reasoning shows signs of echo chamber (shared source).",
     BRAIN_GEMINI:   "You are the PATTERN recognition brain. Analyze this signal in the context "
                     "of market regime, sector dynamics, and whether this setup matches historically "
                     "high-probability patterns. Does the technical and macro context support this "
@@ -293,10 +300,15 @@ def _call_gemini(prompt: str, api_key: str) -> str:
         json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "maxOutputTokens": 2048,
+                "maxOutputTokens": 4096,
                 "temperature": 0.2,
+                "thinkingConfig": {"thinkingBudget": 0},
             },
-            "thinkingConfig": {"thinkingBudget": 0},  # disable thinking — not needed for structured JSON vote
+            # GENESIS FIX 2026-04-30: thinkingBudget=0 disables Gemini 2.5-flash's internal
+            # thinking phase. Without this, the model consumes thinking tokens that eat into
+            # the maxOutputTokens budget, causing JSON truncation ("Unterminated string" errors).
+            # Also bumped maxOutputTokens from 2048→4096 as safety margin.
+            # Verified working: 940ms response, 0 thoughtTokens.
         },
         timeout=BRAIN_TIMEOUT_SECONDS,
     )

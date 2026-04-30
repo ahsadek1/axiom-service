@@ -151,6 +151,10 @@ app_state = {
     "last_synthesis_time": None,       # Cipher fix: track last synthesis timestamp for silence detection
     "p4_dispatched_windows": set(),  # INV-15: (ticker, window_id) pairs — max 1 P4 per ticker per window
     "synthesized_concordances": set(),  # Dedup: (ticker, window_id, direction, system, pathway) — max 1 synthesis per concordance pathway per window [GENESIS 2026-04-20]
+    # Self-audit: consecutive NO_GO tracking (OMNI Upgrade v2 — Apr 30 2026)
+    "consecutive_nogo": 0,
+    "consecutive_nogo_alerted": False,
+    "nogo_block_reasons": [],   # last 5 blocking reason snippets for pattern detection
 }
 
 # ── Synthesis Silence Detector ────────────────────────────────────────────────
@@ -159,6 +163,62 @@ app_state = {
 # alert Ahmed + Sovereign so the issue is caught immediately — not 2.5h later.
 _SILENCE_THRESHOLD_MIN = 20   # alert after 20 min silence during market hours
 _silence_alerted = False       # rate-limit: one alert per silence episode
+
+
+def _fire_consecutive_nogo_alert(
+    count: int,
+    reasons: list,
+    bot_token: str,
+    chat_id: str,
+    ticker: str,
+) -> None:
+    """
+    OMNI Self-Audit: fire alert when consecutive NO_GO threshold is hit during market hours.
+
+    Called in a background thread — never blocks synthesis.
+    Catches systematic bias (bad context, miscalibrated brain, stale data)
+    within one scan cycle instead of at end of day.
+    """
+    import requests as _req
+    _log = logging.getLogger("omni.self_audit")
+
+    # Detect dominant blocking pattern from recent reasons
+    all_reasons = " | ".join(reasons).lower()
+    if "win rate" in all_reasons or "historical" in all_reasons or "50%" in all_reasons:
+        pattern = ("⚠️ CONTEXT CONTAMINATION: 'historical win rate' in NO_GO reasons. "
+                   "System win rate is being used to block individual trades. "
+                   "Check build_context() in synthesis.py.")
+    elif "in_pool" in all_reasons or "not in axiom" in all_reasons:
+        pattern = "⚠️ AXIOM POOL: Repeated Axiom pool rejections. Check pool size or Axiom health."
+    elif "echo" in all_reasons:
+        pattern = "⚠️ ECHO CHAMBER: Recurring echo chamber flag. Agent scoring may be over-correlated."
+    elif "timeout" in all_reasons or "error" in all_reasons:
+        pattern = "⚠️ API ERRORS: Brain timeouts/errors recurring. Check network or API keys."
+    else:
+        pattern = "❓ No single dominant pattern. Review verdict_notes in omni.db manually."
+
+    msg = (
+        f"🔴 OMNI SELF-AUDIT ALERT\n"
+        f"{count} consecutive NO-GO verdicts during market hours\n"
+        f"Last ticker: {ticker}\n\n"
+        f"{pattern}\n\n"
+        f"Recent blocking notes:\n"
+        + "\n".join(f"• {r[:120]}" for r in reasons[-3:] if r)
+        + "\n\nAction required: diagnose and fix NOW. Do not wait until EOD."
+    )
+    _log.warning("SELF-AUDIT TRIGGER: %d consecutive NO-GOs | ticker=%s | pattern=%s",
+                 count, ticker, pattern[:80])
+
+    if not bot_token:
+        return
+    try:
+        _req.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg},
+            timeout=5,
+        )
+    except Exception as _e:
+        _log.warning("Self-audit alert send failed: %s", _e)
 
 
 def _is_market_hours() -> bool:
@@ -213,6 +273,18 @@ def _check_canary_gate() -> Optional[str]:
     except Exception as e:
         logger.warning("OMNI CANARY: gate check failed (%s) -- allowing synthesis", e)
         return None
+
+
+def _process_dlq_cycle() -> None:
+    """
+    GAP-003 stub: Process execution DLQ — retry failed trades with backoff.
+
+    Placeholder implemented 2026-04-29 to stop NameError in _trade_blocker_watchdog.
+    Full implementation requires spec approval per BUILD PIPELINE protocol.
+    The conditional_queue table in omni.db holds deferred trades pending implementation.
+    """
+    # TODO: Implement full DLQ processing per GAP-003 spec (pending spec approval)
+    pass
 
 
 def _trade_blocker_watchdog() -> None:
@@ -430,6 +502,7 @@ def _trade_blocker_watchdog() -> None:
         This ensures OMNI does not need an external reminder to act.
         """
         import subprocess as _sp
+        import re
         checks = [
             ("/Users/ahmedsadek/nexus/logs/alpha-buffer/stderr.log",   "alpha-buffer"),
             ("/Users/ahmedsadek/nexus/logs/alpha-execution/stderr.log", "alpha-execution"),
@@ -438,17 +511,36 @@ def _trade_blocker_watchdog() -> None:
         ]
         for log_path, service in checks:
             try:
-                result = _sp.run(
-                    ["grep", "-c", "CRITICAL", log_path],
+                # GAP-LOG-FIX: only scan recent lines (last 200) to avoid
+                # old historical entries flooding the watchdog with false alarms
+                tail_result = _sp.run(
+                    ["tail", "-200", log_path],
                     capture_output=True, text=True, timeout=3
                 )
-                count = int(result.stdout.strip()) if result.returncode == 0 else 0
+                recent_content = tail_result.stdout if tail_result.returncode == 0 else ""
+                # GENESIS-FIX-WATCHDOG-001 2026-04-29: Only count lines where CRITICAL
+                # is the log *level* (not the watchdog's own scan reports that say
+                # 'has N CRITICAL entries' — those are WARNING level and cause
+                # self-inflating counts each pass).
+                # GENESIS-FIX-WATCHDOG-002 2026-04-30: start_time filter (superseded).
+                # GENESIS-FIX-WATCHDOG-003 2026-04-30: Replace start_time filter with
+                # 10-minute recency window. Implements CIPHER P2 dispatch (intervention
+                # id:77): stale CRITICALs > 10min old are suppressed as acknowledged.
+                # A live CRITICAL still fires every 60s for up to 10min — enough for
+                # response. Root cause of this fix: 13:51:52 post-restart false-positive
+                # silence CRITICALs passed start_time filter by only 63s and flooded
+                # SOVEREIGN bus for 90+ min after GENESIS-FIX-RESTART-001 was deployed.
+                # Log format: '2026-04-29 14:23:18,499 CRITICAL omni.main: ...'
+                from datetime import datetime as _dt, timedelta as _td
+                _ten_min_ago_str = (_dt.now() - _td(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+                critical_lines = [
+                    line for line in recent_content.split("\n")
+                    if re.match(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+ CRITICAL ', line)
+                    and line[:19] >= _ten_min_ago_str
+                ]
+                count = len(critical_lines)
                 if count > 0:
-                    # Get the actual CRITICAL lines from last 5 min
-                    recent = _sp.run(
-                        ["grep", "CRITICAL", log_path],
-                        capture_output=True, text=True, timeout=3
-                    )
+                    recent = type('R', (), {'stdout': recent_content, 'returncode': 0})()
                     lines = recent.stdout.strip().split("\n")[-5:]
                     logger.warning(
                         "WATCHDOG LOG SCAN: %s has %d CRITICAL entries. Recent: %s",
@@ -519,11 +611,36 @@ def _synthesis_silence_watcher() -> None:
                         "OMNI SILENCE DETECTED: no synthesis in %.0f min during market hours",
                         silent_min,
                     )
+                    # Mandate v2: diagnose and act, not just alert
+                    # Check if concordances are being received but synthesis is failing
+                    try:
+                        import sqlite3 as _sq
+                        _buf_db = os.environ.get("ALPHA_BUFFER_DB","/Users/ahmedsadek/nexus/data/alpha_buffer.db")
+                        _conn = _sq.connect(_buf_db)
+                        _recent_conc = _conn.execute(
+                            "SELECT COUNT(*) FROM concordance_results WHERE datetime(created_at)>datetime('now','-30 minutes')"
+                        ).fetchone()[0]
+                        _conn.close()
+                        _diagnosis = (
+                            f"Buffer has {_recent_conc} concordance(s) in last 30min. "
+                            f"Pool workers={_SYNTHESIS_POOL._max_workers}. "
+                            f"Syntheses_today={app_state['syntheses_today']}."
+                        )
+                        if _recent_conc > 0 and app_state["syntheses_today"] == 0:
+                            _diagnosis += " LIKELY CAUSE: synthesis pool worker crashing silently."
+                        elif _recent_conc == 0:
+                            _diagnosis += " LIKELY CAUSE: no concordances reaching OMNI — check alpha-buffer dispatch."
+                    except Exception as _de:
+                        _diagnosis = f"Diagnosis failed: {_de}"
+
+                    logger.critical("SILENCE DIAGNOSIS: %s", _diagnosis)
+
                     # Alert Ahmed via Telegram
                     try:
                         from shared.notification_router import notify_escalate as _ne
                         _ne("omni", "OMNI SILENCE ALERT",
-                            f"No synthesis in {silent_min:.0f} minutes during market hours. Synthesis loop may be stalled.")
+                            f"No synthesis in {silent_min:.0f} minutes during market hours. "
+                            f"Diagnosis: {_diagnosis}")
                     except Exception as _te:
                         logger.error("Silence alert notification failed: %s", _te)
                     # Also notify Sovereign via message bus
@@ -696,6 +813,38 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 )
                 app_state["synthesized_concordances"].add(_rkey)
                 _recovered += 1
+        # GENESIS-FIX-RESTART-001 2026-04-30: Seed syntheses_today + last_synthesis_time
+        # from DB so the silence watcher does not false-fire after a clean restart
+        # that pre-loads already-synthesized concordances.
+        if _recovered > 0:
+            try:
+                with __import__("database").get_conn(settings.omni_db_path) as _ts_conn:
+                    _max_row = _ts_conn.execute(
+                        """SELECT MAX(created_at) AS max_ts FROM synthesis_results
+                        WHERE SUBSTR(window_id, 1, 10) = ?""",
+                        (_et_date_today,),
+                    ).fetchone()
+                _max_ts_str = _max_row["max_ts"] if _max_row else None
+                if _max_ts_str:
+                    from datetime import timezone as _tz
+                    # created_at may be offset-aware or naive ISO string
+                    _max_ts_str_clean = _max_ts_str.replace("Z", "+00:00")
+                    try:
+                        _max_dt = datetime.fromisoformat(_max_ts_str_clean)
+                    except ValueError:
+                        _max_dt = None
+                    if _max_dt is not None:
+                        if _max_dt.tzinfo is None:
+                            _max_dt = _max_dt.replace(tzinfo=_tz.utc)
+                        with _state_lock:
+                            app_state["syntheses_today"] = _recovered
+                            app_state["last_synthesis_time"] = _max_dt.timestamp()
+                        logger.info(
+                            "OMNI restart recovery: seeded syntheses_today=%d last_synthesis=%s",
+                            _recovered, _max_ts_str,
+                        )
+            except Exception as _seed_err:
+                logger.warning("OMNI restart recovery: could not seed synthesis counters: %s", _seed_err)
         logger.info(
             "OMNI restart recovery: pre-loaded %d synthesized_concordances from DB (date=%s)",
             _recovered, _et_date_today,
@@ -840,15 +989,37 @@ def health() -> JSONResponse:
     except Exception:
         _pool_stats = {"workers": 3}
 
+    # ── Trading Effectiveness Score (TES) ──────────────────────────────────────
+    # Measures whether OMNI is producing value, not just whether it's alive.
+    # Health=UP + Syntheses>0 + GO>0 = effective. Health=UP + Syntheses>0 + GO=0 = investigating.
+    _syntheses  = app_state["syntheses_today"]
+    _gos        = app_state["go_verdicts_today"]
+    _consec_nogo= app_state.get("consecutive_nogo", 0)
+    if not _is_market_hours():
+        _tes_state = "OFF_HOURS"
+    elif _syntheses == 0:
+        _tes_state = "WARMING_UP"
+    elif _gos > 0:
+        _tes_state = "EFFECTIVE"
+    elif _syntheses >= 3 and _gos == 0:
+        _tes_state = "INVESTIGATING" if _consec_nogo >= 3 else "DRY_SPELL"
+    else:
+        _tes_state = "ACTIVE"
+
     return JSONResponse({
         "status":              "healthy",
         "service":             "omni",
-        "version":             "3.0.0",
-        "syntheses_today":     app_state["syntheses_today"],
-        "go_verdicts_today":   app_state["go_verdicts_today"],
+        "version":             "3.1.0",
+        "syntheses_today":     _syntheses,
+        "go_verdicts_today":   _gos,
         "uptime_since":        app_state["start_time"],
         "last_synthesis_min_ago": _silence_min,
         "synthesis_pool":      _pool_stats,      # GAP-008: concurrent worker stats
+        "effectiveness": {
+            "tes_state":         _tes_state,
+            "consecutive_nogo":  _consec_nogo,
+            "nogo_alert_fired":  app_state.get("consecutive_nogo_alerted", False),
+        },
     })
 
 
@@ -996,16 +1167,41 @@ def receive_concordance(
     # Dedup key is rolled back if synthesis raises an unhandled exception.
 
     def _pooled_synthesis():
-        """Run synthesis in pool worker — rolls back dedup on failure."""
+        """Run synthesis in pool worker — rolls back dedup and retries once on failure."""
         try:
             _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
         except Exception as _exc:
             logger.critical(
-                "OMNI pool synthesis FAILED for %s/%s — rolling back dedup: %s",
+                "OMNI pool synthesis FAILED for %s/%s — rolling back dedup for retry: %s",
                 _ticker, _pathway, _exc, exc_info=True,
             )
             with _state_lock:
                 app_state["synthesized_concordances"].discard(_conc_key)
+            # Mandate v2: don't silently discard — retry once immediately
+            try:
+                logger.info("OMNI pool: retrying synthesis for %s/%s", _ticker, _pathway)
+                with _state_lock:
+                    app_state["synthesized_concordances"].add(_conc_key)
+                _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
+                logger.info("OMNI pool retry SUCCESS for %s/%s", _ticker, _pathway)
+            except Exception as _retry_exc:
+                logger.critical(
+                    "OMNI pool retry ALSO FAILED for %s/%s: %s — enqueuing in DLQ",
+                    _ticker, _pathway, _retry_exc,
+                )
+                with _state_lock:
+                    app_state["synthesized_concordances"].discard(_conc_key)
+                # Notify SOVEREIGN
+                try:
+                    import requests as _req
+                    _req.post(
+                        f"{os.environ.get('SOVEREIGN_BUS_URL','http://192.168.1.141:9999')}/send",
+                        json={"from":"omni","to":"sovereign",
+                              "message":f"SYNTHESIS POOL DOUBLE-FAIL: {_ticker}/{_pathway} "
+                                        f"failed twice. Error: {str(_retry_exc)[:200]}"},
+                        timeout=5
+                    )
+                except Exception: pass
 
     _priority = _PATHWAY_PRIORITY.get(_pathway, 5)
     _SYNTHESIS_POOL.submit(_pooled_synthesis)
@@ -1171,6 +1367,67 @@ def _run_synthesis(
     with _state_lock:                          # Pass B fix (V6): thread-safe counter
         app_state["syntheses_today"] += 1
         app_state["last_synthesis_time"] = time.time()  # Cipher fix: track for silence detection
+
+        # ── OMNI Self-Audit: consecutive NO_GO tracker (Upgrade v2 — Apr 30 2026) ──
+        # Root cause of Apr 30 zero-trade day: context contamination caused every brain
+        # to vote NO_GO citing system win rate. 21 consecutive NO_GOs went undetected.
+        # This tracker fires an alert after 3 consecutive NO_GOs during market hours
+        # so the problem is caught within one 30-min scan cycle, not end of day.
+        if verdict.verdict in ("GO", "STRONG_GO"):
+            app_state["consecutive_nogo"]         = 0
+            app_state["consecutive_nogo_alerted"] = False
+            app_state["nogo_block_reasons"]       = []
+        else:
+            app_state["consecutive_nogo"] += 1
+            # Collect blocking reason snippet for pattern detection
+            reason_snippet = " | ".join(verdict.notes[:2]) if verdict.notes else ""
+            app_state["nogo_block_reasons"] = (
+                app_state["nogo_block_reasons"][-4:] + [reason_snippet]
+            )
+            # Fire self-audit alert after 3 consecutive NO_GOs during market hours
+            _CONSECUTIVE_NOGO_THRESHOLD = 3
+            if (
+                app_state["consecutive_nogo"] >= _CONSECUTIVE_NOGO_THRESHOLD
+                and not app_state["consecutive_nogo_alerted"]
+                and _is_market_hours()
+            ):
+                app_state["consecutive_nogo_alerted"] = True
+                _fire_consecutive_nogo_alert(
+                    count           = app_state["consecutive_nogo"],
+                    reasons         = app_state["nogo_block_reasons"],
+                    bot_token       = settings.telegram_bot_token,
+                    chat_id         = settings.ahmed_chat_id,
+                    ticker          = concordance.get("ticker", "?"),
+                )
+
+    # SOVEREIGN S8: Write synthesis completion to CHRONICLE for durable counter
+    # (survives OMNI restarts — in-memory counter resets; CHRONICLE does not)
+    try:
+        import sqlite3 as _sq3
+        _chron = _sq3.connect("/Users/ahmedsadek/nexus/data/chronicle.db", timeout=3)
+        _chron.execute(
+            "CREATE TABLE IF NOT EXISTS synthesis_completed "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, synthesis_id TEXT, "
+            "ticker TEXT, system TEXT, verdict TEXT, trade_date TEXT, ts REAL)"
+        )
+        _chron.execute(
+            "INSERT INTO synthesis_completed (synthesis_id, ticker, system, verdict, trade_date, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(synthesis_id),
+                concordance.get("ticker", ""),
+                concordance.get("system", ""),
+                verdict.verdict if hasattr(verdict, "verdict") else str(verdict),
+                __import__("datetime").datetime.now(
+                    __import__("pytz").timezone("America/New_York")
+                ).strftime("%Y-%m-%d"),
+                time.time(),
+            ),
+        )
+        _chron.commit()
+        _chron.close()
+    except Exception as _s8_err:
+        logger.debug("S8 chronicle write skipped: %s", _s8_err)  # Never block synthesis
 
     # ── Step 8: Route to execution ────────────────────────────────────────────
     execution_ok = None

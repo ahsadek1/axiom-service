@@ -212,6 +212,7 @@ def build_context(
     concordance:   dict,
     axiom_result:  Optional[dict],
     regime:        Optional[dict],
+    oracle_ctx:    Optional[dict] = None,
 ) -> dict:
     """
     Build the complete context dict sent to all 4 brains.
@@ -222,6 +223,7 @@ def build_context(
         concordance:  Concordance payload from Alpha or Prime buffer.
         axiom_result: Axiom risk assessment for the ticker.
         regime:       Current market regime from Axiom.
+        oracle_ctx:   ORACLE intelligence context for the ticker (flow, gamma, etc.).
 
     Returns:
         Complete context dict for brain prompts.
@@ -258,10 +260,58 @@ def build_context(
             "alpha_credit_allowed": regime.get("alpha_credit_allowed") if regime else False,
             "prime_allowed":        regime.get("prime_allowed") if regime else False,
         },
+        "oracle": oracle_ctx,
+        # NOTE: Historical system-level performance data is intentionally EXCLUDED
+        # from brain context. Brains must evaluate the current setup on its own merits.
+        # System win rate, trade history, and aggregate P&L belong in OMNI's meta-learning
+        # layer only — feeding them here causes brains to reject valid setups because the
+        # nascent system has <30 trades and a low win rate. This was the root cause of
+        # 0 GO verdicts on Apr 30 2026 despite 21 valid synthesis cycles.
+        # Performance targets are retained as benchmarks the system aims for — not as
+        # a filter applied to individual trade decisions.
         "performance_targets": {
-            "win_rate_target":     0.75,
-            "avg_win_pct_target":  0.40,
-            "loss_rate_ceiling":   0.25,
-            "avg_loss_pct_ceiling": 0.20,
+            "win_rate_target":     0.75,    # system goal — do NOT use to gate individual trades
+            "avg_win_pct_target":  0.40,    # system goal — do NOT use to gate individual trades
+            "note": "These are system-level goals for calibration tracking only. "
+                    "Judge THIS setup on its own risk/reward, not on past system performance.",
         },
     }
+
+
+def _maybe_alert_brain_degradation(
+    ticker: str,
+    brains_responded: int,
+    brain_summary: dict,
+    bot_token: str,
+    chat_id: str,
+) -> None:
+    """
+    Alert if fewer than 4 brains responded — synthesis ran on degraded intel.
+    Silent if all 4 responded. Fire-and-forget.
+    """
+    import logging as _logging, requests as _req
+    log = _logging.getLogger("omni.synthesis")
+    if brains_responded >= 4:
+        return
+    failed = [k for k,v in (brain_summary or {}).items() if isinstance(v, str) and v.startswith("ERROR")]
+    log.warning(
+        "BRAIN DEGRADATION: %s — only %d/4 brains responded. Failed: %s",
+        ticker, brains_responded, failed,
+    )
+    if not bot_token:
+        return
+    try:
+        msg = (
+            f"\u26a0\ufe0f OMNI BRAIN DEGRADATION\n"
+            f"Ticker: {ticker}\n"
+            f"Brains responded: {brains_responded}/4\n"
+            f"Failed: {', '.join(failed) or 'unknown'}\n"
+            f"Synthesis proceeded at reduced confidence."
+        )
+        _req.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg},
+            timeout=5,
+        )
+    except Exception as e:
+        log.warning("Brain degradation alert failed: %s", e)
