@@ -8,10 +8,12 @@ Scheduler state held in-memory — jobs defined at startup, not persisted.
 
 import logging
 from datetime import datetime, date
+import time
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger("axiom.scheduler")
 
@@ -65,7 +67,7 @@ def create_scheduler(app_state: dict) -> BackgroundScheduler:
         replace_existing=True,
     )
 
-    # Every 15 minutes from 9:15 AM to 3:30 PM — Tier 2 live pool refresh
+    # Every 15 minutes from 9:15 AM to 4:30 PM — live pool refresh + health monitor
     scheduler.add_job(
         func    = lambda: _run_tier2_if_open(app_state),
         trigger = CronTrigger(
@@ -78,7 +80,18 @@ def create_scheduler(app_state: dict) -> BackgroundScheduler:
         replace_existing=True,
     )
 
-    logger.info("Axiom scheduler configured with %d jobs", len(scheduler.get_jobs()))
+    # Self-healing health monitor — runs every 5 minutes 24/7
+    # Checks Axiom config, Alpha scanner, Prime verdicts, Alpaca account.
+    # Auto-fixes detected issues. Never just reports and waits.
+    scheduler.add_job(
+        func    = lambda: _run_health_check(app_state),
+        trigger = IntervalTrigger(minutes=5),
+        id      = "health_monitor",
+        name    = "Self-healing health monitor",
+        replace_existing=True,
+    )
+
+    logger.info("Axiom scheduler created with %d jobs", len(scheduler.get_jobs()))
     return scheduler
 
 
@@ -170,9 +183,15 @@ def _run_tier1(app_state: dict, run_type: str) -> None:
         logger.error("Tier 1 filter (%s) failed: %s", run_type, e)
 
 
-def _run_tier2_if_open(app_state: dict) -> None:
-    """Execute Tier 2 filter, enrich with ORACLE intelligence, and push to agents."""
-    if not _is_market_hours():
+def _run_tier2_if_open(app_state: dict, force: bool = False) -> None:
+    """
+    Execute Tier 2 filter, enrich with ORACLE intelligence, and push to agents.
+
+    Args:
+        app_state: Shared application state dict.
+        force:     If True, bypass the market-hours gate (for manual /trigger-tier2 calls).
+    """
+    if not force and not _is_market_hours():
         logger.debug("Tier 2 skipped — outside market hours")
         return
 
@@ -327,6 +346,7 @@ def _run_tier2_if_open(app_state: dict) -> None:
             bot_token      = settings.telegram_bot_token,
             chat_id        = settings.ahmed_chat_id,
             window_id      = window_id,
+            nexus_secret   = settings.nexus_secret,
         )
         logger.info(
             "Tier 2 complete — pool=%d | window=%s | regime=%s (score=%d) | "
@@ -350,3 +370,65 @@ def _run_tier2_if_open(app_state: dict) -> None:
                 f"Error: {str(e)[:200]}\n"
                 f"Using last known pool.",
             )
+
+
+_health_last_report: dict = {}  # cache: check_name -> (status, timestamp)
+
+
+def _run_health_check(app_state: dict) -> None:
+    """
+    Run the self-healing health monitor with dedup.
+
+    Dedup rules:
+      - FAIL alerts immediately, re-alerts every 15 min if still failing
+      - WARN alerts only on first detection (no repeat spam)
+      - OK clears previous state silently
+
+    Args:
+        app_state: Axiom's global state dict.
+    """
+    from health_monitor import run_full_check, format_check_report
+    from telegram import send_message
+
+    results = run_full_check(app_state)
+
+    fails = {k: v for k, v in results.items() if v["status"] == "FAIL"}
+    warns = {k: v for k, v in results.items() if v["status"] == "WARN"}
+
+    now = int(time.time())
+    should_alert = False
+    alert_reasons: list[str] = []
+
+    for name, result in fails.items():
+        last = _health_last_report.get(name)
+        if last is None or last[0] != "FAIL":
+            should_alert = True
+            alert_reasons.append(f"{name}: {result['status']}")
+            _health_last_report[name] = ("FAIL", now)
+        elif now - last[1] > 900:
+            should_alert = True
+            alert_reasons.append(f"{name}: {result['status']} (still failing)")
+            _health_last_report[name] = ("FAIL", now)
+
+    for name, result in warns.items():
+        last = _health_last_report.get(name)
+        if last is None:
+            should_alert = True
+            alert_reasons.append(f"{name}: {result['status']}")
+            _health_last_report[name] = ("WARN", now)
+
+    for name in list(_health_last_report.keys()):
+        if name not in results or results[name]["status"] == "OK":
+            del _health_last_report[name]
+
+    if should_alert:
+        logger.warning("Health monitor: %d issue(s) — %s", len(alert_reasons), alert_reasons)
+        settings = app_state.get("settings")
+        if settings:
+            report_text = format_check_report(results)
+            try:
+                send_message(settings.telegram_bot_token, settings.ahmed_chat_id, report_text)
+            except Exception as tg_err:
+                logger.error("Health monitor Telegram alert failed: %s", tg_err)
+    else:
+        logger.info("Health monitor: all systems clear — alert suppressed (no new issues)")
