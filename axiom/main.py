@@ -196,7 +196,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title       = "Axiom Service",
     description = "Nexus Trading System — Intelligent pool curator and risk gate",
-    version     = "4.0.0",
+    version     = "4.1.0",
     lifespan    = lifespan,
 )
 
@@ -228,7 +228,7 @@ def health() -> JSONResponse:
     return JSONResponse({
         "status":               "healthy",
         "service":              "axiom",
-        "version":              "4.0.0",
+        "version":              "4.1.0",
         "pool_size":            pool_size,
         "regime":               regime.classification if regime else "unknown",
         "regime_source":        regime.regime_source if regime else "unknown",

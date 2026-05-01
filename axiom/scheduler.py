@@ -8,7 +8,6 @@ Scheduler state held in-memory — jobs defined at startup, not persisted.
 
 import logging
 from datetime import datetime, date
-import time
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -80,18 +79,6 @@ def create_scheduler(app_state: dict) -> BackgroundScheduler:
         replace_existing=True,
     )
 
-    # Self-healing health monitor — DISABLED 2026-04-30 20:45 ET
-    # Root cause: WARN-level Prime verdicts alerted Ahmed every 5 min forever.
-    # Dedup fix was insufficient for in-memory state across Railway deploys.
-    # Re-enable when criteria send Telegram only on FAIL-level (not WARN)
-    # and dedup uses a persistent store (DB or file), not in-memory.
-    # scheduler.add_job(
-    #     func    = lambda: _run_health_check(app_state),
-    #     trigger = IntervalTrigger(minutes=5),
-    #     id      = "health_monitor",
-    #     name    = "Self-healing health monitor",
-    #     replace_existing=True,
-    # )
 
     logger.info("Axiom scheduler created with %d jobs", len(scheduler.get_jobs()))
     return scheduler
@@ -374,63 +361,4 @@ def _run_tier2_if_open(app_state: dict, force: bool = False) -> None:
             )
 
 
-_health_last_report: dict = {}  # cache: check_name -> (status, timestamp)
 
-
-def _run_health_check(app_state: dict) -> None:
-    """
-    Run the self-healing health monitor with dedup.
-
-    Dedup rules:
-      - FAIL alerts immediately, re-alerts every 15 min if still failing
-      - WARN alerts only on first detection (no repeat spam)
-      - OK clears previous state silently
-
-    Args:
-        app_state: Axiom's global state dict.
-    """
-    from health_monitor import run_full_check, format_check_report
-    from telegram import send_message
-
-    results = run_full_check(app_state)
-
-    fails = {k: v for k, v in results.items() if v["status"] == "FAIL"}
-    warns = {k: v for k, v in results.items() if v["status"] == "WARN"}
-
-    now = int(time.time())
-    should_alert = False
-    alert_reasons: list[str] = []
-
-    for name, result in fails.items():
-        last = _health_last_report.get(name)
-        if last is None or last[0] != "FAIL":
-            should_alert = True
-            alert_reasons.append(f"{name}: {result['status']}")
-            _health_last_report[name] = ("FAIL", now)
-        elif now - last[1] > 900:
-            should_alert = True
-            alert_reasons.append(f"{name}: {result['status']} (still failing)")
-            _health_last_report[name] = ("FAIL", now)
-
-    for name, result in warns.items():
-        last = _health_last_report.get(name)
-        if last is None:
-            should_alert = True
-            alert_reasons.append(f"{name}: {result['status']}")
-            _health_last_report[name] = ("WARN", now)
-
-    for name in list(_health_last_report.keys()):
-        if name not in results or results[name]["status"] == "OK":
-            del _health_last_report[name]
-
-    if should_alert:
-        logger.warning("Health monitor: %d issue(s) — %s", len(alert_reasons), alert_reasons)
-        settings = app_state.get("settings")
-        if settings:
-            report_text = format_check_report(results)
-            try:
-                send_message(settings.telegram_bot_token, settings.ahmed_chat_id, report_text)
-            except Exception as tg_err:
-                logger.error("Health monitor Telegram alert failed: %s", tg_err)
-    else:
-        logger.info("Health monitor: all systems clear — alert suppressed (no new issues)")
