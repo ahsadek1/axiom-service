@@ -190,17 +190,21 @@ class AlpacaClient:
 
     def place_spread_order(
         self,
-        legs:       list[dict],
-        order_type: str = "limit",
+        legs:        list[dict],
+        qty:         int = 1,
+        order_type:  str = "limit",
         limit_debit: Optional[float] = None,
+        client_order_id: Optional[str] = None,
     ) -> dict:
         """
         Place a multi-leg options spread order.
 
         Args:
-            legs:        List of leg dicts with symbol, side, ratio_qty.
-            order_type:  'limit' (recommended for spreads).
-            limit_debit: Net debit/credit limit for the spread.
+            legs:             List of leg dicts with symbol, side, ratio_qty.
+            qty:              Number of spread contracts to trade.
+            order_type:       'limit' (recommended for spreads).
+            limit_debit:      Net debit/credit limit for the spread.
+            client_order_id:  Optional idempotency key for order recovery.
 
         Returns:
             Order dict from Alpaca.
@@ -209,10 +213,13 @@ class AlpacaClient:
             "order_class":   "mleg",
             "type":          order_type,
             "time_in_force": "day",
+            "qty":           str(qty),
             "legs":          legs,
         }
         if limit_debit is not None:
             body["limit_price"] = str(round(limit_debit, 2))
+        if client_order_id:
+            body["client_order_id"] = client_order_id
 
         resp = requests.post(
             f"{ALPACA_PAPER_URL}/v2/orders",
