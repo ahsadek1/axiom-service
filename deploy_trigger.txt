@@ -1,1 +1,1 @@
-# Re-deploy trigger: force Railway to deploy latest commit a3ba8ac
+# Re-deploy trigger: force Railway to deploy latest commit 9d886a8 — psychology_overlay fix 2026-05-01T14:12:42Z
