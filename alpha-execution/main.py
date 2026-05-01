@@ -666,6 +666,7 @@ def health() -> JSONResponse:
         "trades_today":       app_state["trades_today"],
         "open_positions":     count_open_positions(settings.alpha_db_path),
         "uptime_since":       app_state["start_time"],
+        "uptime_sec":         int((datetime.now(ET) - datetime.fromisoformat(app_state["start_time"])).total_seconds()),
         "execution_valid":    execution_valid,
         "alpaca_reachable":   alpaca_ok,
         "execution_paused":      app_state.get("execution_paused", False),

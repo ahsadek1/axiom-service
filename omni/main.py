@@ -877,6 +877,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     threading.Thread(target=_sovereign_comms_loop_omni, daemon=True, name="omni-sovereign-comms").start()
     threading.Thread(target=_trade_blocker_watchdog, daemon=True, name="omni-trade-blocker-watchdog").start()
 
+    # ── Inevitable Failure Sentinel (Ahmed mandate May 1 2026) ───────────────────
+    # Detects precursor error patterns before they become silent death.
+    # Alerts Cipher + Vector + Ahmed immediately on detection.
+    from failure_sentinel import start_sentinel as _start_sentinel
+    _start_sentinel(
+        omni_db    = settings.omni_db_path,
+        alpha_db   = "/Users/ahmedsadek/nexus/data/alpha_execution.db",
+        app_state  = app_state,
+        state_lock = _state_lock,
+    )
+    logger.info("Failure sentinel started ✅")
+
     yield
 
     _comms_stop_omni.set()
