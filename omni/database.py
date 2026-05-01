@@ -170,6 +170,7 @@ def save_synthesis_result(
     verdict:              str,
     verdict_notes:        str,
     axiom_result:         Optional[dict],
+    psychology_overlay:   Optional[dict] = None,
 ) -> int:
     """
     Persist a complete synthesis result.
@@ -216,6 +217,7 @@ def save_synthesis_result(
                 votes_go, brains_responded, echo_chamber_flagged,
                 verdict, verdict_notes,
                 axiom_risk_score, axiom_sizing_mult, axiom_hard_stops, axiom_error,
+                psychology_overlay,
                 created_at
             ) VALUES (
                 ?,?,?,?,?,?,
@@ -224,7 +226,7 @@ def save_synthesis_result(
                 ?,?,?,?,?,?,
                 ?,?,?,?,?,?,
                 ?,?,?,?,?,
-                ?,?,?,?,?
+                ?,?,?,?,?,?
             )
             ON CONFLICT(window_id, ticker, direction, system)
             DO UPDATE SET
@@ -257,6 +259,7 @@ def save_synthesis_result(
                 axiom_result.get("sizing_mult") if axiom_result else None,
                 hard_stops_json,
                 axiom_result.get("error") if axiom_result else None,
+                json.dumps(psychology_overlay) if psychology_overlay else None,
                 now,
             ),
         )
