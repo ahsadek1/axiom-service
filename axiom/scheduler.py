@@ -80,16 +80,18 @@ def create_scheduler(app_state: dict) -> BackgroundScheduler:
         replace_existing=True,
     )
 
-    # Self-healing health monitor — runs every 5 minutes 24/7
-    # Checks Axiom config, Alpha scanner, Prime verdicts, Alpaca account.
-    # Auto-fixes detected issues. Never just reports and waits.
-    scheduler.add_job(
-        func    = lambda: _run_health_check(app_state),
-        trigger = IntervalTrigger(minutes=5),
-        id      = "health_monitor",
-        name    = "Self-healing health monitor",
-        replace_existing=True,
-    )
+    # Self-healing health monitor — DISABLED 2026-04-30 20:45 ET
+    # Root cause: WARN-level Prime verdicts alerted Ahmed every 5 min forever.
+    # Dedup fix was insufficient for in-memory state across Railway deploys.
+    # Re-enable when criteria send Telegram only on FAIL-level (not WARN)
+    # and dedup uses a persistent store (DB or file), not in-memory.
+    # scheduler.add_job(
+    #     func    = lambda: _run_health_check(app_state),
+    #     trigger = IntervalTrigger(minutes=5),
+    #     id      = "health_monitor",
+    #     name    = "Self-healing health monitor",
+    #     replace_existing=True,
+    # )
 
     logger.info("Axiom scheduler created with %d jobs", len(scheduler.get_jobs()))
     return scheduler
