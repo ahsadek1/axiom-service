@@ -31,7 +31,7 @@ SP500_TICKERS = [
     "ROK",  "EXP",  "MS",   "SRE",  "FOX",  "KEYS", "CWST", "EXC",  "DELL", "RJF",
     "ATI",  "GILD", "FOXA", "AMZN", "USFD", "REGN", "LDOS", "BAC",  "IWM",  "NUE",
     "NVR",  "NVDA", "EMR",  "RS",   "IEF",  "PHM",  "EGP",  "DTE",  "EVRG", "ITW",
-    "BLK",  "AON",  "LMT",  "IBM",  "BKR",  "MMC",  "EBAY", "TMUS", "PNW",  "CMG",
+    "BLK",  "AON",  "LMT",  "IBM",  "BKR",  "EBAY", "TMUS", "PNW",  "CMG",
     "PRU",  "DRI",  "WDC",  "NVO",  "CPT",  "WEC",  "NOC",  "BKNG", "ULTA", "HII",
     "LRCX", "SHW",  "V",    "RCL",  "UDR",  "PEP",  "WFC",  "H",    "AKAM", "STX",
     "PSX",  "PG",   "TXT",  "CL",   "GRMN", "SLV",  "TMO",  "HSY",  "VLO",
@@ -43,6 +43,14 @@ SP500_TICKERS = [
 ]
 
 NASDAQ100_TICKERS = []  # Merged into SP500_TICKERS above (deduplicated)
+
+# ── Delisted / data-unavailable tickers — excluded from universe ───────────────
+# Add here when yfinance or Polygon returns persistent "no data" / "delisted" errors.
+# Prevents scan cycle errors and false data boundary failures.
+# Last updated: 2026-05-02 (VECTOR)
+KNOWN_DELISTED: frozenset[str] = frozenset({
+    "MMC",   # yfinance "possibly delisted; no price data" confirmed 2026-05-02
+})
 
 
 # ── System Limits (Circuit Breaker Config) ──────────────────────────────────
@@ -101,8 +109,11 @@ class Settings:
 
     @property
     def stock_universe(self) -> list[str]:
-        """Deduplicated S&P 500 + Nasdaq 100 universe."""
-        return list(dict.fromkeys(SP500_TICKERS + NASDAQ100_TICKERS))
+        """Deduplicated S&P 500 + Nasdaq 100 universe, with known delisted tickers removed."""
+        return [
+            t for t in dict.fromkeys(SP500_TICKERS + NASDAQ100_TICKERS)
+            if t not in KNOWN_DELISTED
+        ]
 
 
 def load_settings() -> Settings:

@@ -101,7 +101,7 @@ SECTOR_MAP: dict[str, str] = {
     "CBOE": "Financials", "PRU":  "Financials", "MET":  "Financials",
     "AFL":  "Financials", "ALL":  "Financials", "PGR":  "Financials",
     "TRV":  "Financials", "CB":   "Financials", "AIG":  "Financials",
-    "AON":  "Financials", "MMC":  "Financials", "ACGL": "Financials",
+    "AON":  "Financials", "ACGL": "Financials",
     "KKR":  "Financials", "APO":  "Financials", "BK":   "Financials",
     "STT":  "Financials", "MTB":  "Financials", "PNC":  "Financials",
     "NTRS": "Financials", "RJF":  "Financials", "IBKR": "Financials",
