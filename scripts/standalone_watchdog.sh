@@ -52,7 +52,17 @@ send_alert() {
   echo "[watchdog] ALERT SENT: $msg" >> "$LOG"
 }
 
-NEXUS_SECRET="62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2"
+# Load NEXUS_SECRET from .deploy-secrets (single source of truth)
+if [[ -f "/Users/ahmedsadek/nexus/.deploy-secrets" ]]; then
+  NEXUS_SECRET=$(grep '^NEXUS_SECRET=' /Users/ahmedsadek/nexus/.deploy-secrets | cut -d= -f2)
+else
+  echo "[watchdog] ERROR: .deploy-secrets not found — cannot authenticate service health checks" >> "$LOG"
+  exit 1
+fi
+if [[ -z "$NEXUS_SECRET" ]]; then
+  echo "[watchdog] ERROR: NEXUS_SECRET not found in .deploy-secrets" >> "$LOG"
+  exit 1
+fi
 
 check_service() {
   local name="$1"

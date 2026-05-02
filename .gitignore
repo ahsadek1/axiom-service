@@ -6,3 +6,8 @@ __pycache__/
 .env
 data/
 logs/
+
+# Secret files — never commit these
+.*-secrets
+*.secrets
+.secrets

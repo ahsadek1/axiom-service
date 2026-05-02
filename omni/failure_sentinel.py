@@ -21,6 +21,7 @@ Failure classes monitored:
 
 import logging
 import sqlite3
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -33,9 +34,9 @@ logger = logging.getLogger("omni.failure_sentinel")
 ET = pytz.timezone("America/New_York")
 
 # ── Contact config ────────────────────────────────────────────────────────────
-CIPHER_BOT_TOKEN = "8293809089:AAHgaSCfKipnohcKVbMjiIBaI8VojvxV3J4"
-VECTOR_BOT_TOKEN = "8736004775:AAG3v_7tcXk8SXh5whgpKRT3Dr3-C71VtQI"
-AHMED_CHAT_ID    = "8573754783"
+CIPHER_BOT_TOKEN = os.getenv("CIPHER_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
+VECTOR_BOT_TOKEN = os.getenv("VECTOR_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
+AHMED_CHAT_ID    = os.getenv("AHMED_CHAT_ID", "8573754783")
 
 # Cipher and Vector share Ahmed's DM for now — will wire to agent sessions
 CIPHER_CHAT_ID   = AHMED_CHAT_ID

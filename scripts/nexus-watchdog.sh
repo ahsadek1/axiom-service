@@ -5,7 +5,15 @@
 # Sends "RECOVERED" alert when it comes back up.
 # State stored in /tmp/nexus-watchdog-state/ (cleared on reboot — intentional).
 
-BOT_TOKEN="7973500599:AAGoTNnJgF0Muvok_FSXeTPHeAUaOKMahk0"
+# Load bot token from .deploy-secrets (single source of truth)
+if [[ -f "/Users/ahmedsadek/nexus/.deploy-secrets" ]]; then
+  BOT_TOKEN=$(grep '^TELEGRAM_BOT_TOKEN=' /Users/ahmedsadek/nexus/.deploy-secrets | cut -d= -f2)
+else
+  echo "[nexus-watchdog] ERROR: .deploy-secrets not found" >&2; exit 1
+fi
+if [[ -z "$BOT_TOKEN" ]]; then
+  echo "[nexus-watchdog] ERROR: TELEGRAM_BOT_TOKEN not found in .deploy-secrets" >&2; exit 1
+fi
 CHAT_ID="8573754783"
 STATE_DIR="/tmp/nexus-watchdog-state"
 mkdir -p "$STATE_DIR"

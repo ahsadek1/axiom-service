@@ -24,11 +24,18 @@ import requests
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc"
-AHMED_CHAT_ID      = "8573754783"
-NEXUS_SECRET       = "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2"
-ALPACA_KEY         = os.environ.get("ALPACA_API_KEY", "")
-ALPACA_SECRET      = os.environ.get("ALPACA_SECRET_KEY", "")
+def _require(var: str) -> str:
+    """Return env var value or raise at startup — never silently use a stale fallback."""
+    val = os.environ.get(var)
+    if not val:
+        raise RuntimeError(f"{var} is required but not set. Source .deploy-secrets before running.")
+    return val
+
+TELEGRAM_BOT_TOKEN = _require("TELEGRAM_BOT_TOKEN")
+AHMED_CHAT_ID      = os.environ.get("AHMED_CHAT_ID", "8573754783")
+NEXUS_SECRET       = _require("NEXUS_SECRET")
+ALPACA_KEY         = _require("ALPACA_API_KEY")
+ALPACA_SECRET      = _require("ALPACA_SECRET_KEY")
 
 SERVICES = {
     "axiom":           "http://localhost:8001/health",

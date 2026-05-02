@@ -41,10 +41,7 @@ logger = logging.getLogger(__name__)
 SOVEREIGN_BUS_URL: str = os.getenv(
     "SOVEREIGN_BUS_URL", "http://192.168.1.141:9999"
 )
-GENESIS_BOT_TOKEN: str = os.getenv(
-    "GENESIS_BOT_TOKEN",
-    "7973500599:AAHTfCRmjGMoW3pEayGSpDfb84D44M2K3us",
-)
+GENESIS_BOT_TOKEN: str = os.getenv("GENESIS_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
 SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID: str = os.getenv(
     "SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID", "8573754783"
 )

@@ -41,10 +41,7 @@ logger = logging.getLogger(__name__)
 SOVEREIGN_BUS_URL: str = os.getenv(
     "SOVEREIGN_BUS_URL", "http://192.168.1.141:9999"
 )
-GENESIS_BOT_TOKEN: str = os.getenv(
-    "GENESIS_BOT_TOKEN",
-    "7973500599:AAHTfCRmjGMoW3pEayGSpDfb84D44M2K3us",
-)
+GENESIS_BOT_TOKEN: str = os.getenv("GENESIS_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
 SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID: str = os.getenv(
     "SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID", "8573754783"
 )
@@ -686,9 +683,10 @@ def get_instructions(agent_name: str) -> List[Dict[str, str]]:
 from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: E402
 
 # Agent registry: SOVEREIGN uses this to push directives via HTTP (zero lag)
-_NEXUS_SECRET: str = os.getenv(
-    "NEXUS_WEBHOOK_SECRET",
-    os.getenv("NEXUS_SECRET", "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2"),
+_NEXUS_SECRET: str = (
+    os.getenv("NEXUS_WEBHOOK_SECRET")
+    or os.getenv("NEXUS_SECRET")
+    or ""
 )
 _PUSH_TIMEOUT: float = 5.0
 

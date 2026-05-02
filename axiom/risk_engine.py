@@ -55,8 +55,8 @@ ALPACA_BASE   = "https://paper-api.alpaca.markets"
 ALPACA_KEY    = os.getenv("ALPACA_KEY",    "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
 ALPACA_H      = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-ORATS_TOKEN   = os.getenv("ORATS_TOKEN",   "4476e955-241a-4540-b114-ebbf1a3a3b87")
-DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY",  "sk-b750bc3774144ebd95e8dee764ffd384")
+ORATS_TOKEN   = os.getenv("ORATS_TOKEN", "")
+DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY") or os.getenv("DEEPSEEK_API_KEY") or ""
 
 TOTAL_CAPITAL   = float(os.getenv("NEXUS_TOTAL_CAPITAL", "25000"))
 MAX_POSITIONS   = int(os.getenv("NEXUS_MAX_POSITIONS",   "3"))  # HARD CAP per NEXUS_ARCHITECTURE.md + HARD_RULES.md
