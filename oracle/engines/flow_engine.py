@@ -36,15 +36,21 @@ def fetch(ticker: str, card_type: str = "full") -> tuple[Optional[FlowData], str
         return FlowData(**cached), config.FRESHNESS_LIVE
 
     uw_data = unusual_whales_client.get_flow(ticker) or {}
-    mc_flow = market_chameleon_client.get_options_flow(ticker) or {}
+    mc_flow = market_chameleon_client.get_put_call_ratio(ticker) or {}
+
+    # MC returns oi_put_call_ratio / volume_put_call_ratio — prefer volume PCR
+    mc_pcr = mc_flow.get("volume_put_call_ratio") or mc_flow.get("oi_put_call_ratio")
+    # Volume vs avg: approximate from call+put volume vs typical (~500k/day)
+    total_vol = (mc_flow.get("total_call_volume") or 0) + (mc_flow.get("total_put_volume") or 0)
+    vol_vs_avg = round(total_vol / 500000, 2) if total_vol > 0 else None
 
     flow = FlowData(
         sweeps_today=uw_data.get("sweeps_today", []),
         dark_pool_prints=uw_data.get("dark_pool_prints", []),
         net_flow_bias=uw_data.get("net_flow_bias", "NEUTRAL"),
         unusual_activity=uw_data.get("unusual_activity", False),
-        put_call_ratio=mc_flow.get("put_call_ratio"),
-        options_volume_vs_avg=mc_flow.get("options_volume_vs_avg"),
+        put_call_ratio=mc_pcr,
+        options_volume_vs_avg=vol_vs_avg,
     )
 
     # Cipher Pass 3 P3-8: OR logic for partial stub detection

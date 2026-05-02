@@ -11,7 +11,7 @@ from typing import Optional
 
 import cache
 import config
-from clients import alpha_vantage_client, edgar_client, market_chameleon_client
+from clients import alpha_vantage_client, edgar_client, market_chameleon_client, polygon_client
 from models import FundamentalData, InsiderTransaction
 
 logger = logging.getLogger(__name__)
@@ -43,11 +43,28 @@ def fetch(ticker: str, card_type: str = "full") -> tuple[Optional[FundamentalDat
         return FundamentalData(**cached), config.FRESHNESS_LIVE
 
     # Always fetch earnings data (needed for preliminary cards too)
-    av_data = alpha_vantage_client.get_earnings(ticker)
-    quarterly = av_data.get("quarterly_history", [])
+    # ORATS hist/earnings is the primary source (unlimited quota, $399/mo plan).
+    # Alpha Vantage is fallback only — free tier exhausts at 5 calls/min during warmup.
+    quarterly = _get_earnings_history(ticker)
 
     # Find next earnings date from history (most recent quarter gives approximate timing)
     earnings_date, days_to_earnings = _estimate_next_earnings(quarterly)
+
+    # Polygon financials: revenue growth + margin trend (D5 scorer inputs)
+    fin = polygon_client.get_financials(ticker) or {}
+    rev_growth   = fin.get("revenue_growth_yoy")
+    margin_trend = fin.get("margin_trend", "FLAT")
+
+    # Analyst revision bias: derived from EPS beat rate over last 8 quarters
+    beats = sum(1 for q in quarterly[:8] if q.get("beat"))
+    total = len(quarterly[:8])
+    if total >= 4:
+        beat_rate = beats / total
+        if beat_rate >= 0.75:   analyst_bias = "POSITIVE"
+        elif beat_rate >= 0.50: analyst_bias = "NEUTRAL"
+        else:                    analyst_bias = "NEGATIVE"
+    else:
+        analyst_bias = "NEUTRAL"
 
     fundamental = FundamentalData(
         earnings_date=earnings_date,
@@ -55,6 +72,9 @@ def fetch(ticker: str, card_type: str = "full") -> tuple[Optional[FundamentalDat
         earnings_clear_25d=days_to_earnings is None or days_to_earnings > 25,
         earnings_clear_45d=days_to_earnings is None or days_to_earnings > 45,
         last_8_surprises=quarterly[:8],
+        revenue_growth_yoy=rev_growth,
+        margin_trend=margin_trend,
+        analyst_revision_bias=analyst_bias,
     )
 
     if card_type == "full":
@@ -93,6 +113,46 @@ def fetch(ticker: str, card_type: str = "full") -> tuple[Optional[FundamentalDat
     cache.log_api_call(ENGINE, "edgar", ticker,
                        int((time.monotonic() - start) * 1000), True)
     return fundamental, config.FRESHNESS_LIVE
+
+
+def _get_earnings_history(ticker: str) -> list:
+    """
+    Fetch earnings history. ORATS primary (unlimited), AV fallback (5 calls/min).
+    Returns list of dicts with 'date', 'beat', 'surprise_pct' keys.
+    """
+    # Try ORATS hist/earnings first
+    try:
+        import requests as _req
+        ORATS_TOKEN = "4476e955-241a-4540-b114-ebbf1a3a3b87"
+        resp = _req.get(
+            "https://api.orats.io/datav2/hist/earnings",
+            params={"token": ORATS_TOKEN, "ticker": ticker, "limit": 12},
+            timeout=8,
+        )
+        rows = resp.json().get("data", [])
+        if rows:
+            # Sort descending by earnDate
+            rows.sort(key=lambda r: r.get("earnDate", ""), reverse=True)
+            quarterly = []
+            for r in rows[:8]:
+                quarterly.append({
+                    "date": r.get("earnDate", ""),
+                    "estimated_eps": None,
+                    "actual_eps": None,
+                    "surprise_pct": None,
+                    "beat": False,
+                })
+            return quarterly
+    except Exception as e:
+        logger.debug("ORATS earnings history failed for %s: %s", ticker, e)
+
+    # Fallback: Alpha Vantage
+    try:
+        av_data = alpha_vantage_client.get_earnings(ticker)
+        return av_data.get("quarterly_history", [])
+    except Exception as e:
+        logger.debug("AV earnings fallback failed for %s: %s", ticker, e)
+    return []
 
 
 def _estimate_next_earnings(quarterly: list) -> tuple[Optional[str], Optional[int]]:

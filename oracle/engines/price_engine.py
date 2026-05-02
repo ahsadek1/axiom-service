@@ -44,7 +44,7 @@ def fetch(ticker: str, card_type: str = "full") -> tuple[Optional[PriceData], st
     # Live fetch — Polygon primary
     raw = polygon_client.get_snapshot(ticker)
     if raw is not None:
-        data = _parse_polygon(raw)
+        data = _parse_polygon(raw, ticker=ticker)
         cache.set(ticker, ENGINE, data.model_dump(), config.PRICE_TTL_MARKET_HOURS, card_type)
         cache.log_api_call(ENGINE, PLATFORM_PRIMARY, ticker,
                            raw.get("latency_ms", 0), True)
@@ -71,8 +71,16 @@ def fetch(ticker: str, card_type: str = "full") -> tuple[Optional[PriceData], st
     return None, config.FRESHNESS_UNAVAILABLE
 
 
-def _parse_polygon(raw: Dict[str, Any]) -> PriceData:
-    """Parse Polygon snapshot response into PriceData."""
+def _parse_polygon(raw: Dict[str, Any], ticker: str = "") -> PriceData:
+    """Parse Polygon snapshot + compute technicals from daily bars."""
+    # Fetch RSI / MA / volume ratio from daily bars (cached by Oracle TTL)
+    tech = {}
+    if ticker:
+        try:
+            tech = polygon_client.get_technicals(ticker) or {}
+        except Exception as e:
+            logger.warning("Technicals fetch failed for %s: %s", ticker, e)
+
     return PriceData(
         last=raw.get("last"),
         bid=raw.get("bid"),
@@ -80,6 +88,11 @@ def _parse_polygon(raw: Dict[str, Any]) -> PriceData:
         day_high=raw.get("day_high"),
         day_low=raw.get("day_low"),
         volume=raw.get("volume"),
+        avg_volume_30d=tech.get("avg_volume_30d"),
+        volume_ratio=tech.get("volume_ratio"),
+        rsi_14=tech.get("rsi_14"),
+        price_vs_20d_ma=tech.get("price_vs_20d_ma"),
+        price_vs_50d_ma=tech.get("price_vs_50d_ma"),
     )
 
 

@@ -10,7 +10,7 @@ from typing import Optional
 
 import cache
 import config
-from clients import market_chameleon_client, orats_client
+from clients import orats_client
 from models import VolData
 
 logger = logging.getLogger(__name__)
@@ -38,31 +38,27 @@ def fetch(ticker: str, card_type: str = "full") -> tuple[Optional[VolData], str]
                            True, cache_hit=True)
         return VolData(**cached), config.FRESHNESS_LIVE
 
-    # Fetch from both sources (stubs return None values currently)
-    mc_data = market_chameleon_client.get_iv_rank(ticker) or {}
+    # ORATS is primary source for all vol data (rip = IV rank percentile, live API).
+    # MC get_iv_rank() intentionally returns nulls — it is a passthrough to ORATS.
     orats_data = orats_client.get_vol_surface(ticker) or {}
 
-    iv_rank = mc_data.get("iv_rank")
-    iv_pct = mc_data.get("iv_percentile")
-    hv30_mc = mc_data.get("hv30")
-    hv30_orats = orats_data.get("hv30")
-    hv30 = hv30_mc or hv30_orats
-
-    iv_hv = mc_data.get("iv_hv_spread")
+    iv_rank = orats_data.get("iv_rank")        # rip field (0-100)
+    iv_pct  = orats_data.get("iv_percentile")  # same as rip
+    hv30    = orats_data.get("hv30")
+    hv60    = orats_data.get("hv60")
+    iv_hv   = orats_data.get("iv_hv_spread")
 
     vol = VolData(
         iv_rank=iv_rank,
         iv_percentile=iv_pct,
         hv30=hv30,
-        hv60=orats_data.get("hv60") or orats_data.get("hv20"),
+        hv60=hv60,
         iv_hv_spread=iv_hv,
     )
 
-    # Cipher Pass 3 P3-8: AND logic meant one-stub + one-real was cached as LIVE.
-    # iv_rank=None / iv_percentile=None silently mixed into LIVE-tagged packets.
-    # Fix: OR logic — any stub source → DEGRADED freshness + shorter TTL.
-    both_stub = mc_data.get("_stub") and orats_data.get("_stub")
-    any_stub  = mc_data.get("_stub") or orats_data.get("_stub")
+    # ORATS is the sole source. Stub/unavailable check from ORATS response only.
+    both_stub = orats_data.get("_stub", True)
+    any_stub  = orats_data.get("_stub", True)
 
     if both_stub:
         freshness = config.FRESHNESS_UNAVAILABLE

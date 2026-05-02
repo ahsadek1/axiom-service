@@ -3,7 +3,7 @@ ORACLE Intelligence Hub — Pydantic Models
 All request/response types for the ORACLE service.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel
 
 
@@ -43,6 +43,9 @@ class PriceData(BaseModel):
     volume: Optional[float] = None
     avg_volume_30d: Optional[float] = None
     volume_ratio: Optional[float] = None
+    rsi_14: Optional[float] = None
+    price_vs_20d_ma: Optional[float] = None
+    price_vs_50d_ma: Optional[float] = None
 
 
 class VolData(BaseModel):
@@ -70,7 +73,9 @@ class GammaData(BaseModel):
     call_wall: Optional[float] = None
     put_wall: Optional[float] = None
     hiro_signal: Optional[float] = None
-    net_gex: Optional[str] = None  # POSITIVE | NEGATIVE
+    net_gex: Optional[Union[float, str]] = None  # POSITIVE | NEGATIVE | numeric GEX total
+    pct_to_call_wall: Optional[float] = None  # % distance from spot to call wall (positive = above)
+    pct_to_put_wall: Optional[float] = None   # % distance from spot to put wall (positive = below)
 
 
 class MacroData(BaseModel):
@@ -110,6 +115,10 @@ class FundamentalData(BaseModel):
     insider_net_bias: str = "NEUTRAL"
     insider_cluster_flag: bool = False
     institutional_ownership_change: Optional[float] = None
+    # D5 scorer inputs — populated from Polygon financials
+    revenue_growth_yoy: Optional[float] = None   # % YoY revenue growth
+    margin_trend: str = "FLAT"                    # EXPANDING | FLAT | CONTRACTING
+    analyst_revision_bias: str = "NEUTRAL"        # POSITIVE | NEUTRAL | NEGATIVE (from EPS beat rate)
 
 
 class HistoricalData(BaseModel):
