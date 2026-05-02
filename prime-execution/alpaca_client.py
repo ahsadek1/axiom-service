@@ -67,23 +67,25 @@ class AlpacaClient:
 
     def place_order(
         self,
-        symbol:        str,
-        qty:           float,
-        side:          str,
-        order_type:    str = "market",
-        limit_price:   Optional[float] = None,
-        time_in_force: str = "day",
+        symbol:           str,
+        qty:              float,
+        side:             str,
+        order_type:       str = "market",
+        limit_price:      Optional[float] = None,
+        time_in_force:    str = "day",
+        client_order_id:  Optional[str] = None,
     ) -> dict:
         """
         Place an equity buy or sell order.
 
         Args:
-            symbol:        Ticker symbol.
-            qty:           Number of shares (fractional allowed).
-            side:          'buy' or 'sell'.
-            order_type:    'market' or 'limit'.
-            limit_price:   Required for limit orders.
-            time_in_force: 'day' or 'gtc'.
+            symbol:           Ticker symbol.
+            qty:              Number of shares (fractional allowed).
+            side:             'buy' or 'sell'.
+            order_type:       'market' or 'limit'.
+            limit_price:      Required for limit orders.
+            time_in_force:    'day' or 'gtc'.
+            client_order_id:  Optional idempotency key for order recovery.
 
         Returns:
             Order dict with id and status.
@@ -97,6 +99,8 @@ class AlpacaClient:
         }
         if limit_price is not None:
             body["limit_price"] = str(round(limit_price, 2))
+        if client_order_id:
+            body["client_order_id"] = client_order_id
         resp = requests.post(f"{ALPACA_PAPER_URL}/v2/orders", json=body,
                              headers=self._headers, timeout=10)
         self._raise_for_status(resp)
@@ -131,6 +135,43 @@ class AlpacaClient:
         except Exception as e:
             logger.warning("Latest price failed for %s: %s", symbol, e)
             return None
+
+    def get_order_by_client_id(self, client_order_id: str) -> Optional[dict]:
+        """
+        Look up an order by its client_order_id (idempotency key).
+
+        Used in the network-error recovery path after a Timeout or ConnectionError
+        on order submission, to check whether Alpaca received and placed the order.
+
+        Args:
+            client_order_id: The COID we passed to place_order.
+
+        Returns:
+            Order dict if found, None if not found or on error.
+        """
+        try:
+            url = f"{ALPACA_PAPER_URL}/v2/orders:by_client_order_id"
+            resp = requests.get(
+                url,
+                headers=self._headers,
+                params={"client_order_id": client_order_id},
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                return None
+            self._raise_for_status(resp)
+            return resp.json()
+        except AlpacaError as e:
+            if e.status_code == 404:
+                return None
+            logger.warning("get_order_by_client_id failed for %s: %s", client_order_id, e)
+            return None
+        except Exception as e:
+            logger.warning("get_order_by_client_id error for %s: %s", client_order_id, e)
+            return None
+
+    # Private alias for backward-compat with any callers using the _ prefix
+    _get_order_by_client_id = get_order_by_client_id
 
     def _get(self, url: str, params: Optional[dict] = None):
         resp = requests.get(url, headers=self._headers, params=params, timeout=10)

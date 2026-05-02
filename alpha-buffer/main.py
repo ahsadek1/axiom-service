@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from config import VALID_AGENTS, MIN_SUBMISSION_SCORE, load_settings, assert_thresholds
+from config import VALID_AGENTS, VALID_PATHWAYS, MIN_SUBMISSION_SCORE, load_settings, assert_thresholds
 from concordance import evaluate_concordance
 from circuit_breaker import (
     CircuitBreakerStatus,
@@ -60,6 +60,28 @@ logger = logging.getLogger("alpha_buffer.main")
 
 ET = pytz.timezone("America/New_York")
 
+import hashlib as _hashlib, os as _os, glob as _glob
+
+def _compute_module_hash() -> str:
+    """Hash all *.py files in this service directory (excluding __pycache__).
+    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    """
+    _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _files = sorted(
+        f for f in _glob.glob(_os.path.join(_svc_dir, "*.py"))
+        if "__pycache__" not in f
+    )
+    _h = _hashlib.md5()
+    for _f in _files:
+        try:
+            with open(_f, "rb") as _fh:
+                _h.update(_fh.read())
+        except Exception:
+            pass
+    return _h.hexdigest()[:8]
+
+_CODE_HASH = _compute_module_hash()
+
 # ── Load settings — crash fast on missing env vars ────────────────────────────
 settings = load_settings()
 
@@ -68,6 +90,55 @@ app_state: dict = {
     "settings":  settings,
     "start_time": datetime.now(ET).isoformat(),
 }
+
+# ── Score Distribution Watchdog state ─────────────────────────────────────────
+# Tracks scores per window to detect uniform/fabricated scoring
+_window_score_log: dict = {}   # {window_id: {ticker: score}}
+_score_log_lock = threading.Lock()
+SCORE_UNIFORM_THRESHOLD = 0.75   # 75%+ identical scores in a window = data failure
+SCORE_UNIFORM_MIN_PICKS = 5      # need at least 5 picks to flag
+
+
+def _record_window_score(window_id: str, ticker: str, score: float) -> None:
+    """Record a score for uniform distribution monitoring."""
+    with _score_log_lock:
+        if window_id not in _window_score_log:
+            _window_score_log[window_id] = {}
+        _window_score_log[window_id][ticker] = score
+
+
+def _check_score_distribution(window_id: str) -> None:
+    """
+    After a window closes, check if scores are suspiciously uniform.
+    Uniform scores across different companies = Oracle data failure, not market signal.
+    Alerts Ahmed and logs CRITICAL if detected.
+    """
+    with _score_log_lock:
+        scores = list(_window_score_log.get(window_id, {}).values())
+    if len(scores) < SCORE_UNIFORM_MIN_PICKS:
+        return
+    most_common = max(set(scores), key=scores.count)
+    uniformity = scores.count(most_common) / len(scores)
+    if uniformity >= SCORE_UNIFORM_THRESHOLD:
+        msg = (
+            f"🔴 SCORE UNIFORMITY ALERT — window {window_id}\n"
+            f"{uniformity:.0%} of {len(scores)} scores = {most_common:.1f}/100\n"
+            f"Scores: {sorted(scores)}\n"
+            f"DIAGNOSIS: Oracle data likely null/frozen. D1/D3/D5 returning defaults.\n"
+            f"ACTION: Check Oracle /health and run oracle_data_preflight.py immediately."
+        )
+        logger.critical("SCORE_UNIFORM: %s", msg)
+        try:
+            import requests as _req
+            OMNI_BOT = "7973500599:AAHJuh_c-RN2xv-_WYVl7ev1mwF-IvqislE"
+            for chat_id in ["8573754783", "-1003954790884"]:
+                _req.post(
+                    f"https://api.telegram.org/bot{OMNI_BOT}/sendMessage",
+                    json={"chat_id": chat_id, "text": msg},
+                    timeout=5,
+                )
+        except Exception as _te:
+            logger.warning("Score uniform alert telegram failed: %s", _te)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -229,6 +300,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Alpha Buffer: %d instruction(s) from SOVEREIGN on startup", len(_instr))
     # OMNI H2 fix: start background OMNI retry loop
     retry_task = _asyncio.create_task(_omni_retry_loop())
+    # Score distribution watchdog — checks each window after it closes
+    def _score_watchdog_thread():
+        import time as _time
+        last_checked_window = None
+        while True:
+            _time.sleep(60)
+            try:
+                # Current window — check the PREVIOUS window (it just closed)
+                now = datetime.now(ET)
+                # Previous 15-min window
+                prev_min = (now.minute // 15) * 15 - 15
+                if prev_min < 0:
+                    prev_hour = now.hour - 1
+                    prev_min = 45
+                else:
+                    prev_hour = now.hour
+                prev_window = f"{now.strftime('%Y-%m-%d')}-{prev_hour:02d}{prev_min:02d}"
+                if prev_window != last_checked_window:
+                    last_checked_window = prev_window
+                    _check_score_distribution(prev_window)
+            except Exception as _we:
+                logger.warning("Score watchdog error: %s", _we)
+    threading.Thread(target=_score_watchdog_thread, daemon=True, name="score-dist-watchdog").start()
     yield
     retry_task.cancel()
     logger.info("Alpha Buffer stopped")
@@ -283,7 +377,13 @@ class SubmitRequest(BaseModel):
     @field_validator("ticker")
     @classmethod
     def validate_ticker(cls, v: str) -> str:
-        return v.upper().strip()
+        import re
+        v = v.upper().strip()
+        if not v:
+            raise ValueError("ticker cannot be empty")
+        if not re.match(r'^[A-Z0-9\.]{1,6}$', v):
+            raise ValueError(f"ticker '{v}' invalid — must be 1-6 uppercase alphanumeric characters")
+        return v
 
     @field_validator("score")
     @classmethod
@@ -291,6 +391,15 @@ class SubmitRequest(BaseModel):
         if not (0.0 <= v <= 100.0):
             raise ValueError("score must be between 0 and 100")
         return round(v, 2)
+
+    @field_validator("window_id")
+    @classmethod
+    def validate_window_id(cls, v: Optional[str]) -> Optional[str]:
+        """GENESIS-STRESS-F6-001: Validate pathway is in VALID_PATHWAYS when present.
+        Window_id is also the dedup key — enforce non-empty if provided."""
+        if v is not None and len(v.strip()) == 0:
+            raise ValueError("window_id cannot be empty string if provided")
+        return v.strip() if v else v
 
 
 class TradeOutcomeRequest(BaseModel):
@@ -314,6 +423,8 @@ def health() -> JSONResponse:
         "version":     "3.0.0",
         "cb_status":   cb.get("status", "UNKNOWN"),
         "uptime_since": app_state["start_time"],
+        "code_hash":    _CODE_HASH,
+        "stale_deploy": (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
     })
 
 
@@ -383,6 +494,33 @@ def submit_pick(
                 "reason":   f"Score {body.score} below minimum {MIN_SUBMISSION_SCORE} for Alpha",
             },
         )
+
+    # GENESIS-STRESS-F7-001: Direction collision check.
+    # Reject if the same ticker already has an active opposite-direction concordance
+    # forming in the CURRENT window with 2+ agents. Prevents OMNI from receiving
+    # simultaneous bullish+bearish signals on the same ticker in the same window.
+    try:
+        _opp_direction = "bearish" if body.direction == "bullish" else "bullish"
+        _win_id = body.window_id or current_window_id()
+        _opp_subs = get_window_submissions(
+            settings.alpha_db_path, _win_id,
+            body.ticker.upper(), _opp_direction
+        )
+        if len(_opp_subs) >= 2:  # P2 or better forming in opposite direction
+            logger.warning(
+                "DIRECTION COLLISION: %s/%s rejected — %s/%s already has %d agents this window",
+                body.ticker, body.direction, body.ticker, _opp_direction, len(_opp_subs)
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "accepted": False,
+                    "reason": f"Direction collision: {body.ticker}/{_opp_direction} already forming ({len(_opp_subs)} agents)",
+                    "collision": True,
+                },
+            )
+    except Exception:
+        pass  # fail-open: direction collision check is advisory, not blocking
 
     # Daily dedup gate — one submission per agent+ticker+direction per day.
     # Prevents the same agent flooding concordance with identical picks across windows.
@@ -461,6 +599,8 @@ def submit_pick(
         "Submission ACCEPTED: %s | %s/%s | score=%.1f | window=%s",
         body.agent, body.ticker, body.direction, body.score, window_id,
     )
+    # Score distribution watchdog: record this score for uniform detection
+    _record_window_score(window_id, body.ticker, body.score)
 
     # Pipeline Sentinel — buffer accepted this pick
     try:

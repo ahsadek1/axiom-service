@@ -55,6 +55,28 @@ logger = logging.getLogger("prime_buffer.main")
 
 ET = pytz.timezone("America/New_York")
 
+import hashlib as _hashlib, os as _os, glob as _glob
+
+def _compute_module_hash() -> str:
+    """Hash all *.py files in this service directory (excluding __pycache__).
+    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    """
+    _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _files = sorted(
+        f for f in _glob.glob(_os.path.join(_svc_dir, "*.py"))
+        if "__pycache__" not in f
+    )
+    _h = _hashlib.md5()
+    for _f in _files:
+        try:
+            with open(_f, "rb") as _fh:
+                _h.update(_fh.read())
+        except Exception:
+            pass
+    return _h.hexdigest()[:8]
+
+_CODE_HASH = _compute_module_hash()
+
 settings  = load_settings()
 app_state = {
     "settings":   settings,
@@ -261,6 +283,8 @@ def health() -> JSONResponse:
         "version":      "3.0.0",
         "cb_status":    cb.get("status", "UNKNOWN"),
         "uptime_since": app_state["start_time"],
+        "code_hash":    _CODE_HASH,
+        "stale_deploy": (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
     })
 
 

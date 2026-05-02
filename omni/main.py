@@ -35,6 +35,7 @@ from pydantic import BaseModel, field_validator
 from config import BASE_POSITION_SIZE, MIN_BRAINS_REQUIRED, load_settings
 from axiom_client import assess_ticker, get_regime
 from database import (
+    get_conn,
     get_recent_syntheses,
     get_synthesis_result,
     init_db,
@@ -47,6 +48,30 @@ from synthesis import build_context, compute_verdict, _maybe_alert_brain_degrada
 from psychology_overlay import apply_psychology_overlay, PsychologyOverlayResult
 import oracle_client
 from telegram import send_axiom_block_alert, send_synthesis_card
+
+# P0-A: Stale deploy detection
+import hashlib as _hashlib
+import hashlib as _hashlib, os as _os, glob as _glob
+
+def _compute_module_hash() -> str:
+    """Hash all *.py files in this service directory (excluding __pycache__).
+    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    """
+    _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _files = sorted(
+        f for f in _glob.glob(_os.path.join(_svc_dir, "*.py"))
+        if "__pycache__" not in f
+    )
+    _h = _hashlib.md5()
+    for _f in _files:
+        try:
+            with open(_f, "rb") as _fh:
+                _h.update(_fh.read())
+        except Exception:
+            pass
+    return _h.hexdigest()[:8]
+
+_CODE_HASH = _compute_module_hash()
 
 logging.basicConfig(
     level  = logging.INFO,
@@ -137,7 +162,12 @@ def _dispatch_sovereign_instruction(instr: dict) -> None:
             app_state["go_verdicts_today"] = 0
             app_state["p4_dispatched_windows"] = set()
             app_state["synthesized_concordances"] = set()
-        logger.info("SOVEREIGN DIRECTIVE: FLUSH — daily counters and dedup sets cleared")
+            # FIX: reset consecutive_nogo + alert flag on daily boundary
+            # Without this, consecutive_nogo_alerted=True from Friday suppresses Monday alerts
+            app_state["consecutive_nogo"] = 0
+            app_state["consecutive_nogo_alerted"] = False
+            app_state["nogo_block_reasons"] = []
+        logger.info("SOVEREIGN DIRECTIVE: FLUSH — daily counters and dedup sets cleared (incl. consecutive_nogo)")
         report("omni", "ack", {"directive": "FLUSH", "status": "applied"})
     else:
         logger.warning("SOVEREIGN DIRECTIVE: unrecognized '%s'", directive[:100])
@@ -163,6 +193,53 @@ app_state = {
 # alert Ahmed + Sovereign so the issue is caught immediately — not 2.5h later.
 _SILENCE_THRESHOLD_MIN = 20   # alert after 20 min silence during market hours
 _silence_alerted = False       # rate-limit: one alert per silence episode
+
+# ── Block 2: STANDBY mode ─────────────────────────────────────────────────────
+# OMNI enters STANDBY if the Anthropic API key fails at startup.
+# /health returns 200 with status: "standby"; /concordance returns 503.
+# A background thread retries every 30s and clears standby on success.
+_omni_standby_active: bool = False
+_omni_standby_reason: str  = ""
+
+
+def _omni_preflight_check() -> "tuple[bool, str]":
+    """Block 2: Verify Anthropic API key is valid before accepting concordances.
+
+    Returns:
+        (ok: bool, reason: str) — reason is empty when ok=True.
+    """
+    try:
+        from shared.api_key_validator import ApiKeyValidator as _AKV
+        _r = _AKV().validate_anthropic(settings.anthropic_api_key)
+        if _r.status == "failed":
+            return False, f"Anthropic API key invalid: {_r.message}"
+        return True, ""
+    except Exception as exc:
+        return False, f"Anthropic preflight error: {exc}"
+
+
+def _omni_preflight_retry_loop() -> None:
+    """Block 2: Background thread — retry Anthropic preflight every 30s until ACTIVE."""
+    global _omni_standby_active, _omni_standby_reason
+    import time as _time
+    while True:
+        _time.sleep(30)
+        with _state_lock:
+            if not _omni_standby_active:
+                return
+        ok, reason = _omni_preflight_check()
+        if ok:
+            with _state_lock:
+                _omni_standby_active = False
+                _omni_standby_reason = ""
+            logger.info("Block 2: OMNI STANDBY cleared — Anthropic API key now valid")
+            try:
+                from shared.notification_router import notify_info as _ni
+                _ni("omni", "OMNI Active", "Anthropic API key validated — OMNI exiting STANDBY")
+            except Exception:
+                pass
+            return
+        logger.warning("Block 2: OMNI preflight retry failed — still in STANDBY: %s", reason)
 
 
 def _fire_consecutive_nogo_alert(
@@ -766,22 +843,51 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Auth registry validation passed for OMNI")
     except AuthConfigError as e:
         logger.critical("Auth config invalid: %s", e)
-    # G11 SYS-4: Validate all 4 brain API keys at startup
+    # G11 SYS-4 + Block 2: Validate brain API keys at startup.
+    # Anthropic is CRITICAL (primary brain) — BLOCKING gate per RESILIENCE_SPEC_v2.
+    # Gemini / DeepSeek / OpenAI remain warn-only (non-critical fallback brains).
     from shared.api_key_validator import ApiKeyValidator, ValidationResult as _VR
     _validator = ApiKeyValidator()
-    _brain_results = [
-        _validator.validate_anthropic(settings.anthropic_api_key),
-        _validator.validate_openai(settings.openai_api_key),
-        _validator.validate_gemini(settings.gemini_api_key),
-        _validator.validate_deepseek(settings.deepseek_api_key),
-    ]
-    for _r in _brain_results:
-        if _r.status == "failed":
-            logger.critical("API key probe: %s → FAILED (%s)", _r.api_name, _r.message)
-        elif _r.status == "degraded":
-            logger.warning("API key probe: %s → DEGRADED (%s)", _r.api_name, _r.message)
-        else:
-            logger.info("API key probe: %s → %s (%s)", _r.api_name, _r.status, _r.message)
+    _anthropic_result = _validator.validate_anthropic(settings.anthropic_api_key)
+    if _anthropic_result.status == "failed":
+        # Block 2: Anthropic failure — enter STANDBY, reject /concordance with 503
+        global _omni_standby_active, _omni_standby_reason
+        logger.critical(
+            "Block 2: Anthropic API key FAILED — OMNI entering STANDBY. (%s)",
+            _anthropic_result.message,
+        )
+        _omni_standby_active = True
+        _omni_standby_reason = f"Anthropic API key invalid: {_anthropic_result.message}"
+        try:
+            from shared.notification_router import notify_escalate as _ne
+            _ne("omni", "OMNI STANDBY — Anthropic API Failed",
+                f"OMNI cannot synthesize without Claude. Retrying every 30s.\nReason: {_omni_standby_reason}")
+        except Exception:
+            pass
+        threading.Thread(
+            target=_omni_preflight_retry_loop, daemon=True, name="omni-preflight-retry"
+        ).start()
+    else:
+        logger.info("Block 2: Anthropic → %s (%s)", _anthropic_result.status, _anthropic_result.message)
+    # Non-critical brains: warn-only
+    for _bkey, _bval in [
+        ("openai", settings.openai_api_key),
+        ("gemini", settings.gemini_api_key),
+        ("deepseek", settings.deepseek_api_key),
+    ]:
+        try:
+            if _bkey == "openai":
+                _r = _validator.validate_openai(_bval)
+            elif _bkey == "gemini":
+                _r = _validator.validate_gemini(_bval)
+            else:
+                _r = _validator.validate_deepseek(_bval)
+            if _r.status != "ok":
+                logger.warning("API key probe: %s → %s (%s)", _bkey, _r.status, _r.message)
+            else:
+                logger.info("API key probe: %s → ok", _bkey)
+        except Exception as _be:
+            logger.warning("API key probe: %s → error (%s)", _bkey, _be)
     init_db(settings.omni_db_path)
 
     # ── Restart-safe state reconstruction ────────────────────────────────────
@@ -813,9 +919,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 )
                 app_state["synthesized_concordances"].add(_rkey)
                 _recovered += 1
-        # GENESIS-FIX-RESTART-001 2026-04-30: Seed syntheses_today + last_synthesis_time
-        # from DB so the silence watcher does not false-fire after a clean restart
-        # that pre-loads already-synthesized concordances.
+        # Block 3: syntheses_today is derived from DB on every /health call — do NOT seed here.
+        # Seed only last_synthesis_time so the silence watcher does not false-fire
+        # after a clean restart that pre-loads already-synthesized concordances.
         if _recovered > 0:
             try:
                 with __import__("database").get_conn(settings.omni_db_path) as _ts_conn:
@@ -837,14 +943,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                         if _max_dt.tzinfo is None:
                             _max_dt = _max_dt.replace(tzinfo=_tz.utc)
                         with _state_lock:
-                            app_state["syntheses_today"] = _recovered
+                            # Only seed last_synthesis_time (for silence watcher).
+                            # syntheses_today / go_verdicts_today are derived from DB in /health.
                             app_state["last_synthesis_time"] = _max_dt.timestamp()
                         logger.info(
-                            "OMNI restart recovery: seeded syntheses_today=%d last_synthesis=%s",
-                            _recovered, _max_ts_str,
+                            "OMNI restart recovery: seeded last_synthesis_time from DB (last=%s)",
+                            _max_ts_str,
                         )
             except Exception as _seed_err:
-                logger.warning("OMNI restart recovery: could not seed synthesis counters: %s", _seed_err)
+                logger.warning("OMNI restart recovery: could not seed last_synthesis_time: %s", _seed_err)
         logger.info(
             "OMNI restart recovery: pre-loaded %d synthesized_concordances from DB (date=%s)",
             _recovered, _et_date_today,
@@ -989,6 +1096,18 @@ class ConcordancePayload(BaseModel):
 @app.get("/health")
 def health() -> JSONResponse:
     """Health check. Always returns 200. No auth required."""
+    # Block 2: STANDBY fast path — GA takes no action for status: "standby"
+    with _state_lock:
+        _sb_active = _omni_standby_active
+        _sb_reason = _omni_standby_reason
+    if _sb_active:
+        return JSONResponse({
+            "status":  "standby",
+            "service": "omni",
+            "version": "3.1.0",
+            "reason":  _sb_reason,
+        })
+
     _last_ts = app_state["last_synthesis_time"]
     _silence_min = round((time.time() - _last_ts) / 60, 1) if _last_ts else None
     # GAP-008: pool stats
@@ -1004,9 +1123,37 @@ def health() -> JSONResponse:
     # ── Trading Effectiveness Score (TES) ──────────────────────────────────────
     # Measures whether OMNI is producing value, not just whether it's alive.
     # Health=UP + Syntheses>0 + GO>0 = effective. Health=UP + Syntheses>0 + GO=0 = investigating.
-    _syntheses  = app_state["syntheses_today"]
-    _gos        = app_state["go_verdicts_today"]
-    _consec_nogo= app_state.get("consecutive_nogo", 0)
+    # Block 3: Derive counters from DB (DB is truth, memory is cache)
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        import datetime as _dt_mod
+        _et_today = _dt_mod.datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
+        with get_conn(settings.omni_db_path) as _hconn:
+            _row = _hconn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN verdict IN ('GO','STRONG_GO') THEN 1 ELSE 0 END) AS go_count "
+                "FROM synthesis_results WHERE SUBSTR(window_id,1,10) = ?",
+                (_et_today,)
+            ).fetchone()
+            _syntheses = int(_row["total"] or 0) if _row else 0
+            _gos = int(_row["go_count"] or 0) if _row else 0
+            _recent = _hconn.execute(
+                "SELECT verdict FROM synthesis_results ORDER BY created_at DESC LIMIT 20"
+            ).fetchall()
+        _consec_nogo = 0
+        for _rv in _recent:
+            if _rv["verdict"] in ("GO", "STRONG_GO"):
+                break
+            _consec_nogo += 1
+        with _state_lock:
+            app_state["syntheses_today"] = _syntheses
+            app_state["go_verdicts_today"] = _gos
+            app_state["consecutive_nogo"] = _consec_nogo
+    except Exception as _dbe:
+        logger.warning("Block 3: DB counter derivation failed, using memory cache: %s", _dbe)
+        _syntheses  = app_state.get("syntheses_today", 0)
+        _gos        = app_state.get("go_verdicts_today", 0)
+        _consec_nogo= app_state.get("consecutive_nogo", 0)
     if not _is_market_hours():
         _tes_state = "OFF_HOURS"
     elif _syntheses == 0:
@@ -1032,6 +1179,8 @@ def health() -> JSONResponse:
             "consecutive_nogo":  _consec_nogo,
             "nogo_alert_fired":  app_state.get("consecutive_nogo_alerted", False),
         },
+        "code_hash":           _CODE_HASH,
+        "stale_deploy":        (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
     })
 
 
@@ -1067,6 +1216,14 @@ def receive_concordance(
     # Replaces the original `active_secret = x or y; verify_secret(active_secret)` pattern
     # which validated both against nexus_secret — broken on secret rotation.
     verify_concordance_auth(x_nexus_secret, x_nexus_prime_secret)
+
+    # Block 2: STANDBY gate — reject synthesis while Anthropic preflight has not passed
+    with _state_lock:
+        if _omni_standby_active:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "standby", "reason": f"OMNI in STANDBY: {_omni_standby_reason}"},
+            )
 
     # Poll SOVEREIGN for any mid-session instructions (deduped via watermark)
     _instr = get_instructions("omni")
@@ -1674,6 +1831,10 @@ def sovereign_directive(
             app_state["go_verdicts_today"] = 0
             app_state["p4_dispatched_windows"] = set()
             app_state["synthesized_concordances"] = set()
+            # FIX: reset consecutive_nogo + alert flag on daily boundary
+            app_state["consecutive_nogo"] = 0
+            app_state["consecutive_nogo_alerted"] = False
+            app_state["nogo_block_reasons"] = []
         report("omni", "ack", {"directive": d, "status": "applied"})
         return JSONResponse({"ok": True, "directive": d})
     elif d == "SET_AUTO_EXECUTE":

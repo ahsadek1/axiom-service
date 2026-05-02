@@ -96,6 +96,59 @@ AI_CONFIDENCE_THRESHOLD: float = float(os.environ.get("AI_CONFIDENCE_THRESHOLD",
 
 HEARTBEAT_PATH: str = "/tmp/nexus_guardian_heartbeat"
 
+# ── Block 9: CHRONICLE cron log ───────────────────────────────────────────────
+CHRONICLE_DB_PATH: str = "/Users/ahmedsadek/nexus/data/chronicle.db"
+
+def _ensure_cron_log_table() -> None:
+    """Block 9: Create cron_log table in CHRONICLE if it doesn't exist."""
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(CHRONICLE_DB_PATH, timeout=5)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cron_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                cron_id    TEXT    NOT NULL,
+                started_at REAL    NOT NULL,
+                duration_s REAL    NOT NULL,
+                outcome    TEXT    NOT NULL,  -- success / error / timeout
+                error_msg  TEXT,
+                created_at TEXT    NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as _e:
+        log.warning("Block 9: cron_log table init failed: %s", _e)
+
+
+def _log_cron(cron_id: str, started_at: float, outcome: str, error_msg: str = "") -> None:
+    """Block 9: Write cron execution record to CHRONICLE cron_log.
+
+    Args:
+        cron_id:    Identifier for the cron task (e.g. "pipeline_telemetry", "backup").
+        started_at: time.time() at task start.
+        outcome:    "success", "error", or "timeout".
+        error_msg:  Error detail if outcome != "success".
+    """
+    try:
+        import sqlite3 as _sq
+        from datetime import datetime as _dt, timezone as _tz
+        duration_s = time.time() - started_at
+        conn = _sq.connect(CHRONICLE_DB_PATH, timeout=5)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO cron_log (cron_id, started_at, duration_s, outcome, error_msg, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (cron_id, started_at, round(duration_s, 3), outcome,
+             error_msg[:500] if error_msg else None,
+             _dt.now(_tz.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as _e:
+        log.warning("Block 9: _log_cron failed for %s: %s", cron_id, _e)
+
 # ---------------------------------------------------------------------------
 # Service registry + dependency graph
 # ---------------------------------------------------------------------------
@@ -107,7 +160,9 @@ SERVICES: List[Dict[str, Any]] = [
     {"name": "omni",            "port": 8004, "health_path": "/health", "launchd": "ai.nexus.omni",            "db": "omni.db"},
     {"name": "alpha-execution", "port": 8005, "health_path": "/health", "launchd": "ai.nexus.alpha-execution", "db": "alpha_execution.db"},
     {"name": "prime-execution", "port": 8006, "health_path": "/health", "launchd": "ai.nexus.prime-execution", "db": "prime_execution.db"},
-    {"name": "oracle",          "port": 8007, "health_path": "/ping",   "launchd": "ai.nexus.oracle",          "db": "oracle.db"},
+    # Block 2/6: Oracle uses /health (not /ping) so GA can see service_mode, warm_tickers, and status.
+    # GA suppresses Oracle heals when status='warming' — that is normal post-restart state.
+    {"name": "oracle",          "port": 8007, "health_path": "/health", "launchd": "ai.nexus.oracle",          "db": "oracle.db"},
     {"name": "ails",            "port": 8008, "health_path": "/health", "launchd": "ai.nexus.ails",            "db": "ails.db"},
     # Agent scanning services — critical for concordance formation
     {"name": "cipher",          "port": 9001, "health_path": "/health", "launchd": "ai.nexus.cipher",          "db": "cipher.db"},
@@ -2176,6 +2231,10 @@ class GuardianAngelV4:
         self._failure_times: Dict[str, float] = {}
         self._last_heal_ts: Dict[str, float] = {}
         self._heal_cooldown = 300  # 5 min between heal attempts per service
+        # Block 5: Per-service daily heal attempt counter — resets at midnight ET
+        self._heal_attempts_today: Dict[str, int] = {}
+        self._heal_attempts_reset_date: str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        self.MAX_HEAL_ATTEMPTS: int = 3  # hard cap per service per calendar day
         self._last_db_check_ts: float = 0.0
 
         _now = time.time()
@@ -2186,8 +2245,11 @@ class GuardianAngelV4:
         self._last_coherence_ts: float = _now
         self._last_eod_ts: float = 0.0
         self._last_api_probe_ts: float = _now
+        self._last_e2e_ts: float = 0.0   # Block 9: 7AM OMNI E2E diagnostic
         self._running = True
 
+        # Block 9: ensure CHRONICLE cron_log table exists at startup
+        _ensure_cron_log_table()
         log.info("Guardian Angel v4 — Full Coverage initialized")
 
     def _health_check_service(self, svc: Dict[str, Any]) -> bool:
@@ -2200,12 +2262,17 @@ class GuardianAngelV4:
         Returns True if healthy.
         """
         name = svc["name"]
+        # Skip services with no port or health_path (e.g. chronicle — remote/undeployed)
+        if not svc.get("port") or not svc.get("health_path"):
+            return True
         url = f"http://localhost:{svc['port']}{svc['health_path']}"
         failure_type = "UNKNOWN"
         t0 = time.time()
+        # Per-service timeout override — ATG runs multi-minute QI scans
+        http_timeout = svc.get("health_timeout", 5)
 
         try:
-            resp = requests.get(url, timeout=5, headers={"X-Nexus-Secret": NEXUS_SECRET})
+            resp = requests.get(url, timeout=http_timeout, headers={"X-Nexus-Secret": NEXUS_SECRET})
             elapsed = (time.time() - t0) * 1000
 
             if resp.ok:
@@ -2270,12 +2337,114 @@ class GuardianAngelV4:
             )
             return False
 
+        # ── Block 5: Daily heal cap ─────────────────────────────────────────────
+        # Reset counter at day boundary (ET calendar day)
+        _today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if _today_str != self._heal_attempts_reset_date:
+            self._heal_attempts_today = {}
+            self._heal_attempts_reset_date = _today_str
+
+        if self._heal_attempts_today.get(name, 0) >= self.MAX_HEAL_ATTEMPTS:
+            log.warning(
+                "HEAL SUPPRESSED: %s has reached MAX_HEAL_ATTEMPTS=%d today — escalating Tier 4",
+                name, self.MAX_HEAL_ATTEMPTS,
+            )
+            self._escalation.alert_tier4(
+                name,
+                f"Max heal attempts ({self.MAX_HEAL_ATTEMPTS}) reached today. "
+                "Auto-healing stopped. Manual intervention required.",
+            )
+            return False
+
         last_heal = self._last_heal_ts.get(name, 0.0)
         if time.time() - last_heal < self._heal_cooldown:
             remaining = int(self._heal_cooldown - (time.time() - last_heal))
             log.info("HEAL SKIPPED: %s — cooldown active (%ds remaining)", name, remaining)
             return False
-        self._last_heal_ts[name] = time.time()
+        # Block 5: _last_heal_ts set ONLY after verified-healthy post-heal (moved below)
+
+        # ── Block 6: SENTINEL Routing Table ─────────────────────────────────────
+        # Read full health response to choose the correct heal action.
+        # Do NOT blindly restart — read what the service is telling us first.
+        _route_action = "RESTART"  # default
+        _route_reason = failure_type
+        _port = svc.get("port")
+        _is_execution_svc = _port in (8005, 8006)
+
+        # Market hours gate: execution services before 9:25 AM or after 16:05 PM ET
+        _now_et = datetime.now(ET if "ET" in dir() else __import__("pytz").timezone("America/New_York"))
+        _market_start = _now_et.replace(hour=9, minute=25, second=0, microsecond=0)
+        _market_end   = _now_et.replace(hour=16, minute=5,  second=0, microsecond=0)
+        if _is_execution_svc and not (_market_start <= _now_et <= _market_end):
+            log.info(
+                "HEAL SUPPRESSED: %s — outside market hours (%s ET), expected state",
+                name, _now_et.strftime("%H:%M"),
+            )
+            return False
+
+        # Read latest health payload for routing decision
+        _health_payload: dict = {}
+        try:
+            _hr = requests.get(url, timeout=5, headers={"X-Nexus-Secret": NEXUS_SECRET})
+            if _hr.ok or _hr.status_code in (200, 503):
+                _health_payload = _hr.json()
+        except Exception:
+            pass  # Connection refused — routing falls through to default RESTART
+
+        _svc_status = _health_payload.get("status", "unknown")
+
+        if _svc_status in ("standby", "warming"):
+            # Block 2: service is self-recovering — do NOT interfere.
+            # 'warming' = Oracle post-restart cache fill (normal, takes 15-30s)
+            # 'standby' = any other service preflight retry in progress
+            log.info("HEAL SKIPPED: %s — status=%s, service is self-recovering", name, _svc_status)
+            return False
+
+        if _health_payload.get("stale_deploy") is True:
+            # Deploy gate owns stale deploys — GA alerts but never heals
+            log.warning("STALE DEPLOY detected on %s — alerting only (deploy gate owns this)", name)
+            _send_telegram(
+                f"*STALE DEPLOY* — `{name}`\n"
+                "code_hash mismatch detected.\n"
+                "Deploy gate should have caught this. Check `post_deploy_check.py`.",
+                tier=2,
+            )
+            return False
+
+        if _health_payload.get("alpaca_reachable") is False:
+            # Alpaca unreachable — wait 60s, retry probe, alert if still down
+            log.warning("HEAL: %s — alpaca_reachable=False, waiting 60s before retry", name)
+            time.sleep(60)
+            try:
+                _retry_r = requests.get(url, timeout=5, headers={"X-Nexus-Secret": NEXUS_SECRET})
+                if _retry_r.ok and _retry_r.json().get("alpaca_reachable") is not False:
+                    log.info("HEAL: %s — Alpaca recovered after 60s wait", name)
+                    return True
+            except Exception:
+                pass
+            _send_telegram(
+                f"*ALPACA UNREACHABLE* — `{name}`\n"
+                "Still down after 60s retry. Check Alpaca status.",
+                tier=3,
+            )
+            return False
+
+        if _health_payload.get("execution_paused") is True:
+            _route_action = "RESUME"
+            _route_reason = "execution_paused=True"
+        elif (_health_payload.get("execution_valid") is False
+              and _svc_status not in ("standby",)
+              and _health_payload.get("alpaca_reachable") is not False):
+            _route_action = "RESTART"
+            _route_reason = "execution_valid=False (all deps normal)"
+        elif failure_type == "CONNECTION_REFUSED":
+            _route_action = "RESTART"
+        # else: keep default RESTART
+
+        log.info(
+            "Block 6 routing: %s → action=%s reason=%s",
+            name, _route_action, _route_reason,
+        )
 
         root = self._causal.find_root_cause(name)
         causal_chain = self._causal.explain_chain(name)
@@ -2286,10 +2455,29 @@ class GuardianAngelV4:
         log.info("HEAL: %s | type=%s | root=%s | patch=%s (%s success)",
                  name, failure_type, root, best_patch, rate_str)
 
+        # Block 5: Increment attempt counter BEFORE heal (regardless of outcome)
+        self._heal_attempts_today[name] = self._heal_attempts_today.get(name, 0) + 1
+
         t_heal = time.time()
         healed = False
 
-        if best_patch == "RESTART":
+        # Block 6: Execute routed heal action
+        if _route_action == "RESUME":
+            # Execution service paused — send /resume, not a restart
+            _resume_secret = NEXUS_PRIME_SECRET if svc.get("port") == 8006 else NEXUS_SECRET
+            _resume_url = f"http://localhost:{svc['port']}/resume"
+            try:
+                _resume_resp = requests.post(
+                    _resume_url,
+                    headers={"X-Nexus-Secret": _resume_secret, "X-Nexus-Prime-Secret": _resume_secret},
+                    timeout=5,
+                )
+                healed = _resume_resp.ok
+                log.info("RESUME sent to %s: status=%d", name, _resume_resp.status_code)
+            except Exception as _re:
+                log.warning("RESUME failed for %s: %s", name, _re)
+                healed = False
+        elif best_patch == "RESTART" or _route_action == "RESTART":
             healed = _launchctl_restart(root if root != name else name)
             if healed:
                 time.sleep(5)
@@ -2311,6 +2499,8 @@ class GuardianAngelV4:
                                      f"root={root}, causal={causal_chain}")
 
         if healed:
+            # Block 5: _last_heal_ts set ONLY after verified-healthy post-heal
+            self._last_heal_ts[name] = time.time()
             _send_telegram(
                 f"*FIXED* — `{name}` recovered\n"
                 f"Type: {failure_type} | Root: `{root}`\n"
@@ -2321,7 +2511,6 @@ class GuardianAngelV4:
             self._crash_history[name] = []
             if name in self._failure_times:
                 del self._failure_times[name]
-            self._last_heal_ts.pop(name, None)
             self._escalation.report_healed(name)
         else:
             # Novel failure — call MultiAIBrain (3 independent analyses)
@@ -2557,6 +2746,60 @@ class GuardianAngelV4:
         self._coherence._telemetry = new_conn
         log.info("_refresh_telemetry_conn: all dependents updated with new telemetry connection.")
 
+    def _run_omni_e2e_diagnostic(self) -> None:
+        """Block 9: 7AM ET pre-market OMNI E2E diagnostic.
+
+        Sends a lightweight health probe to OMNI at 7 AM ET to verify the full
+        synthesis path is reachable before market open. Uses a 620s timeout to
+        accommodate cold-start brain initialization. Duration is logged to
+        CHRONICLE cron_log regardless of outcome.
+
+        Fires once per day — guarded by self._last_e2e_ts.
+        """
+        _e2e_start = time.time()
+        outcome    = "success"
+        error_msg  = ""
+        try:
+            resp = requests.get(
+                "http://localhost:8004/health",
+                timeout=620,
+                headers={"X-Nexus-Secret": NEXUS_SECRET},
+            )
+            if not resp.ok:
+                outcome   = "error"
+                error_msg = f"OMNI /health returned {resp.status_code}"
+                _send_telegram(
+                    f"*7AM E2E DIAGNOSTIC FAILED* — OMNI /health → {resp.status_code}\n"
+                    f"Detail: {error_msg}",
+                    tier=3,
+                )
+            else:
+                _svc_status = resp.json().get("status", "unknown")
+                if _svc_status == "standby":
+                    outcome   = "error"
+                    error_msg = f"OMNI is in STANDBY at 7AM: {resp.json().get('reason', '')}"
+                    _send_telegram(
+                        f"*7AM E2E DIAGNOSTIC — OMNI STANDBY*\n{error_msg}\n"
+                        "OMNI cannot synthesize. Check Anthropic API key.",
+                        tier=3,
+                    )
+                else:
+                    log.info(
+                        "Block 9 7AM E2E diagnostic: OMNI healthy (status=%s, %.1fs)",
+                        _svc_status, time.time() - _e2e_start,
+                    )
+        except requests.Timeout:
+            outcome   = "timeout"
+            error_msg = f"OMNI /health timed out after 620s"
+            log.error("Block 9 7AM E2E: %s", error_msg)
+            _send_telegram(f"*7AM E2E TIMEOUT* — OMNI /health timed out (>620s)", tier=3)
+        except Exception as _e2e_exc:
+            outcome   = "error"
+            error_msg = str(_e2e_exc)[:200]
+            log.error("Block 9 7AM E2E diagnostic error: %s", error_msg)
+        finally:
+            _log_cron("omni_e2e_7am", _e2e_start, outcome, error_msg)
+
     def run(self) -> None:
         """Main monitoring loop."""
         log.info("Guardian Angel v4 — Full Coverage running")
@@ -2566,8 +2809,10 @@ class GuardianAngelV4:
             loop_start = time.time()
 
             # --- Service health + root cause healing ---
+            _sh_start = time.time()
             for svc in SERVICES:
                 self._health_check_service(svc)
+            _log_cron("service_health_checks", _sh_start, "success")
 
             # --- Escalation ladder tick ---
             self._escalation.tick()
@@ -2582,7 +2827,15 @@ class GuardianAngelV4:
 
             # --- V4: Pipeline telemetry during market hours ---
             if _is_pipeline_hours():
-                self._pipeline.run_all()
+                _pt_start = time.time()
+                _pt_err = ""
+                try:
+                    self._pipeline.run_all()
+                    _log_cron("pipeline_telemetry", _pt_start, "success")
+                except Exception as _pt_exc:
+                    _pt_err = str(_pt_exc)[:200]
+                    _log_cron("pipeline_telemetry", _pt_start, "error", _pt_err)
+                    raise
 
             now = time.time()
 
@@ -2606,7 +2859,13 @@ class GuardianAngelV4:
 
             if now - self._last_backup_ts >= 3600:
                 self._last_backup_ts = now
-                _backup_dbs(self._healing_conn)
+                _bk_start = time.time()
+                try:
+                    _backup_dbs(self._healing_conn)
+                    _log_cron("hourly_backup", _bk_start, "success")
+                except Exception as _bk_exc:
+                    _log_cron("hourly_backup", _bk_start, "error", str(_bk_exc)[:200])
+                    raise
                 # FIX: prune_old() must run while _BACKUP_LOCK is still effectively
                 # held — previously it ran AFTER _backup_dbs released the lock, letting
                 # TelemetryWriter resume and grab the SQLite connection first, causing
@@ -2640,6 +2899,19 @@ class GuardianAngelV4:
 
             if _is_market_hours() and _is_on_the_hour():
                 self._send_health_pulse()
+
+            # Block 9: 7AM ET OMNI E2E diagnostic (once per day, weekdays only)
+            try:
+                import zoneinfo as _zi
+                _tz_e2e  = _zi.ZoneInfo("America/New_York")
+                _now_e2e = datetime.now(_tz_e2e)
+                if (_now_e2e.weekday() < 5
+                        and _now_e2e.hour == 7
+                        and now - self._last_e2e_ts > 3600):
+                    self._last_e2e_ts = time.time()
+                    self._run_omni_e2e_diagnostic()
+            except ImportError:
+                pass
 
             # EOD report at 4:30 PM ET on weekdays
             eod_due = False

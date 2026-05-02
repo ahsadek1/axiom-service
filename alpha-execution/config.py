@@ -36,7 +36,9 @@ VIX_BRAKE_ELEVATED = 25   # above this: reduce sizing
 VIX_BRAKE_FULL     = 35   # above this: block all new positions
 
 # ── Position Limits ───────────────────────────────────────────────────────────
-MAX_CONCURRENT_POSITIONS = 10
+# MUST match axiom/config.py MAX_POSITIONS — single source of truth is axiom.
+# C-2 fix (2026-05-02): was 10, corrected to 3 to match Ahmed's mandate and Axiom gate.
+MAX_CONCURRENT_POSITIONS = 3
 MAX_NEW_PER_DAY          = 5
 
 # ── Strike Calculation ────────────────────────────────────────────────────────
@@ -61,6 +63,9 @@ class Settings:
     telegram_bot_token:    str
     ahmed_chat_id:         str
     port:                  int
+    axiom_url:             str
+    axiom_secret:          str
+    polygon_api_key:       str
 
 
 def load_settings() -> Settings:
@@ -78,7 +83,11 @@ def load_settings() -> Settings:
         "ALPHA_BUFFER_URL":     os.getenv("ALPHA_BUFFER_URL"),
         "TELEGRAM_BOT_TOKEN":   os.getenv("TELEGRAM_BOT_TOKEN"),
         "AHMED_CHAT_ID":        os.getenv("AHMED_CHAT_ID"),
+        "AXIOM_URL":            os.getenv("AXIOM_URL"),
+        "AXIOM_SECRET":         os.getenv("AXIOM_SECRET"),
     }
+    # Polygon key is optional — earnings gate skips gracefully if absent
+    polygon_key = os.getenv("POLYGON_API_KEY", "")
     missing = [k for k, v in required.items() if not v]
     if missing:
         raise ValueError(
@@ -93,4 +102,7 @@ def load_settings() -> Settings:
         telegram_bot_token   = required["TELEGRAM_BOT_TOKEN"],
         ahmed_chat_id        = required["AHMED_CHAT_ID"],
         port                 = int(os.getenv("PORT", "8005")),
+        axiom_url            = required["AXIOM_URL"],
+        axiom_secret         = required["AXIOM_SECRET"],
+        polygon_api_key      = polygon_key,
     )

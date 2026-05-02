@@ -34,7 +34,7 @@ SP500_TICKERS = [
     "BLK",  "AON",  "LMT",  "IBM",  "BKR",  "MMC",  "EBAY", "TMUS", "PNW",  "CMG",
     "PRU",  "DRI",  "WDC",  "NVO",  "CPT",  "WEC",  "NOC",  "BKNG", "ULTA", "HII",
     "LRCX", "SHW",  "V",    "RCL",  "UDR",  "PEP",  "WFC",  "H",    "AKAM", "STX",
-    "PSX",  "PG",   "TXT",  "CL",   "GRMN", "SLV",  "TMO",  "HOLX", "HSY",  "VLO",
+    "PSX",  "PG",   "TXT",  "CL",   "GRMN", "SLV",  "TMO",  "HSY",  "VLO",
     "NNN",  "IBB",  "JNJ",  "KR",   "DHI",  "NEE",  "STT",  "GDX",  "C",    "XLB",
     "SCHW", "FTNT", "COP",  "IEMG", "CSX",  "AVB",  "AIT",  "SAIC", "J",    "KLAC",
     "O",    "DD",   "LOW",  "ALL",  "FRT",  "EEM",  "ODFL", "D",    "CDNS", "AMAT",

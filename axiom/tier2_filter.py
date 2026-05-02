@@ -31,7 +31,7 @@ from regime import Regime
 logger = logging.getLogger("axiom.tier2")
 
 # ── Tier 2 Thresholds ─────────────────────────────────────────────────────────
-MIN_IV_RANK            = 20.0
+MIN_IV_RANK            = 5.0
 MAX_IV_RANK            = 80.0
 MIN_RSI                = 20.0
 MAX_RSI                = 85.0
@@ -89,7 +89,7 @@ SECTOR_MAP: dict[str, str] = {
     "BIIB": "Healthcare", "VRTX": "Healthcare", "REGN": "Healthcare",
     "ISRG": "Healthcare", "TMO":  "Healthcare", "DHR":  "Healthcare",
     "BSX":  "Healthcare", "MDT":  "Healthcare", "EW":   "Healthcare",
-    "HCA":  "Healthcare", "HOLX": "Healthcare", "WELL": "Healthcare",
+    "HCA":  "Healthcare", "WELL": "Healthcare",
     "VTR":  "Healthcare", "NVO":  "Healthcare", "AZN":  "Healthcare",
     "LDOS": "Healthcare", "SAIC": "Healthcare",
     # ── Financials ────────────────────────────────────────────────────────────

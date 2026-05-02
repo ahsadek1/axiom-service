@@ -36,6 +36,12 @@ PATHWAY_SIZING: dict[str, float] = {
     "P4": 0.25,
 }
 
+# Valid pathways — strictly enforced. P0 does not exist.
+# GENESIS-STRESS-F6-001 2026-05-01: stress test found that P0 pathway was accepted
+# by the buffer because pathway is Optional[str] with no enum validation.
+# Any pathway not in this set must be rejected at submission time.
+VALID_PATHWAYS: frozenset = frozenset(PATHWAY_SIZING.keys())  # {P1, P2, P3, P4}
+
 # Circuit breaker thresholds (based on $25K paper per system)
 CB_AMBER_CONSECUTIVE_LOSSES  = 2
 CB_AMBER_DAILY_LOSS_PCT      = 0.03     # 3% = $750

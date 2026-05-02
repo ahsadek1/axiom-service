@@ -30,6 +30,30 @@ from shared.sovereign_comms import get_instructions, report
 
 from config import load_settings, MAX_POSITIONS, MAX_RISK_PER_TRADE, MIN_DTE, MAX_DTE, VIX_PAUSE_THRESHOLD, MIN_IVR_CREDIT_SPREAD, MAX_IVR_DEBIT_SPREAD
 
+# P0-A: Stale deploy detection
+import hashlib as _hashlib
+import hashlib as _hashlib, os as _os, glob as _glob
+
+def _compute_module_hash() -> str:
+    """Hash all *.py files in this service directory (excluding __pycache__).
+    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    """
+    _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _files = sorted(
+        f for f in _glob.glob(_os.path.join(_svc_dir, "*.py"))
+        if "__pycache__" not in f
+    )
+    _h = _hashlib.md5()
+    for _f in _files:
+        try:
+            with open(_f, "rb") as _fh:
+                _h.update(_fh.read())
+        except Exception:
+            pass
+    return _h.hexdigest()[:8]
+
+_CODE_HASH = _compute_module_hash()
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level  = logging.INFO,
@@ -62,6 +86,11 @@ app_state: dict = {
     "start_time":                datetime.now(ET).isoformat(),
     "status":                    "starting",
 }
+
+# ── Block 2: STANDBY mode ─────────────────────────────────────────────────────
+_SERVICE_MODE:   str  = "active"   # "active" | "standby"
+_standby_reason: str  = ""
+_axiom_mode_lock = threading.Lock()
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -99,6 +128,53 @@ def verify_secret(request: Request) -> None:
 
 # ── Lifespan — start/stop scheduler ──────────────────────────────────────────
 
+def _axiom_preflight_check() -> tuple[bool, str]:
+    """Block 2: Verify Axiom startup preconditions.
+
+    Checks:
+      1. VIX data reachable (Polygon probe via data_sources).
+      2. Regime classification succeeds (not None).
+
+    Returns:
+        (ok: bool, reason: str) — reason is empty when ok=True.
+    """
+    try:
+        from data_sources import get_vix_with_fallback
+        vix, _ = get_vix_with_fallback(settings.fred_api_key, None)
+        if vix is None:
+            return False, "VIX data unavailable at startup (Polygon + FRED both unreachable)"
+    except Exception as exc:
+        return False, f"VIX probe failed at startup: {exc}"
+
+    try:
+        from regime import classify_regime
+        regime = classify_regime(vix, False)
+        if regime is None or getattr(regime, "classification", None) is None:
+            return False, "Regime classification returned None at startup"
+    except Exception as exc:
+        return False, f"Regime classification failed at startup: {exc}"
+
+    return True, ""
+
+
+def _axiom_preflight_retry_loop() -> None:
+    """Block 2: Background thread — retry axiom preflight every 30s until ACTIVE."""
+    global _SERVICE_MODE, _standby_reason
+    import time as _time
+    while True:
+        _time.sleep(30)
+        with _axiom_mode_lock:
+            if _SERVICE_MODE == "active":
+                return
+        ok, reason = _axiom_preflight_check()
+        if ok:
+            with _axiom_mode_lock:
+                _SERVICE_MODE = "active"
+                _standby_reason = ""
+            logger.info("Block 2: Axiom preflight PASSED — transitioning to ACTIVE")
+            return
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """FastAPI lifespan — initialize DB and start scheduler on startup."""
@@ -106,6 +182,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from scheduler import create_scheduler
 
     logger.info("Axiom service starting...")
+
+    # ── Block 2: Startup Preflight Gate ───────────────────────────────────────────
+    global _SERVICE_MODE, _standby_reason
+    _pf_ok, _pf_reason = _axiom_preflight_check()
+    if not _pf_ok:
+        with _axiom_mode_lock:
+            _SERVICE_MODE = "standby"
+            _standby_reason = _pf_reason
+        logger.critical("Block 2: Axiom PREFLIGHT FAILED — STANDBY. Reason: %s", _pf_reason)
+        import threading as _th
+        _th.Thread(target=_axiom_preflight_retry_loop, daemon=True, name="axiom-preflight-retry").start()
+    else:
+        logger.info("Block 2: Axiom preflight PASSED — ACTIVE mode")
+    # ─────────────────────────────────────────────────────────────────
 
     # Initialize database
     try:
@@ -208,9 +298,13 @@ class AssessRequest(BaseModel):
     dte: Optional[int] = None         # Optional DTE for options — enforced against MIN_DTE/MAX_DTE
     strategy: Optional[str] = None    # Optional strategy type: "debit", "credit", "short", "long"
     ivr: Optional[float] = None       # IV rank/percentile (0–100) — enforced against IVR credit/debit limits
+    vix: Optional[float] = None       # C-4 fix: caller-supplied VIX for defence-in-depth halt check
     proposed_usd: Optional[float] = None  # Proposed trade size in USD
     strike: Optional[float] = None    # Short strike price
     r2_score: Optional[float] = None  # R2 conviction score from OMNI
+    confidence: Optional[float] = None   # OMNI confidence score
+    pathway: Optional[str] = None        # Concordance pathway
+    sizing: Optional[float] = None       # Sizing multiplier
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -221,6 +315,18 @@ def health() -> JSONResponse:
     Health check endpoint. Always returns 200.
     Never exposes internal errors or state details.
     """
+    # Block 2: STANDBY fast path — GA takes no action for status: "standby"
+    with _axiom_mode_lock:
+        _sb_mode   = _SERVICE_MODE
+        _sb_reason = _standby_reason
+    if _sb_mode == "standby":
+        return JSONResponse({
+            "status":  "standby",
+            "service": "axiom",
+            "version": "4.1.0",
+            "reason":  _sb_reason,
+        })
+
     regime   = app_state.get("regime")
     pool_size = len(app_state.get("pool", []))
 
@@ -237,6 +343,8 @@ def health() -> JSONResponse:
         "regime_last_updated":  regime_updated,
         "submissions_open":     _is_submissions_open(),
         "uptime_since":         app_state.get("start_time"),
+        "code_hash":           _CODE_HASH,
+        "stale_deploy":        (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
     })
 
 
@@ -321,6 +429,24 @@ def assess_stock(
     """
     verify_secret(request)
 
+    # Block 2: STANDBY gate — return hard stop when VIX/regime preflight has not passed
+    with _axiom_mode_lock:
+        if _SERVICE_MODE == "standby":
+            return JSONResponse({
+                "ticker":         body.ticker.upper().strip(),
+                "risk_score":     10.0,
+                "sizing_mult":    0.0,
+                "hard_stops":     ["AXIOM_STANDBY"],
+                "critical_flags": [],
+                "concern_1":      f"Axiom in STANDBY: {_standby_reason}",
+                "concern_2":      "N/A",
+                "concern_3":      "N/A",
+                "in_pool":        False,
+                "regime":         "UNKNOWN",
+                "window_id":      app_state.get("window_id") or current_window_id(),
+                "model":          "axiom-risk-engine-v3",
+            })
+
     ticker    = body.ticker.upper().strip()
     window_id = app_state.get("window_id") or current_window_id()
     pool      = app_state.get("pool", [])
@@ -356,7 +482,19 @@ def assess_stock(
     risk_score  = 2.0
     sizing_mult = 1.0
 
-    # DTE enforcement (hard block — item ③ OMNI 7AM diagnostic)
+    # C-4 fix (2026-05-02): VIX hard halt at Axiom layer — defence in depth.
+    # Previously only enforced at alpha-execution. If execution is bypassed or
+    # restarts with stale state, VIX halt was invisible to Axiom.
+    vix_in_assess = body.vix if body.vix is not None else app_state.get("last_vix")
+    if vix_in_assess is not None and vix_in_assess >= VIX_PAUSE_THRESHOLD:
+        hard_stops.append(
+            f"VIX {vix_in_assess:.1f} ≥ halt threshold {VIX_PAUSE_THRESHOLD} — "
+            f"no new positions permitted"
+        )
+        risk_score = 10.0
+        sizing_mult = 0.0
+
+    # DTE enforcement (hard block — item ④ OMNI 7AM diagnostic)
     if body.dte is not None:
         if body.dte < MIN_DTE:
             hard_stops.append(f"DTE {body.dte}d below minimum {MIN_DTE}d — hard blocked")

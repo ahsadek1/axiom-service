@@ -9,14 +9,39 @@ Port: 8005 (local), $PORT (Railway).
 """
 
 import asyncio
+from typing import Optional, List, Dict, Any
+import glob as _glob
+import hashlib as _hashlib
 import logging
 import os
+import os as _os
 import secrets
 import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncGenerator, Optional
+
+
+def _compute_module_hash() -> str:
+    """Hash all *.py files in this service directory (excluding __pycache__).
+    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    """
+    _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _files = sorted(
+        f for f in _glob.glob(_os.path.join(_svc_dir, "*.py"))
+        if "__pycache__" not in f
+    )
+    _h = _hashlib.md5()
+    for _f in _files:
+        try:
+            with open(_f, "rb") as _fh:
+                _h.update(_fh.read())
+        except Exception:
+            pass
+    return _h.hexdigest()[:8]
+
+_CODE_HASH = _compute_module_hash()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
@@ -61,7 +86,7 @@ def _report_exec_event(
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
@@ -128,12 +153,50 @@ _skipped_tickers: set = set()    # GAP-001: tickers skipped for session due to I
 _ticker_fail_counts: dict = {}   # GAP-CB: consecutive execution failures per ticker
 _TICKER_FAIL_THRESHOLD = 3       # GAP-CB: auto-skip after this many consecutive failures
 
+# ── Block 2: Startup Preflight Gate ──────────────────────────────────────────
+# Module-level mode flag.  "active" = normal; "standby" = preflight failed.
+# Written under _state_lock; read by /health and /execute.
+_SERVICE_MODE: str = "active"
+_standby_reason: str = ""
+_standby_alerted: bool = False     # rate-limit: alert Ahmed only once on entry
+
 # GAP-002: Restore durable state from prior session
 _prior_state = _svc_state.restore()
+_STATE_RESTORED = bool(_prior_state)  # GAP-002: expose in /health
 if _prior_state.get("execution_paused"):    app_state["execution_paused"] = True
-if _prior_state.get("trades_today"):        app_state["trades_today"] = int(_prior_state["trades_today"])
+# Block 3: trades_today is derived from DB (count_new_positions_today) — do not seed from prior state
 if _prior_state.get("skipped_tickers"):     _skipped_tickers.update(_prior_state["skipped_tickers"])
 if _prior_state.get("ticker_fail_counts"):  _ticker_fail_counts.update(_prior_state["ticker_fail_counts"])
+
+# FLAW 4 fix: Validate restored state against live Alpaca before trusting it.
+# Restored ticker_fail_counts / skipped_tickers may reference orders that Alpaca
+# has already settled or rejected. Restoring them blind caused duplicate
+# client_order_id 422 errors (GOOGL incident 2026-05-01).
+def _validate_restored_state() -> None:
+    """Clear ticker-level counters for tickers with no live Alpaca position.
+    Runs once at startup, best-effort — never raises, never blocks."""
+    try:
+        _alpaca = AlpacaClient(settings.alpaca_api_key, settings.alpaca_secret_key)
+        live_positions = {p["symbol"] for p in _alpaca.get_positions()}
+        # Clear fail counts for tickers not in live positions
+        stale_fails = [t for t in list(_ticker_fail_counts.keys()) if t not in live_positions]
+        for t in stale_fails:
+            del _ticker_fail_counts[t]
+            logger.info("FLAW4: cleared stale ticker_fail_count for %s (no live Alpaca position)", t)
+        # Clear skipped tickers not in live positions either
+        stale_skipped = {t for t in _skipped_tickers if t not in live_positions}
+        _skipped_tickers.difference_update(stale_skipped)
+        if stale_skipped:
+            logger.info("FLAW4: cleared stale skipped_tickers: %s", stale_skipped)
+        if stale_fails or stale_skipped:
+            _svc_state.write_many({"ticker_fail_counts": dict(_ticker_fail_counts),
+                                   "skipped_tickers": list(_skipped_tickers)})
+        logger.info("FLAW4: restore validation complete. live_positions=%s", live_positions)
+    except Exception as _e:
+        logger.warning("FLAW4: restore validation failed (non-fatal): %s", _e)
+
+if _prior_state:  # Only validate if there was something to restore
+    _validate_restored_state()
 
 # ── Token Bucket Rate Limiter — /execute endpoint ─────────────────────────────────────
 # Commercial-grade protection: max 10 /execute calls per 60s globally.
@@ -185,6 +248,14 @@ def verify_secret(x_nexus_secret: str) -> None:
         x_nexus_secret, settings.nexus_webhook_secret
     ):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def _auth_dependency(x_nexus_secret: str = Header(default="", alias="X-Nexus-Secret")) -> None:
+    """GENESIS-STRESS-F4-001: FastAPI Depends-based auth that fires BEFORE body parsing.
+    This ensures 403 is returned for invalid credentials before Pydantic 422 validation,
+    preventing information leakage about request body structure to unauthenticated callers.
+    """
+    verify_secret(x_nexus_secret)
 
 
 def _get_alpaca() -> AlpacaClient:
@@ -318,6 +389,81 @@ def _is_market_hours() -> bool:
     return open_t <= now <= close_t
 
 
+def _preflight_check() -> tuple[bool, str]:
+    """Block 2: Verify startup preconditions before accepting traffic.
+
+    Checks:
+      1. Alpaca reachable — GET /v2/account returns 200 with status ACTIVE.
+      2. DB writable — test INSERT + ROLLBACK on alpha DB.
+      3. Market hours determination is unambiguous (pytz loaded, ET timezone confirmed).
+
+    Returns:
+        (ok: bool, reason: str)  — reason is empty when ok=True.
+    """
+    # Check 1: Alpaca reachable
+    try:
+        _a = AlpacaClient(settings.alpaca_api_key, settings.alpaca_secret_key)
+        acct = _a.get_account()
+        if acct.get("status") != "ACTIVE":
+            return False, f"Alpaca account status is '{acct.get('status')}' (expected ACTIVE)"
+    except Exception as exc:
+        return False, f"Alpaca unreachable at startup: {exc}"
+
+    # Check 2: DB writable
+    try:
+        import sqlite3 as _sq
+        _conn = _sq.connect(settings.alpha_db_path, timeout=5)
+        _conn.execute("BEGIN")
+        _conn.execute(
+            "CREATE TABLE IF NOT EXISTS _preflight_probe "
+            "(id INTEGER PRIMARY KEY, ts TEXT)"
+        )
+        _conn.execute("INSERT INTO _preflight_probe (ts) VALUES (?)", (datetime.now(ET).isoformat(),))
+        _conn.execute("ROLLBACK")
+        _conn.close()
+    except Exception as exc:
+        return False, f"DB not writable at startup: {exc}"
+
+    # Check 3: Market hours timezone unambiguous
+    try:
+        _tz = pytz.timezone("America/New_York")
+        _now = datetime.now(_tz)
+        if _now.tzinfo is None:
+            return False, "pytz ET timezone returned naive datetime — timezone load failed"
+    except Exception as exc:
+        return False, f"pytz timezone check failed: {exc}"
+
+    return True, ""
+
+
+def _run_preflight_retry_loop() -> None:
+    """Block 2: Background thread — retry preflight every 30s until ACTIVE.
+
+    Transitions _SERVICE_MODE from 'standby' to 'active' when all checks pass.
+    Alerts Ahmed once on entering standby, once on exiting.
+    """
+    global _SERVICE_MODE, _standby_reason, _standby_alerted
+    import time as _time
+    while True:
+        _time.sleep(30)
+        with _state_lock:
+            if _SERVICE_MODE == "active":
+                return  # already active — nothing to do
+        ok, reason = _preflight_check()
+        if ok:
+            with _state_lock:
+                _SERVICE_MODE = "active"
+                _standby_reason = ""
+            logger.info("Block 2: Preflight PASSED — transitioning to ACTIVE mode")
+            try:
+                from shared.notification_router import notify_info as _ni
+                _ni("alpha-execution", "PREFLIGHT PASSED — ACTIVE",
+                    "All startup checks passed. Alpha Execution is now ACTIVE.")
+            except Exception:
+                pass
+            return
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB and start exit monitor scheduler."""
@@ -344,6 +490,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("API key probe: alpaca → %s (%s)", _alpaca_result.status, _alpaca_result.message)
     init_db(settings.alpha_db_path)
+
+    # ── Block 2: Startup Preflight Gate ───────────────────────────────────────
+    global _SERVICE_MODE, _standby_reason, _standby_alerted
+    _pf_ok, _pf_reason = _preflight_check()
+    if not _pf_ok:
+        with _state_lock:
+            _SERVICE_MODE = "standby"
+            _standby_reason = _pf_reason
+            _standby_alerted = True
+        logger.critical(
+            "Block 2: PREFLIGHT FAILED — entering STANDBY mode. Reason: %s", _pf_reason
+        )
+        try:
+            from shared.notification_router import notify_escalate as _ne
+            _ne("alpha-execution", "STANDBY MODE — PREFLIGHT FAILED",
+                f"Alpha Execution is in STANDBY. Retrying every 30s.\nReason: {_pf_reason}")
+        except Exception:
+            pass
+        import threading as _threading
+        _threading.Thread(
+            target=_run_preflight_retry_loop, daemon=True,
+            name="alpha-exec-preflight-retry"
+        ).start()
+    else:
+        logger.info("Block 2: Preflight PASSED — service starting in ACTIVE mode")
 
     # ── Startup Reconciliation ────────────────────────────────────────────────
     # On every service start, compare DB open positions against Alpaca.
@@ -588,6 +759,9 @@ app = FastAPI(
     title    = "Alpha Execution Engine",
     version  = "3.0.0",
     lifespan = lifespan,
+    # GENESIS-STRESS-F4-001: Apply auth dependency globally so 403 fires
+    # before Pydantic body validation (422). Prevents body schema leakage.
+    dependencies=[Depends(_auth_dependency)],
 )
 
 
@@ -638,6 +812,20 @@ class ExecuteRequest(BaseModel):
 @app.get("/health")
 def health() -> JSONResponse:
     """Health check with real Alpaca connectivity probe and VIX brake status."""
+    # Block 2: STANDBY fast path — return 200 with standby status so GA takes no action
+    with _state_lock:
+        _mode = _SERVICE_MODE
+        _reason = _standby_reason
+    if _mode == "standby":
+        return JSONResponse({
+            "status":           "standby",
+            "service":          "alpha-execution",
+            "version":          "3.0.0",
+            "reason":           _reason,
+            "execution_valid":  False,
+            "alpaca_reachable": False,
+        })
+
     # Probe Alpaca — real connectivity check, not just a ping
     try:
         acct = _get_alpaca().get_account()
@@ -658,12 +846,17 @@ def health() -> JSONResponse:
         "UNKNOWN"
     )
 
+    # Block 3: derive trades_today from DB — in-memory counter is display-only cache
+    trades_today_db = count_new_positions_today(settings.alpha_db_path)
+    with _state_lock:
+        app_state["trades_today"] = trades_today_db
+
     execution_valid = alpaca_ok and not app_state.get("execution_paused", False) and not vix_brake_full
     return JSONResponse({
         "status":             "healthy" if execution_valid else "degraded",
         "service":            "alpha-execution",
         "version":            "3.0.0",
-        "trades_today":       app_state["trades_today"],
+        "trades_today":       trades_today_db,
         "open_positions":     count_open_positions(settings.alpha_db_path),
         "uptime_since":       app_state["start_time"],
         "uptime_sec":         int((datetime.now(ET) - datetime.fromisoformat(app_state["start_time"])).total_seconds()),
@@ -682,6 +875,10 @@ def health() -> JSONResponse:
         "max_new_per_day":    MAX_NEW_PER_DAY,
         "auto_execute":       app_state.get("auto_execute", False),
         "mode":               app_state.get("mode", "dry_run"),
+        # P0-A: Stale deploy detection
+        "state_restored":     _STATE_RESTORED,
+        "code_hash":          _CODE_HASH,
+        "stale_deploy":       (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
     })
 
 
@@ -706,6 +903,14 @@ def execute(
         JSON with execution result, position_id, and spread details.
     """
     verify_secret(x_nexus_secret)
+
+    # ── Block 2: STANDBY gate — reject execution while preflight has not passed ──
+    with _state_lock:
+        if _SERVICE_MODE == "standby":
+            return JSONResponse(
+                status_code=503,
+                content={"executed": False, "reason": f"Service in STANDBY: {_standby_reason}"},
+            )
 
     # ── GAP-5: Rate Limit Gate ───────────────────────────────────────────────────
     # Max 10 /execute calls per 60s. Blocks brute-force and runaway OMNI loops.
@@ -1052,21 +1257,33 @@ def execute(
         _raw_coid = f"nexus-{_window_id}-{body.ticker}"
         _client_order_id = _raw_coid[:48].replace(" ", "-")
 
-        order = alpaca.place_spread_order(
-            legs             = legs,
-            qty              = contracts,
-            order_type       = "limit",
-            limit_debit      = estimated_credit,
-            client_order_id  = _client_order_id,
-        )
+        # Block 4: Pre-submission existence check — if this COID already exists on
+        # Alpaca (OMNI retry or duplicate signal), recover the existing order instead
+        # of submitting a duplicate. Eliminates race-window duplicate fills.
+        _existing_order = alpaca.get_order_by_client_id(_client_order_id)
+        if _existing_order is not None:
+            _existing_status = _existing_order.get("status", "unknown")
+            logger.info(
+                "Block 4: order already exists for client_order_id=%s (status=%s) — skipping submission",
+                _client_order_id, _existing_status,
+            )
+            order = _existing_order
+        else:
+            order = alpaca.place_spread_order(
+                legs             = legs,
+                qty              = contracts,
+                order_type       = "limit",
+                limit_debit      = estimated_credit,
+                client_order_id  = _client_order_id,
+            )
+            logger.info("Alpha spread order placed: %s | order_id=%s", spread.leg_description(), order.get("id"))
+            try:
+                from pipeline_client import trace_hop as _trace_hop
+                _trace_hop(_ps_trace_id, "alpaca_submitted", "alpha-execution", body.ticker, "alpha")
+            except Exception:
+                pass
         short_order_id = order.get("id")
         long_order_id  = order.get("id")   # spread is a single multi-leg order
-        logger.info("Alpha spread order placed: %s | order_id=%s", spread.leg_description(), short_order_id)
-        try:
-            from pipeline_client import trace_hop as _trace_hop
-            _trace_hop(_ps_trace_id, "alpaca_submitted", "alpha-execution", body.ticker, "alpha")
-        except Exception:
-            pass
     except Exception as e:
         import requests as _req_mod
         order_error = str(e)[:200]
@@ -1391,6 +1608,7 @@ def execute(
     with _state_lock:
         app_state["trades_today"] += 1
         app_state["total_trades"] += 1
+        _svc_state.write("trades_today", app_state["trades_today"])  # GAP-002
 
     # Pipeline Sentinel — Alpaca order confirmed, position live
     try:

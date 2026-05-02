@@ -294,6 +294,57 @@ class AlpacaClient:
             logger.warning("Options chain fetch failed for %s: %s", underlying, e)
             return []
 
+    def get_orders(self, status: str = "open") -> list[dict]:
+        """
+        Fetch orders filtered by status.
+
+        Args:
+            status: 'open', 'closed', or 'all'.
+
+        Returns:
+            List of order dicts.
+        """
+        return self._get(f"{ALPACA_PAPER_URL}/v2/orders", params={"status": status, "limit": 100})
+
+    def get_order_by_client_id(self, client_order_id: str) -> Optional[dict]:
+        """
+        Look up an order by its client_order_id (idempotency key).
+
+        Used in the network-error recovery path: after a Timeout or ConnectionError
+        on order submission, we don't know if Alpaca actually received and placed
+        the order. This method checks directly so we can recover the order_id and
+        avoid duplicate submissions.
+
+        Args:
+            client_order_id: The COID we passed to place_spread_order.
+
+        Returns:
+            Order dict if found, None if not found or on error.
+        """
+        try:
+            url = f"{ALPACA_PAPER_URL}/v2/orders:by_client_order_id"
+            resp = requests.get(
+                url,
+                headers=self._headers,
+                params={"client_order_id": client_order_id},
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                return None
+            self._raise_for_status(resp)
+            return resp.json()
+        except AlpacaError as e:
+            if e.status_code == 404:
+                return None
+            logger.warning("get_order_by_client_id failed for %s: %s", client_order_id, e)
+            return None
+        except Exception as e:
+            logger.warning("get_order_by_client_id error for %s: %s", client_order_id, e)
+            return None
+
+    # ── Private alias for backward-compat with recovery path call ─────────────
+    _get_order_by_client_id = get_order_by_client_id
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get(self, url: str, params: Optional[dict] = None):

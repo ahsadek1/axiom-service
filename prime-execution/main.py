@@ -49,6 +49,30 @@ from database import (
 from exit_monitor import evaluate_exits
 from reconciler import run_reconciler
 
+# P0-A: Stale deploy detection
+import hashlib as _hashlib
+import hashlib as _hashlib, os as _os, glob as _glob
+
+def _compute_module_hash() -> str:
+    """Hash all *.py files in this service directory (excluding __pycache__).
+    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    """
+    _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _files = sorted(
+        f for f in _glob.glob(_os.path.join(_svc_dir, "*.py"))
+        if "__pycache__" not in f
+    )
+    _h = _hashlib.md5()
+    for _f in _files:
+        try:
+            with open(_f, "rb") as _fh:
+                _h.update(_fh.read())
+        except Exception:
+            pass
+    return _h.hexdigest()[:8]
+
+_CODE_HASH = _compute_module_hash()
+
 logging.basicConfig(
     level  = logging.INFO,
     format = "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -79,11 +103,17 @@ if not app_state["auto_execute"]:
 else:
     logger.warning("NEXUS_AUTO_EXECUTE=true — LIVE TRADING MODE. Orders will be submitted to Alpaca.")
 
-# GAP-002: Restore durable state from prior session
+# GAP-002: Restore durable state from prior session (execution_paused only — Block 3 owns trades_today)
 _prior_state_p = _svc_state.restore()
+_STATE_RESTORED_P = bool(_prior_state_p)
 if _prior_state_p.get("execution_paused"):        app_state["execution_paused"] = True
-if _prior_state_p.get("trades_today"):             app_state["trades_today"] = int(_prior_state_p["trades_today"])
 if _prior_state_p.get("was_paused_for_reconcile"): app_state["was_paused_for_reconcile"] = True
+# Block 3: trades_today is derived from DB — do NOT seed from prior state (DB is truth)
+
+# ── Block 2: Service mode ─────────────────────────────────────────────────────
+_SERVICE_MODE: str = "active"   # "active" | "standby"
+_standby_reason: str = ""
+_standby_alerted: bool = False
 
 # Lock for position-limit checks and DB writes during /execute
 _execute_lock = threading.Lock()
@@ -101,6 +131,83 @@ def verify_secret(x_nexus_prime_secret: str) -> None:
 
 def _get_alpaca() -> AlpacaClient:
     return AlpacaClient(settings.alpaca_api_key, settings.alpaca_secret_key)
+
+
+# ── Block 2: Preflight gate ────────────────────────────────────────────────────────
+
+def _preflight_check() -> tuple[bool, str]:
+    """Block 2: Verify startup preconditions before accepting traffic.
+
+    Checks:
+      1. Alpaca reachable — GET /v2/account returns 200 with status ACTIVE.
+      2. DB writable — test INSERT + ROLLBACK on prime DB.
+      3. Market hours determination unambiguous (pytz loaded, ET confirmed).
+
+    Returns:
+        (ok: bool, reason: str) — reason is empty when ok=True.
+    """
+    # Check 1: Alpaca reachable
+    try:
+        _a = AlpacaClient(settings.alpaca_api_key, settings.alpaca_secret_key)
+        acct = _a.get_account()
+        if acct.get("status") != "ACTIVE":
+            return False, f"Alpaca account status is '{acct.get('status')}' (expected ACTIVE)"
+    except Exception as exc:
+        return False, f"Alpaca unreachable at startup: {exc}"
+
+    # Check 2: DB writable
+    try:
+        import sqlite3 as _sq
+        _conn = _sq.connect(settings.prime_db_path, timeout=5)
+        _conn.execute("BEGIN")
+        _conn.execute(
+            "CREATE TABLE IF NOT EXISTS _preflight_probe "
+            "(id INTEGER PRIMARY KEY, ts TEXT)"
+        )
+        _conn.execute("INSERT INTO _preflight_probe (ts) VALUES (?)", (datetime.now(ET).isoformat(),))
+        _conn.execute("ROLLBACK")
+        _conn.close()
+    except Exception as exc:
+        return False, f"DB not writable at startup: {exc}"
+
+    # Check 3: Market hours timezone unambiguous
+    try:
+        _tz = pytz.timezone("America/New_York")
+        _now = datetime.now(_tz)
+        if _now.tzinfo is None:
+            return False, "pytz ET timezone returned naive datetime"
+    except Exception as exc:
+        return False, f"pytz timezone check failed: {exc}"
+
+    return True, ""
+
+
+def _run_preflight_retry_loop() -> None:
+    """Block 2: Background thread — retry preflight every 30s until ACTIVE.
+
+    Transitions _SERVICE_MODE from 'standby' to 'active' when all checks pass.
+    Alerts Ahmed once on exit from standby.
+    """
+    global _SERVICE_MODE, _standby_reason, _standby_alerted
+    import time as _time
+    while True:
+        _time.sleep(30)
+        with _state_lock:
+            if _SERVICE_MODE == "active":
+                return
+        ok, reason = _preflight_check()
+        if ok:
+            with _state_lock:
+                _SERVICE_MODE = "active"
+                _standby_reason = ""
+            logger.info("Block 2: Preflight PASSED — transitioning to ACTIVE mode")
+            try:
+                from shared.notification_router import notify_info as _ni
+                _ni("prime-execution", "PREFLIGHT PASSED — ACTIVE",
+                    "All startup checks passed. Prime Execution is now ACTIVE.")
+            except Exception:
+                pass
+            return
 
 
 def _run_startup_reconciliation() -> None:
@@ -325,6 +432,32 @@ async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
         logger.info("API key probe: alpaca → %s (%s)", _alpaca_result.status, _alpaca_result.message)
     init_db(settings.prime_db_path)
 
+    # ── Block 2: Startup Preflight Gate ────────────────────────────────────────────────
+    global _SERVICE_MODE, _standby_reason, _standby_alerted
+    _pf_ok, _pf_reason = _preflight_check()
+    if not _pf_ok:
+        with _state_lock:
+            _SERVICE_MODE = "standby"
+            _standby_reason = _pf_reason
+            _standby_alerted = True
+        logger.critical(
+            "Block 2: PREFLIGHT FAILED — entering STANDBY mode. Reason: %s", _pf_reason
+        )
+        try:
+            from shared.notification_router import notify_escalate as _ne
+            _ne("prime-execution", "STANDBY MODE — PREFLIGHT FAILED",
+                f"Prime Execution is in STANDBY. Retrying every 30s.\nReason: {_pf_reason}")
+        except Exception:
+            pass
+        import threading as _th
+        _th.Thread(
+            target=_run_preflight_retry_loop, daemon=True,
+            name="prime-exec-preflight-retry"
+        ).start()
+    else:
+        logger.info("Block 2: Preflight PASSED — service starting in ACTIVE mode")
+    # ───────────────────────────────────────────────────────────────────
+
     # GAP-3 fix: Startup reconciliation — close any DB-open positions absent from Alpaca.
     # Prevents dangling 'open'/'pending' positions from blocking all future GO verdicts.
     # Runs once synchronously before scheduler starts. Safe — non-blocking on Alpaca failure.
@@ -485,19 +618,27 @@ class TechnicalStopRequest(BaseModel):
 @app.get("/health")
 def health() -> JSONResponse:
     """Health check with real Alpaca connectivity probe."""
+    # Block 2: standby gate
+    if _SERVICE_MODE == "standby":
+        return JSONResponse({"status": "standby", "reason": _standby_reason,
+                             "service": "prime-execution", "code_hash": _CODE_HASH})
     try:
         acct = _get_alpaca().get_account()
         alpaca_ok = acct.get("status") == "ACTIVE"
     except Exception:
         alpaca_ok = False
     with _state_lock:
-        app_state["alpaca_reachable"] = alpaca_ok if "alpaca_reachable" in app_state else alpaca_ok
+        app_state["alpaca_reachable"] = alpaca_ok
+    # Block 3: trades_today derived from DB — in-memory counter is display-only cache
+    trades_today_db = count_new_positions_today(settings.prime_db_path)
+    with _state_lock:
+        app_state["trades_today"] = trades_today_db
     execution_valid = alpaca_ok and not app_state.get("execution_paused", False)
     return JSONResponse({
-        "status":              "healthy" if execution_valid else "degraded",
+        "status":              "standby" if _SERVICE_MODE == "standby" else ("healthy" if execution_valid else "degraded"),
         "service":             "prime-execution",
         "version":             "3.0.0",
-        "trades_today":        app_state["trades_today"],
+        "trades_today":        trades_today_db,
         "open_positions":      count_open_positions(settings.prime_db_path),
         "execution_valid":     execution_valid,
         "alpaca_reachable":    alpaca_ok,
@@ -506,6 +647,10 @@ def health() -> JSONResponse:
         "uptime_since":        app_state["start_time"],
         "auto_execute":        app_state.get("auto_execute", False),
         "mode":                app_state.get("mode", "dry_run"),
+        # P0-A: Stale deploy detection
+        "state_restored":      _STATE_RESTORED_P,
+        "code_hash":           _CODE_HASH,
+        "stale_deploy":        (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
     })
 
 
@@ -531,6 +676,13 @@ def execute(
         JSON with execution result and position details.
     """
     verify_secret(x_nexus_prime_secret)
+
+    # Block 2: STANDBY gate — reject execution while preflight is retrying
+    if _SERVICE_MODE == "standby":
+        return JSONResponse(
+            status_code=503,
+            content={"executed": False, "reason": f"Service in STANDBY: {_standby_reason}"},
+        )
 
     # Market hours gate — never submit orders outside 9:30 AM – 4:00 PM ET.
     # Prevents after-hours order submission caused by service restarts, stale
@@ -688,8 +840,31 @@ def execute(
             pass
         return JSONResponse(content={"executed": False, "mode": "dry_run", "order_preview": order_preview})
 
+    # Block 4: Pre-submission order existence check
+    # Check Alpaca directly before submitting — prevents duplicate equity orders
+    # after restart or OMNI retry on the same window.
+    _prime_coid = f"nexus-prime-{body.ticker}-{body.verdict[:4] if body.verdict else 'go'}"
+    _prime_coid = _prime_coid[:48].replace(" ", "-")
+    _existing_prime_order = alpaca.get_order_by_client_id(_prime_coid)
+    if _existing_prime_order is not None:
+        _ep_status = _existing_prime_order.get("status", "unknown")
+        if _ep_status not in ("cancelled", "expired", "rejected"):
+            logger.info(
+                "Block 4: Prime order already exists for %s (status=%s) — skipping",
+                body.ticker, _ep_status,
+            )
+            if pending_id:
+                alpaca_order_id = _existing_prime_order.get("id")
+                confirm_pending_position(settings.prime_db_path, pending_id, alpaca_order_id)
+            return JSONResponse(content={
+                "executed": False,
+                "status": "recovered",
+                "reason": f"order_already_exists_on_alpaca: {_ep_status}",
+                "ticker": body.ticker,
+            })
+
     try:
-        order           = alpaca.place_order(body.ticker, shares, side)
+        order           = alpaca.place_order(body.ticker, shares, side, client_order_id=_prime_coid)
         alpaca_order_id = order.get("id")
         logger.info(
             "Prime order placed: %s %s %.0f shares @ ~$%.2f | order_id=%s",
@@ -962,6 +1137,7 @@ def resume_execution(x_nexus_prime_secret: str = Header(default="")) -> JSONResp
     with _state_lock:
         was_paused = app_state.get("execution_paused", False)
         app_state["execution_paused"] = False
+        _svc_state.write("execution_paused", False)  # GAP-002
     logger.info("Execution resumed via /resume (was_paused=%s)", was_paused)
     return JSONResponse({"resumed": True, "was_paused": was_paused})
 
@@ -1009,11 +1185,13 @@ def sovereign_directive(
     elif d == "HALT":
         with _state_lock:
             app_state["execution_paused"] = True
+            _svc_state.write("execution_paused", True)  # GAP-002
         report("prime_execution", "ack", {"directive": "HALT", "status": "applied", "paused": True})
         return JSONResponse({"ok": True, "directive": "HALT", "paused": True})
     elif d == "RESUME":
         with _state_lock:
             app_state["execution_paused"] = False
+            _svc_state.write("execution_paused", False)  # GAP-002
         report("prime_execution", "ack", {"directive": "RESUME", "status": "applied", "paused": False})
         return JSONResponse({"ok": True, "directive": "RESUME", "paused": False})
     elif d in ("FLUSH", "RESET_DAY"):

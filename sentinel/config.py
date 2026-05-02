@@ -81,3 +81,6 @@ OMNI_URL        = os.environ.get("OMNI_URL",       "http://localhost:8004")
 ALPHA_EXEC_URL  = os.environ.get("ALPHA_EXEC_URL", "http://localhost:8005")
 PRIME_EXEC_URL  = os.environ.get("PRIME_EXEC_URL", "http://localhost:8006")
 SENTINEL_LOG    = "/Users/ahmedsadek/nexus/logs/sentinel/sentinel.log"
+
+# ── Operational Mode ─────────────────────────────────────────────────────────────
+OBSERVE_ONLY    = False   # When True: checks run but healer skips restarts

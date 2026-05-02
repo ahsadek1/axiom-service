@@ -88,7 +88,7 @@ def get_macro_data(timeout: float = 5.0) -> Optional[Dict[str, Any]]:
     """
     try:
         resp = requests.get(
-            f"{_base_url()}/oracle/engine/macro",
+            f"{_base_url()}/oracle/macro",
             headers=_headers(),
             timeout=timeout,
         )

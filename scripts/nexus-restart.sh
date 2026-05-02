@@ -21,12 +21,33 @@ if [ -n "$1" ]; then
     echo "Restarting $label..."
     launchctl kickstart -k "gui/${UID_VAL}/${label}" 2>/dev/null && echo "  Done." || echo "  Failed — is $label loaded?"
 else
-    # Restart all
+    # Restart all — Oracle must be warm before Axiom starts (P1-A fix 2026-05-01)
     echo "Restarting all Nexus services..."
     for label in "${ALL_SERVICES[@]}"; do
         echo "  → $label"
         launchctl kickstart -k "gui/${UID_VAL}/${label}" 2>/dev/null || echo "    (not loaded — trying start)"
-        sleep 2
+
+        # After Oracle: wait until cache is warm (>=20 tickers) before launching Axiom
+        # Prevents VIX_ONLY_FALLBACK race condition on restart
+        if [ "$label" = "ai.nexus.oracle" ]; then
+            echo "  ⏳ Waiting for Oracle cache to warm (target: >=20 tickers)..."
+            WARM=0
+            for i in $(seq 1 30); do
+                sleep 2
+                WARM_COUNT=$(curl -s --connect-timeout 3 http://localhost:8007/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('cache_warm_tickers',0))" 2>/dev/null || echo 0)
+                echo "    Oracle warm tickers: ${WARM_COUNT}"
+                if [ "${WARM_COUNT}" -ge 20 ] 2>/dev/null; then
+                    echo "  ✅ Oracle warm (${WARM_COUNT} tickers) — proceeding to Axiom"
+                    WARM=1
+                    break
+                fi
+            done
+            if [ "$WARM" -eq 0 ]; then
+                echo "  ⚠️  Oracle warm timeout after 60s — starting Axiom anyway (VIX-only fallback active)"
+            fi
+        else
+            sleep 2
+        fi
     done
     echo ""
     echo "Waiting 5s for services to come up..."

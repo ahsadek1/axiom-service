@@ -60,28 +60,37 @@ def polygon_get_snapshot(ticker: str, api_key: str) -> Optional[dict]:
 
 def polygon_get_iv_rank(ticker: str, api_key: str) -> Optional[float]:
     """
-    Fetch IV rank for a ticker from Polygon options summary.
+    Fetch IV rank percentile (rip) from ORATS summaries API.
+
+    ORATS `rip` = IV rank percentile (0-100). This is the same source
+    Oracle/scorer uses — ensures Tier 2 filter and scorer agree on IVR.
+
+    Previously used Polygon implied_volatility * 100 which is NOT IV rank
+    and caused the filter to pass low-IVR tickers that the scorer rejected.
 
     Args:
         ticker:  Stock ticker symbol.
-        api_key: Polygon.io API key.
+        api_key: Unused (kept for signature compatibility). Uses ORATS key.
 
     Returns:
-        IV rank as float 0-100, or None if unavailable.
+        IV rank percentile as float 0-100, or None if unavailable.
     """
     try:
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
-        resp = requests.get(url, params={"apiKey": api_key, "limit": 1}, timeout=8)
+        ORATS_TOKEN = "4476e955-241a-4540-b114-ebbf1a3a3b87"
+        resp = requests.get(
+            "https://api.orats.io/datav2/summaries",
+            params={"token": ORATS_TOKEN, "ticker": ticker},
+            timeout=8,
+        )
         resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        if results:
-            iv = results[0].get("implied_volatility")
-            if iv:
-                return float(iv) * 100
+        rows = resp.json().get("data", [])
+        if rows:
+            rip = rows[0].get("rip")
+            if rip is not None:
+                return float(rip)
         return None
     except Exception as e:
-        logger.debug("Polygon IV rank unavailable for %s: %s", ticker, e)
+        logger.debug("ORATS IV rank unavailable for %s: %s", ticker, e)
         return None
 
 

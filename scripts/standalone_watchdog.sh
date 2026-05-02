@@ -52,11 +52,25 @@ send_alert() {
   echo "[watchdog] ALERT SENT: $msg" >> "$LOG"
 }
 
+NEXUS_SECRET="62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2"
+
 check_service() {
   local name="$1"
   local url="$2"
   local timeout="${3:-4}"
   if curl -sf --max-time "$timeout" "$url" > /dev/null 2>&1; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Auth-aware check for services that require X-Nexus-Secret on /health
+check_service_auth() {
+  local name="$1"
+  local url="$2"
+  local timeout="${3:-4}"
+  if curl -sf --max-time "$timeout" -H "X-Nexus-Secret: $NEXUS_SECRET" "$url" > /dev/null 2>&1; then
     return 0
   else
     return 1
@@ -70,10 +84,21 @@ run_watchdog() {
 
   # 1. Critical V1 services
   # Check critical services
-  local svc_names=("Alpha-Exec" "Prime-Exec" "OMNI" "Guardian" "Oracle" "Axiom")
-  local svc_urls=("http://localhost:8005/health" "http://localhost:8006/health" "http://localhost:8004/health" "http://localhost:8009/health" "http://localhost:8007/ping" "http://localhost:8001/health")
+  # Services requiring auth header — use check_service_auth
+  local auth_svc_names=("Alpha-Exec" "Prime-Exec" "Axiom")
+  local auth_svc_urls=("http://localhost:8005/health" "http://localhost:8006/health" "http://localhost:8001/health")
 
   local i
+  for i in "${!auth_svc_names[@]}"; do
+    if ! check_service_auth "${auth_svc_names[$i]}" "${auth_svc_urls[$i]}"; then
+      issues+=("${auth_svc_names[$i]} DOWN")
+    fi
+  done
+
+  # Services with unauthenticated health/ping endpoints
+  local svc_names=("OMNI" "Oracle")
+  local svc_urls=("http://localhost:8004/health" "http://localhost:8007/ping")
+
   for i in "${!svc_names[@]}"; do
     if ! check_service "${svc_names[$i]}" "${svc_urls[$i]}"; then
       issues+=("${svc_names[$i]} DOWN")
