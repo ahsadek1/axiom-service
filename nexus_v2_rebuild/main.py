@@ -39,12 +39,21 @@ logging.basicConfig(
 logger = logging.getLogger("nexus.main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
+
+def _require(var: str) -> str:
+    """Raise at startup if env var missing — never silently use a stale fallback."""
+    val = os.environ.get(var)
+    if not val:
+        raise RuntimeError(f"{var} is required but not set. Source .deploy-secrets before running.")
+    return val
+
 DB_PATH       = os.environ.get("NEXUS_DB_PATH", "/Users/ahmedsadek/nexus/data/nexus_v2.db")
-AXIOM_URL     = os.environ.get("AXIOM_URL", "http://localhost:8001")
-NEXUS_SECRET  = os.environ.get("NEXUS_SECRET", "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2")
-OMNI_BOT      = os.environ.get("OMNI_BOT_TOKEN", "7973500599:AAHJuh_c-RN2xv-_WYVl7ev1mwF-IvqislE")
-AHMED_CHAT    = "8573754783"
-HEALTH_GROUP  = "-1003954790884"
+AXIOM_URL     = os.environ.get("AXIOM_URL",    "http://localhost:8001")
+OMNI_URL      = os.environ.get("OMNI_URL",     "http://localhost:8004")  # Railway: set to Railway OMNI URL
+NEXUS_SECRET  = _require("NEXUS_SECRET")
+OMNI_BOT      = _require("TELEGRAM_BOT_TOKEN")
+AHMED_CHAT    = os.environ.get("AHMED_CHAT_ID", "8573754783")
+HEALTH_GROUP  = os.environ.get("TELEGRAM_HEALTH_GROUP_CHAT_ID", "-1003954790884")
 VERSION       = "2.0.0"
 
 # ── Global state ──────────────────────────────────────────────────────────────
@@ -84,7 +93,7 @@ def omni_dispatch(ticker, ctx, axiom, score_result) -> None:
     """Send pick to OMNI synthesis endpoint."""
     try:
         r = requests.post(
-            "http://localhost:8004/synthesize",
+            f"{OMNI_URL}/synthesize",
             headers={"Content-Type": "application/json",
                      "X-Nexus-Secret": NEXUS_SECRET},
             json={

@@ -131,10 +131,12 @@ def _check_score_distribution(window_id: str) -> None:
         logger.critical("SCORE_UNIFORM: %s", msg)
         try:
             import requests as _req
-            OMNI_BOT = "7973500599:AAHJuh_c-RN2xv-_WYVl7ev1mwF-IvqislE"
+            _bot = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            if not _bot:
+                logger.error("SCORE_UNIFORM Telegram alert skipped: TELEGRAM_BOT_TOKEN not set")
             for chat_id in ["8573754783", "-1003954790884"]:
                 _req.post(
-                    f"https://api.telegram.org/bot{OMNI_BOT}/sendMessage",
+                    f"https://api.telegram.org/bot{_bot}/sendMessage",
                     json={"chat_id": chat_id, "text": msg},
                     timeout=5,
                 )
@@ -419,14 +421,26 @@ class TradeOutcomeRequest(BaseModel):
 def health() -> JSONResponse:
     """Health check. Always returns 200. No auth required."""
     cb = get_circuit_breaker_state(settings.alpha_db_path)
+    # shared/resilience HealthReport — standard surface for VECTOR + monitoring
+    try:
+        import sys as _sys_h, os as _os_h
+        _sys_h.path.insert(0, _os_h.path.join(_os_h.path.dirname(__file__), ".."))
+        from shared.resilience.health import HealthReport
+        _hr = HealthReport(agent="alpha-buffer", version="3.0.0")
+        _hr.add_source("circuit_breaker", ok=(cb.get("status") not in ("RED", "STOP")))
+        _hr.add_source("db", ok=_os_h.path.exists(settings.alpha_db_path))
+        _resilience = _hr.to_dict()
+    except Exception as _he:
+        _resilience = {"error": str(_he)}
     return JSONResponse({
-        "status":      "healthy",
-        "service":     "alpha-buffer",
-        "version":     "3.0.0",
-        "cb_status":   cb.get("status", "UNKNOWN"),
-        "uptime_since": app_state["start_time"],
-        "code_hash":    _CODE_HASH,
-        "stale_deploy": (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
+        "status":           "healthy",
+        "service":          "alpha-buffer",
+        "version":          "3.0.0",
+        "cb_status":        cb.get("status", "UNKNOWN"),
+        "uptime_since":     app_state["start_time"],
+        "code_hash":        _CODE_HASH,
+        "stale_deploy":     (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
+        "resilience_status": _resilience,
     })
 
 

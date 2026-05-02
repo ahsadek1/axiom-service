@@ -12,6 +12,7 @@ Authored: 2026-05-02 | Cipher spec + OMNI adversarial review
 from __future__ import annotations
 import json
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass

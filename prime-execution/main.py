@@ -482,10 +482,12 @@ async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
         replace_existing=True,
     )
 
-    # Reconciler every 30 min during market hours
+    # Reconciler every 4 hours during market hours — swing trades need time to develop.
+    # 30-min was forcing premature exits on multi-hour swing positions (OMNI gap 7 fix).
+    # Approved: Ahmed Sadek 2026-05-02. Next review: after first clean trading week.
     scheduler.add_job(
         func    = lambda: _run_reconciler(),
-        trigger = CronTrigger(hour="9-15", minute="0,30", timezone=ET),
+        trigger = CronTrigger(hour="9,13", minute="30", timezone=ET),
         id      = "prime_reconciler",
         replace_existing=True,
     )
@@ -634,6 +636,19 @@ def health() -> JSONResponse:
     with _state_lock:
         app_state["trades_today"] = trades_today_db
     execution_valid = alpaca_ok and not app_state.get("execution_paused", False)
+    # shared/resilience HealthReport — standard surface for VECTOR + monitoring
+    try:
+        import sys as _sys_hr, os as _os_hr
+        _sys_hr.path.insert(0, _os_hr.path.join(_os_hr.path.dirname(__file__), ".."))
+        from shared.resilience.health import HealthReport
+        _hr = HealthReport(agent="prime-execution", version="3.0.0")
+        _hr.add_source("alpaca", ok=alpaca_ok)
+        _hr.add_source("db", ok=_os_hr.path.exists(settings.prime_db_path))
+        if not execution_valid:
+            _hr.add_source("execution", ok=False, error="paused or alpaca unreachable")
+        _resilience = _hr.to_dict()
+    except Exception as _he:
+        _resilience = {"error": str(_he)}
     return JSONResponse({
         "status":              "standby" if _SERVICE_MODE == "standby" else ("healthy" if execution_valid else "degraded"),
         "service":             "prime-execution",
@@ -647,10 +662,10 @@ def health() -> JSONResponse:
         "uptime_since":        app_state["start_time"],
         "auto_execute":        app_state.get("auto_execute", False),
         "mode":                app_state.get("mode", "dry_run"),
-        # P0-A: Stale deploy detection
         "state_restored":      _STATE_RESTORED_P,
         "code_hash":           _CODE_HASH,
         "stale_deploy":        (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
+        "resilience_status":   _resilience,
     })
 
 

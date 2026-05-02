@@ -15,6 +15,7 @@ import hashlib as _hashlib
 import logging
 import os
 import os as _os
+import re as _re
 import secrets
 import sys
 import threading
@@ -172,6 +173,12 @@ _SKIPPED_TICKER_TTL_S  = 1800   # GAP-2: 30 minutes
 
 # GAP-6: Per-ticker locks — prevent exit_monitor/execute race condition on same position
 _ticker_locks: dict = {}          # ticker → threading.Lock
+
+# PROBE-2 P1-2: window_id format contract.
+# Valid formats: alphanumeric + hyphens/underscores/colons, 4–80 chars.
+# CANARY uses 'CANARY-...' — safe. DLQ suffix adds '-dlq', '-wr' — safe.
+# Rejects empty, whitespace-only, or structurally malformed IDs at entry.
+_WINDOW_ID_RE = _re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-_:]{2,78}[A-Za-z0-9]$|^[A-Za-z0-9]{4,80}$')
 _ticker_locks_mutex = threading.Lock()  # guards the dict itself
 
 
@@ -935,6 +942,19 @@ def health() -> JSONResponse:
         app_state["trades_today"] = trades_today_db
 
     execution_valid = alpaca_ok and not app_state.get("execution_paused", False) and not vix_brake_full
+    # shared/resilience HealthReport — standard surface for VECTOR + monitoring
+    try:
+        from shared.resilience.health import HealthReport
+        _hr = HealthReport(agent="alpha-execution", version="3.0.0")
+        _hr.add_source("alpaca", ok=alpaca_ok)
+        _hr.add_source("db", ok=os.path.exists(settings.alpha_db_path))
+        if vix_brake_full:
+            _hr.suspend(f"VIX brake FULL at {current_vix}")
+        elif not alpaca_ok:
+            _hr.add_source("alpaca", ok=False, error="unreachable")
+        _resilience = _hr.to_dict()
+    except Exception as _he:
+        _resilience = {"error": str(_he)}
     return JSONResponse({
         "status":             "healthy" if execution_valid else "degraded",
         "service":            "alpha-execution",
@@ -947,8 +967,8 @@ def health() -> JSONResponse:
         "alpaca_reachable":   alpaca_ok,
         "execution_paused":      app_state.get("execution_paused", False),
         "first_exec_failed":     app_state.get("first_exec_failed", False),
-        "skipped_tickers":       list(_skipped_tickers.keys()),  # GAP-2: TTL dict, show active keys
-        "ticker_fail_counts":    dict(_ticker_fail_counts),  # GAP-CB: consecutive failures per ticker
+        "skipped_tickers":       list(_skipped_tickers.keys()),
+        "ticker_fail_counts":    dict(_ticker_fail_counts),
         "circuit_breaker_threshold": _TICKER_FAIL_THRESHOLD,
         "vix":                   current_vix,
         "vix_brake":          vix_brake_status,
@@ -958,10 +978,10 @@ def health() -> JSONResponse:
         "max_new_per_day":    MAX_NEW_PER_DAY,
         "auto_execute":       app_state.get("auto_execute", False),
         "mode":               app_state.get("mode", "dry_run"),
-        # P0-A: Stale deploy detection
         "state_restored":     _STATE_RESTORED,
         "code_hash":          _CODE_HASH,
         "stale_deploy":       (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
+        "resilience_status":  _resilience,
     })
 
 
@@ -1065,6 +1085,22 @@ def execute(
         _trace_hop(_ps_trace_id, "execution_received", "alpha-execution", body.ticker, "alpha")
     except Exception:
         pass
+
+    # PROBE-2 P1-2: window_id format validation — explicit regex before any DB/Alpaca call.
+    # Rejects malformed IDs early. Fragile substring match is no longer the only guard.
+    if _window_id != "unknown" and not _WINDOW_ID_RE.match(_window_id):
+        logger.warning(
+            "Alpha execution BLOCKED: window_id='%s' fails format contract for %s",
+            _window_id, body.ticker,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "executed": False,
+                "reason":   f"window_id='{_window_id}' fails format contract (expected alphanumeric/hyphens/underscores/colons, 4-80 chars)",
+                "gate":     "window_id_format_guard",
+            },
+        )
 
     # Test window guard — test entries must NEVER touch the production position table.
     # Any window_id containing 'test' (case-insensitive) is rejected immediately,
@@ -1309,7 +1345,15 @@ def execute(
         )
 
     # ── AUTO_EXECUTE Gate — dry-run if kill-switch is off ──────────────────────
+    # CONTRACT-1 fix: caller auto_execute=True is informational only.
+    # Env var NEXUS_AUTO_EXECUTE is always authoritative. Log any mismatch explicitly.
     if not app_state.get("auto_execute", False):
+        if getattr(body, "auto_execute", None) is True:
+            logger.warning(
+                "CONTRACT-1: caller sent auto_execute=True but NEXUS_AUTO_EXECUTE=false -- "
+                "DRY_RUN for %s %s. Set NEXUS_AUTO_EXECUTE=true for live execution.",
+                body.ticker, body.direction,
+            )
         order_preview = {
             "ticker":           body.ticker,
             "direction":        body.direction,
