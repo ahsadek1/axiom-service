@@ -320,10 +320,8 @@ class TestPlaceSpreadOrderIdempotency:
              patch("main.AlpacaClient", return_value=mock_alpaca), \
              patch("main.resolve_available_contract", return_value=_mock_spread), \
              patch("shared.order_reconciler.OrderReconciler.confirm_fill", return_value=mock_fill), \
-             patch("requests.post"), \
-             patch("requests.get", side_effect=Exception("mocked - no network in tests")), \
              patch("main._get_current_vix", return_value=15.0), \
-             patch("main._check_vix_brake", return_value=None):
+             patch("main._check_vix_brake", return_value=None):  # Note: NOT patching requests.post/get - _FakeAlpaca handles Alpaca calls
             from fastapi.testclient import TestClient
             with patch("main._preflight_check", return_value=(True, "")), \
                  patch("main._run_preflight_retry_loop"), \
@@ -400,6 +398,7 @@ class TestPostConfirmPositionCheck:
         mock_alpaca = MagicMock()
         mock_alpaca.get_latest_price.return_value = 200.0
         mock_alpaca.place_spread_order.return_value = {"id": "order-phantom-001", "status": "accepted"}
+        mock_alpaca.get_order_by_client_id.return_value = None  # block4: no pre-existing order
         mock_alpaca.get_option_contracts.return_value = [
             {"strike_price": "170"}, {"strike_price": "180"},
             {"strike_price": "190"}, {"strike_price": "200"},
@@ -423,10 +422,8 @@ class TestPostConfirmPositionCheck:
              patch("main.AlpacaClient", return_value=mock_alpaca), \
              patch("main.resolve_available_contract", return_value=_mock_spread), \
              patch("shared.order_reconciler.OrderReconciler.confirm_fill", return_value=mock_fill), \
-             patch("requests.post"), \
-             patch("requests.get", side_effect=Exception("mocked - no network in tests")), \
              patch("main._get_current_vix", return_value=15.0), \
-             patch("main._check_vix_brake", return_value=None):
+             patch("main._check_vix_brake", return_value=None):  # Note: NOT patching requests.post/get - _FakeAlpaca handles Alpaca calls
             from fastapi.testclient import TestClient
             with patch("main._preflight_check", return_value=(True, "")), \
                  patch("main._run_preflight_retry_loop"), \
@@ -470,6 +467,7 @@ class TestPostConfirmPositionCheck:
         mock_alpaca = MagicMock()
         mock_alpaca.get_latest_price.return_value = 200.0
         mock_alpaca.place_spread_order.return_value = {"id": "order-valid-001", "status": "accepted"}
+        mock_alpaca.get_order_by_client_id.return_value = None  # block4: no pre-existing order
         mock_alpaca.get_option_contracts.return_value = [
             {"strike_price": "170"}, {"strike_price": "180"},
             {"strike_price": "190"}, {"strike_price": "200"},
@@ -493,10 +491,8 @@ class TestPostConfirmPositionCheck:
              patch("main.AlpacaClient", return_value=mock_alpaca), \
              patch("main.resolve_available_contract", return_value=_mock_spread), \
              patch("shared.order_reconciler.OrderReconciler.confirm_fill", return_value=mock_fill), \
-             patch("requests.post"), \
-             patch("requests.get", side_effect=Exception("mocked - no network in tests")), \
              patch("main._get_current_vix", return_value=15.0), \
-             patch("main._check_vix_brake", return_value=None):
+             patch("main._check_vix_brake", return_value=None):  # Note: NOT patching requests.post/get - _FakeAlpaca handles Alpaca calls
             from fastapi.testclient import TestClient
             with patch("main._preflight_check", return_value=(True, "")), \
                  patch("main._run_preflight_retry_loop"), \
@@ -536,6 +532,7 @@ class TestPostConfirmPositionCheck:
         mock_alpaca = MagicMock()
         mock_alpaca.get_latest_price.return_value = 200.0
         mock_alpaca.place_spread_order.return_value = {"id": "order-down-001", "status": "accepted"}
+        mock_alpaca.get_order_by_client_id.return_value = None  # block4: no pre-existing order
         mock_alpaca.get_option_contracts.return_value = [
             {"strike_price": "170"}, {"strike_price": "180"},
             {"strike_price": "190"}, {"strike_price": "200"},
@@ -559,10 +556,8 @@ class TestPostConfirmPositionCheck:
              patch("main.AlpacaClient", return_value=mock_alpaca), \
              patch("main.resolve_available_contract", return_value=_mock_spread), \
              patch("shared.order_reconciler.OrderReconciler.confirm_fill", return_value=mock_fill), \
-             patch("requests.post"), \
-             patch("requests.get", side_effect=Exception("mocked - no network in tests")), \
              patch("main._get_current_vix", return_value=15.0), \
-             patch("main._check_vix_brake", return_value=None):
+             patch("main._check_vix_brake", return_value=None):  # Note: NOT patching requests.post/get - _FakeAlpaca handles Alpaca calls
             from fastapi.testclient import TestClient
             with patch("main._preflight_check", return_value=(True, "")), \
                  patch("main._run_preflight_retry_loop"), \
