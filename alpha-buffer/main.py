@@ -523,6 +523,35 @@ def submit_pick(
     except Exception:
         pass  # fail-open: direction collision check is advisory, not blocking
 
+    # C-01: Validate ticker is in Axiom universe (non-blocking — fail open if Axiom slow/down)
+    try:
+        import httpx as _hx
+        _axiom_url = getattr(settings, "axiom_url", "http://localhost:8001")
+        _axiom_secret = getattr(settings, "axiom_secret", "")
+        _pool_resp = _hx.get(
+            f"{_axiom_url}/universe",
+            headers={"X-Axiom-Secret": _axiom_secret},
+            timeout=2.0,
+        )
+        if _pool_resp.status_code == 200:
+            _universe = _pool_resp.json().get("tickers", [])
+            if _universe and body.ticker not in _universe:
+                logger.warning(
+                    "C-01: Ticker %s rejected — not in Axiom universe (%d tickers)",
+                    body.ticker, len(_universe),
+                )
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "accepted": False,
+                        "reason":   "ticker_not_in_axiom_universe",
+                        "ticker":   body.ticker,
+                    },
+                )
+    except Exception as _ae:
+        # Fail open — do not block valid signals because Axiom is slow or unreachable
+        logger.debug("C-01: Axiom universe check skipped (%s) — proceeding", _ae)
+
     # Daily dedup gate — one submission per agent+ticker+direction per day.
     # Prevents the same agent flooding concordance with identical picks across windows.
     # Sage fix (Apr 14): Sage produced 106 picks / 14 windows = same tickers 7x.

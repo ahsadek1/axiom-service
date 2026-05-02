@@ -354,14 +354,48 @@ def _check_canary_gate() -> Optional[str]:
 
 def _process_dlq_cycle() -> None:
     """
-    GAP-003 stub: Process execution DLQ — retry failed trades with backoff.
+    H-19: Process execution DLQ — retry failed trades with backoff.
 
-    Placeholder implemented 2026-04-29 to stop NameError in _trade_blocker_watchdog.
-    Full implementation requires spec approval per BUILD PIPELINE protocol.
-    The conditional_queue table in omni.db holds deferred trades pending implementation.
+    Wires execution_dlq.process_dlq() to the alpha-execution /execute route.
+    Also checks for SLA breach (pending entry > 30 min) and alerts SOVEREIGN.
     """
-    # TODO: Implement full DLQ processing per GAP-003 spec (pending spec approval)
-    pass
+    try:
+        from execution_dlq import process_dlq, get_dlq_stats
+        from execution_router import route_execution
+
+        def _route_fn(payload: dict) -> tuple[bool, str | None]:
+            """Route a DLQ retry through the execution router."""
+            try:
+                return route_execution(payload)
+            except Exception as _re:
+                return False, str(_re)
+
+        process_dlq(_route_fn)
+
+        # H-19: SLA alert — if any entry pending > 30 min, alert SOVEREIGN
+        stats = get_dlq_stats()
+        pending = stats.get("pending", 0)
+        if pending > 0:
+            logger.warning("H-19: DLQ has %d pending entries", pending)
+            # Check for SLA breach (pending > 30 min)
+            try:
+                import sqlite3 as _sq
+                from execution_dlq import DLQ_DB_PATH
+                from datetime import datetime, timezone, timedelta
+                with _sq.connect(DLQ_DB_PATH) as _conn:
+                    _conn.row_factory = _sq.Row
+                    _breach = _conn.execute("""
+                        SELECT COUNT(*) as cnt FROM execution_dlq
+                        WHERE status = 'pending'
+                        AND created_at <= ?
+                    """, ((datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),)).fetchone()
+                    if _breach and _breach["cnt"] > 0:
+                        _sov(f"⚠️ H-19 DLQ SLA BREACH: {_breach['cnt']} entries pending > 30 min. "
+                             f"Immediate investigation required.")
+            except Exception as _sla_e:
+                logger.warning("H-19: SLA check failed: %s", _sla_e)
+    except Exception as e:
+        logger.warning("DLQ cycle error: %s", e)
 
 
 def _trade_blocker_watchdog() -> None:
