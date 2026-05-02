@@ -293,6 +293,12 @@ def resolve_available_contract(
         if float(c.get("strike_price", 0)) > 0
     )
 
+    if not available_strikes:
+        raise ValueError(
+            f"No valid strikes in options chain for {ticker} {option_type} on {expiry} "
+            f"— chain returned {len(contracts)} contract(s) with no usable strike prices"
+        )
+
     def snap(target: float) -> float:
         return min(available_strikes, key=lambda s: abs(s - target))
 
