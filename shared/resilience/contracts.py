@@ -146,8 +146,19 @@ def require_int(
     # Reject floats with a fractional part — they are not integers.
     if isinstance(value, float) and not value.is_integer():
         raise DataContractError(source, field, "not an integer", raw=value)
+    # C8: handle float strings like "21.0" from real APIs (ORATS, Polygon).
+    # int("21.0") raises ValueError — route through float() first for dot-strings,
+    # but reject fractional values like "21.5" (not a valid integer).
     try:
-        v = int(value)
+        if isinstance(value, str) and "." in value:
+            as_float = float(value)
+            if not as_float.is_integer():
+                raise DataContractError(source, field, "not an integer", raw=value)
+            v = int(as_float)
+        else:
+            v = int(value)
+    except DataContractError:
+        raise
     except (TypeError, ValueError):
         raise DataContractError(source, field, "not an integer", raw=value)
     if min_val is not None and v < min_val:

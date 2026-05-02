@@ -22,7 +22,7 @@ Usage:
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Generic, Optional, TypeVar
 
 T = TypeVar("T")
@@ -64,7 +64,7 @@ class FreshValue(Generic[T]):
 
     def __init__(self, value: T, max_age: timedelta, label: str) -> None:
         self._value: T = value
-        self._updated_at: datetime = datetime.utcnow()
+        self._updated_at: datetime = datetime.now(timezone.utc)
         self._max_age: timedelta = max_age
         self._label: str = label
         self._lock = threading.Lock()
@@ -73,7 +73,7 @@ class FreshValue(Generic[T]):
         """Atomically replace value and reset the freshness clock."""
         with self._lock:
             self._value = new_value
-            self._updated_at = datetime.utcnow()
+            self._updated_at = datetime.now(timezone.utc)
 
     def get(self) -> Optional[T]:
         """
@@ -81,7 +81,7 @@ class FreshValue(Generic[T]):
         Never raises. Use for scan-skip decisions.
         """
         with self._lock:
-            if (datetime.utcnow() - self._updated_at) > self._max_age:
+            if (datetime.now(timezone.utc) - self._updated_at) > self._max_age:
                 return None
             return self._value
 
@@ -91,7 +91,7 @@ class FreshValue(Generic[T]):
         Use in execution gates where stale data must hard-stop the flow.
         """
         with self._lock:
-            age = datetime.utcnow() - self._updated_at
+            age = datetime.now(timezone.utc) - self._updated_at
             if age > self._max_age:
                 raise StaleStateError(
                     self._label,
@@ -104,13 +104,13 @@ class FreshValue(Generic[T]):
     def age_seconds(self) -> int:
         """Seconds since last update. Useful for health endpoint reporting."""
         with self._lock:
-            return int((datetime.utcnow() - self._updated_at).total_seconds())
+            return int((datetime.now(timezone.utc) - self._updated_at).total_seconds())
 
     @property
     def is_fresh(self) -> bool:
         """True if the value is within its TTL."""
         with self._lock:
-            return (datetime.utcnow() - self._updated_at) <= self._max_age
+            return (datetime.now(timezone.utc) - self._updated_at) <= self._max_age
 
     @property
     def label(self) -> str:

@@ -24,6 +24,8 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from datetime import datetime
 from typing import Callable, Optional
@@ -85,11 +87,22 @@ def build_scanner(
 
     async def _wrapped() -> None:
         try:
-            result = await scan_fn(*(fn_args or []), **(fn_kwargs or {}))
+            # C4 fix: handle both async and sync scan functions.
+            # A sync scan_fn passed to 'await' raises TypeError inside the
+            # exception handler and gets silently logged as a crash.
+            if inspect.iscoroutinefunction(scan_fn):
+                result = await scan_fn(*(fn_args or []), **(fn_kwargs or {}))
+            else:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: scan_fn(*(fn_args or []), **(fn_kwargs or {}))
+                )
 
-            # Update health report
+            # Update health report.
+            # C6 fix: use result.pool_size if set by scan_fn (authoritative).
+            # Fall back to verdicts+skips only if scan_fn didn't set pool_size
+            # (backward compat — avoids undercounting pre-loop filtered tickers).
             health.last_cycle = datetime.utcnow()
-            pool_size = len(result.verdicts) + result.total_skips
+            pool_size = result.pool_size if result.pool_size > 0 else (len(result.verdicts) + result.total_skips)
             health.last_skip_rate = result.skip_rate(pool_size)
 
             logger.info(

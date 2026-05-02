@@ -5,7 +5,7 @@ DB Decision: Option A (Ahmed Sadek, 2026-05-02)
 
 TABLE OWNERSHIP — NON-NEGOTIABLE:
   begin_immediate → execution tables ONLY:
-      active_positions, capital_ledger, processed_picks, trade_log
+      active_positions, capital_ledger, processed_picks
   service_state.py (WAL + threading.Lock) → state/history tables:
       agent_state, daily_metrics, scan_windows, regime_history
   The rule: money movement → begin_immediate. State/history → service_state.py.
@@ -29,11 +29,12 @@ from typing import Generator, Optional
 # ---------------------------------------------------------------------------
 
 # C3 fix — SQL injection guard: only these tables are allowed in idempotent_insert
+# Note: trade_log is NOT in this list — it does not exist in the current schema.
+# Add it here only after the CREATE TABLE migration has been applied.
 _ALLOWED_TABLES = frozenset({
     "active_positions",
     "capital_ledger",
     "processed_picks",
-    "trade_log",
 })
 
 
@@ -57,7 +58,7 @@ def begin_immediate(
     read transaction on the same file.
 
     Use for ALL writes to execution tables:
-        active_positions, capital_ledger, processed_picks, trade_log
+        active_positions, capital_ledger, processed_picks
 
     Do NOT use on tables owned by service_state.py.
 
@@ -116,6 +117,7 @@ def idempotent_insert(
     unique_key: str,
     unique_val: str,
     row: dict,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """
     Insert *row* into *table* only if *unique_key* = *unique_val* doesn't exist.
@@ -123,19 +125,27 @@ def idempotent_insert(
     Safe to call multiple times on the same record (e.g. after crash/restart).
     Uses begin_immediate — safe for execution tables only.
 
+    C3 fix: table name is validated against _ALLOWED_TABLES whitelist before
+    any SQL is constructed. Prevents SQL injection via dynamic table names.
+
+    C1 fix: accepts optional conn for connection reuse in scanner loops.
+
     Args:
         db_path    — absolute path to the SQLite database file
-        table      — table name (execution tables only)
+        table      — table name — MUST be in _ALLOWED_TABLES
         unique_key — column name that enforces uniqueness (must have UNIQUE constraint)
         unique_val — the unique value to check for
         row        — full row dict {column: value} to insert
+        conn       — optional existing connection (caller owns lifecycle)
 
     Returns:
         True  — row was inserted (new record)
         False — row already existed (safe replay, no-op)
 
     Raises:
-        Any non-IntegrityError exception from the DB layer.
+        ValueError              — if table not in _ALLOWED_TABLES
+        sqlite3.IntegrityError  — swallowed (duplicate = False return)
+        Any other DB exception  — re-raised
 
     Example:
         inserted = idempotent_insert(
@@ -146,11 +156,17 @@ def idempotent_insert(
         if not inserted:
             logger.info("pick %s already processed — skipping", pick_id)
     """
+    # C3: SQL injection guard
+    if table not in _ALLOWED_TABLES:
+        raise ValueError(
+            f"idempotent_insert: table '{table}' is not in the allowed list. "
+            f"Allowed: {sorted(_ALLOWED_TABLES)}"
+        )
     cols = ", ".join(row.keys())
     placeholders = ", ".join("?" for _ in row)
     try:
-        with begin_immediate(db_path) as conn:
-            conn.execute(
+        with begin_immediate(db_path, conn=conn) as c:
+            c.execute(
                 f"INSERT INTO {table} ({cols}) VALUES ({placeholders})",
                 list(row.values()),
             )
@@ -189,6 +205,7 @@ class ScanResult:
         skipped_tickers — ticker → reason for per-ticker post-mortem
     """
 
+    pool_size: int = 0           # C6: set by scan_fn before processing — authoritative pool count
     cycles: int = 0
     verdicts: list = field(default_factory=list)
     skip_reasons: dict = field(default_factory=lambda: defaultdict(int))

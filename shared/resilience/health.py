@@ -113,10 +113,12 @@ class HealthReport:
                 error=error,
             )
         )
-        # Escalate agent status — never downgrade (UNHEALTHY stays UNHEALTHY)
+        # Escalate agent status — never downgrade (UNHEALTHY stays UNHEALTHY).
+        # C5 fix: SUSPENDED is also not HEALTHY — a fallback source on a suspended
+        # service must still register DEGRADED, not silently do nothing.
         if not ok and not fallback:
             self.status = HealthStatus.UNHEALTHY
-        elif fallback and self.status == HealthStatus.HEALTHY:
+        elif fallback and self.status not in (HealthStatus.UNHEALTHY, HealthStatus.DEGRADED):
             self.status = HealthStatus.DEGRADED
 
     def suspend(self, reason: str) -> None:
