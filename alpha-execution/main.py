@@ -335,7 +335,10 @@ def _check_earnings_gate(ticker: str, expiration_date: str, polygon_key: str) ->
 
         today = _date.today()
         expiry = _date.fromisoformat(expiration_date)
-        block_until = expiry + _td(days=EARNINGS_BLOCK_DAYS)
+        # M-08 fix: block if earnings happen DURING option life (today → expiry)
+        # OR if earnings are imminent (within EARNINGS_BLOCK_DAYS from today).
+        # Old logic (expiry + BLOCK_DAYS) blocked trades for earnings AFTER expiry — nonsensical.
+        imminent_cutoff = today + _td(days=EARNINGS_BLOCK_DAYS)
 
         # Polygon earnings calendar endpoint
         url = (
@@ -367,10 +370,11 @@ def _check_earnings_gate(ticker: str, expiration_date: str, polygon_key: str) ->
                 report_date = _date.fromisoformat(report_date_str[:10])
             except ValueError:
                 continue
-            if today <= report_date <= block_until:
+            # Block if earnings fall during option life OR are imminent from today
+            if today <= report_date <= expiry or report_date <= imminent_cutoff:
                 return (
                     f"EARNINGS GATE: {ticker} has earnings on {report_date_str} "
-                    f"which is within {EARNINGS_BLOCK_DAYS} days of expiry {expiration_date}"
+                    f"(option expires {expiration_date}, imminent cutoff {imminent_cutoff})"
                 )
 
     except Exception as e:

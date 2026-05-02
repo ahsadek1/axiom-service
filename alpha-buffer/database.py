@@ -285,6 +285,46 @@ def is_already_submitted_today(
     return row is not None
 
 
+def clear_submission_for_retry(
+    db_path:   str,
+    agent:     str,
+    ticker:    str,
+    direction: str,
+    et_date:   Optional[str] = None,
+) -> int:
+    """
+    C-05 fix: Remove today dedup record so a signal can be re-evaluated after execution failure.
+
+    Called when OMNI dispatch fails — allows agents to re-submit same ticker+direction
+    in the next window rather than being permanently blocked for the day.
+
+    Returns:
+        Number of rows deleted (0 = not found, 1 = cleared).
+    """
+    from zoneinfo import ZoneInfo
+    if et_date is None:
+        et_date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    with get_conn(db_path) as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM submissions
+            WHERE agent = ?
+              AND ticker = ?
+              AND direction = ?
+              AND SUBSTR(window_id, 1, 10) = ?
+            """,
+            (agent, ticker, direction, et_date),
+        )
+        deleted = cursor.rowcount
+    if deleted:
+        logger.info(
+            "C-05: cleared dedup for %s/%s/%s — execution failed, no position opened",
+            agent, ticker, direction,
+        )
+    return deleted
+
+
 def get_all_tickers_in_window(db_path: str, window_id: str) -> list[tuple[str, str]]:
     """
     Get all (ticker, direction) pairs with submissions in a window.
@@ -497,6 +537,56 @@ def init_circuit_breaker(db_path: str) -> None:
                 (id, status, last_updated)
             VALUES (1, 'NORMAL', ?)
             """,
+            (now,),
+        )
+        # H-04: Add infra_failure_count column if missing (migration guard)
+        try:
+            conn.execute(
+                "ALTER TABLE circuit_breaker_state "
+                "ADD COLUMN infra_failure_count INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # Column already exists — normal on restarts
+
+
+def record_infra_failure(db_path: str) -> int:
+    """
+    H-04 fix: Record an infrastructure failure (timeout/422/service error) separately
+    from signal losses. Does NOT trip CB thresholds. Alerts at 3+ consecutive.
+
+    Returns:
+        Updated infra_failure_count.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE circuit_breaker_state
+            SET infra_failure_count = infra_failure_count + 1,
+                last_updated = ?
+            WHERE id = 1
+            """,
+            (now,),
+        )
+        row = conn.execute(
+            "SELECT infra_failure_count FROM circuit_breaker_state WHERE id=1"
+        ).fetchone()
+    count = row["infra_failure_count"] if row else 0
+    if count >= 3:
+        logger.warning(
+            "H-04: %d consecutive infrastructure failures — Alpaca/service may be degraded. "
+            "Circuit breaker NOT tripped (infra failures excluded from CB thresholds).",
+            count,
+        )
+    return count
+
+
+def reset_infra_failure_count(db_path: str) -> None:
+    """H-04: Reset infra failure counter on successful execution."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE circuit_breaker_state SET infra_failure_count=0, last_updated=? WHERE id=1",
             (now,),
         )
 

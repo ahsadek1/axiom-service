@@ -29,6 +29,25 @@ MAX_NEW_PER_DAY          = 10
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 ALPACA_DATA_URL  = "https://data.alpaca.markets"
 
+# ── C-11: Prime VIX Gate ─────────────────────────────────────────────────────
+VIX_PAUSE_THRESHOLD_PRIME = 35.0   # matches alpha-execution — block new positions above this
+AXIOM_URL_PRIME = os.getenv("AXIOM_URL", "http://localhost:8001")
+AXIOM_SECRET_PRIME = os.getenv("AXIOM_SECRET", "")
+
+# ── C-03: Separate Alpaca accounts — Alpha vs Prime ───────────────────────────
+# Ahmed approved 2026-05-02. Awaiting separate paper account provisioning.
+# When ready: set ALPACA_PRIME_KEY + ALPACA_PRIME_SECRET in prime-execution .env
+ALPACA_PRIME_KEY    = os.getenv("ALPACA_PRIME_KEY", os.getenv("ALPACA_API_KEY", ""))
+ALPACA_PRIME_SECRET = os.getenv("ALPACA_PRIME_SECRET", os.getenv("ALPACA_SECRET_KEY", ""))
+
+# Warn at import time if same account as alpha
+if ALPACA_PRIME_KEY and ALPACA_PRIME_KEY == os.getenv("ALPACA_API_KEY", ""):
+    import logging as _log
+    _log.getLogger("prime_exec.config").warning(
+        "C-03: PRIME ALPACA ACCOUNT NOT SEPARATED — using same account as Alpha. "
+        "Provision separate paper account and set ALPACA_PRIME_KEY + ALPACA_PRIME_SECRET."
+    )
+
 
 @dataclass(frozen=True)
 class Settings:

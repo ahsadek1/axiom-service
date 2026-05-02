@@ -740,6 +740,33 @@ def execute(
             },
         )
 
+    # ── C-11: Prime VIX Gate — block new equity positions above VIX halt threshold ──────
+    try:
+        import requests as _req_vix
+        from config import VIX_PAUSE_THRESHOLD_PRIME, AXIOM_URL_PRIME, AXIOM_SECRET_PRIME
+        _axiom_h = _req_vix.get(
+            f"{AXIOM_URL_PRIME}/health",
+            headers={"X-Axiom-Secret": AXIOM_SECRET_PRIME},
+            timeout=4,
+        ).json()
+        _vix = float(_axiom_h.get("vix", 0) or 0)
+        if _vix >= VIX_PAUSE_THRESHOLD_PRIME:
+            logger.warning(
+                "C-11: Prime VIX gate — VIX=%.1f >= %.1f, blocking new position for %s",
+                _vix, VIX_PAUSE_THRESHOLD_PRIME, body.ticker,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "executed": False,
+                    "reason":   f"prime_vix_gate: VIX={_vix:.1f} >= {VIX_PAUSE_THRESHOLD_PRIME} — new positions blocked",
+                },
+            )
+        app_state["vix_brake_prime"] = "CLEAR"
+    except Exception as _ve:
+        logger.warning("C-11: VIX check failed (%s) — proceeding (fail-open for prime)", _ve)
+        app_state.setdefault("vix_brake_prime", "UNKNOWN")
+
     # ── Reconciler pause check (read-only — no lock needed) ───────────────────
     if app_state.get("execution_paused"):
         return JSONResponse(

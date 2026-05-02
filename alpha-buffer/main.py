@@ -37,6 +37,7 @@ from circuit_breaker import (
 from database import (
     get_conn,
     is_already_submitted_today,
+    clear_submission_for_retry,
     get_all_tickers_in_window,
     get_circuit_breaker_state,
     get_concordance_result,
@@ -659,6 +660,27 @@ def submit_pick(
         concordance.pathway, concordance.weighted_score, concordance.verdict,
     )
 
+    # H-06: Reject invalid pathway before dispatch — P1/P2/P3/P4 only
+    _VALID_DISPATCH_PATHWAYS = {"P1", "P2", "P3", "P4"}
+    if concordance.pathway not in _VALID_DISPATCH_PATHWAYS:
+        logger.error(
+            "H-06: Concordance rejected — invalid pathway '%s' for %s/%s. "
+            "Valid: %s. Will NOT dispatch to OMNI.",
+            concordance.pathway, body.ticker, body.direction, _VALID_DISPATCH_PATHWAYS,
+        )
+        return JSONResponse({
+            "accepted":    True,
+            "window_id":   window_id,
+            "agent":       body.agent,
+            "ticker":      body.ticker,
+            "direction":   body.direction,
+            "score":       body.score,
+            "concordance": None,
+            "omni_dispatched": False,
+            "message": f"Submission accepted but concordance pathway '{concordance.pathway}' "
+                       f"is not dispatchable. Discarded.",
+        })
+
     # OMNI M2 fix: fire OMNI dispatch in a background thread — do NOT block /submit.
     # Under concurrent agent submissions, a slow OMNI (AI model latency) would cause
     # /submit to queue up behind the network call. The concordance is already persisted;
@@ -690,6 +712,16 @@ def submit_pick(
                 "omni_dispatched=False for retry",
                 body.ticker, body.direction, concordance.pathway,
             )
+            # C-05: Clear dedup so agents can re-submit in next window
+            # Dispatch failure = no position opened = signal should not be wasted
+            try:
+                for _agent in concordance_dict.get("agents_involved", []):
+                    clear_submission_for_retry(
+                        settings.alpha_db_path, _agent,
+                        body.ticker, body.direction,
+                    )
+            except Exception as _ce:
+                logger.warning("C-05: dedup clear failed: %s", _ce)
 
     _threading.Thread(target=_dispatch_background, daemon=True).start()
 
