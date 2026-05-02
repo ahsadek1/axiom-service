@@ -116,8 +116,8 @@ run_watchdog() {
   fi
 
   # 4. Alpaca reachability
-  ALPACA_KEY="PKPGM3BRNYPGCF5Z56IAUZCZJL"
-  ALPACA_SEC="5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs"
+  ALPACA_KEY="${ALPACA_API_KEY:-}"
+  ALPACA_SEC="${ALPACA_SECRET_KEY:-}"
   if ! curl -sf --max-time 5 \
     -H "APCA-API-KEY-ID: $ALPACA_KEY" \
     -H "APCA-API-SECRET-KEY: $ALPACA_SEC" \

@@ -60,8 +60,8 @@ RAILWAY_SERVICES = [
 ]
 
 ALPACA_URL    = "https://paper-api.alpaca.markets/v2/account"
-ALPACA_KEY    = os.environ.get("ALPACA_API_KEY",    "PKPGM3BRNYPGCF5Z56IAUZCZJL")
-ALPACA_SECRET = os.environ.get("ALPACA_API_SECRET", "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs")
+ALPACA_KEY    = os.environ.get("ALPACA_API_KEY",    os.environ.get("ALPACA_API_KEY", ""))
+ALPACA_SECRET = os.environ.get("ALPACA_API_SECRET", os.environ.get("ALPACA_SECRET_KEY", ""))
 CHRONICLE_DB  = "/Users/ahmedsadek/nexus/data/chronicle.db"
 AILS_DB       = "/Users/ahmedsadek/nexus/data/ails.db"
 TELEGRAM_BOT  = os.environ.get("TELEGRAM_BOT_TOKEN", "")

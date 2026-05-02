@@ -27,8 +27,8 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc"
 AHMED_CHAT_ID      = "8573754783"
 NEXUS_SECRET       = "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2"
-ALPACA_KEY         = "PKPGM3BRNYPGCF5Z56IAUZCZJL"
-ALPACA_SECRET      = "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs"
+ALPACA_KEY         = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET      = os.environ.get("ALPACA_SECRET_KEY", "")
 
 SERVICES = {
     "axiom":           "http://localhost:8001/health",

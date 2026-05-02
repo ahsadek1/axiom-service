@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ALPACA_URL    = "https://paper-api.alpaca.markets"
-ALPACA_KEY    = "PKPGM3BRNYPGCF5Z56IAUZCZJL"
-ALPACA_SECRET = "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs"
+ALPACA_KEY    = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID":     ALPACA_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET,

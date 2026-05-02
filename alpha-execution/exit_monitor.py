@@ -41,11 +41,12 @@ logger = logging.getLogger("alpha_exec.exit_monitor")
 
 
 def evaluate_exits(
-    db_path:       str,
+    db_path:             str,
     alpaca_client,
     buffer_reporter,
-    bot_token:     str,
-    chat_id:       str,
+    bot_token:           str,
+    chat_id:             str,
+    ticker_lock_getter=None,  # GAP-6: optional per-ticker lock getter (callable: str → Lock)
 ) -> list[dict]:
     """
     Evaluate all open positions against exit rules.
@@ -53,11 +54,13 @@ def evaluate_exits(
     Runs on every scheduled tick (every 1 min during market hours).
 
     Args:
-        db_path:         Alpha Execution database path.
-        alpaca_client:   AlpacaClient instance.
-        buffer_reporter: BufferReporter for outcome reporting.
-        bot_token:       Telegram bot token.
-        chat_id:         Ahmed's chat ID.
+        db_path:             Alpha Execution database path.
+        alpaca_client:       AlpacaClient instance.
+        buffer_reporter:     BufferReporter for outcome reporting.
+        bot_token:           Telegram bot token.
+        chat_id:             Ahmed's chat ID.
+        ticker_lock_getter:  GAP-6: if provided, called as ticker_lock_getter(ticker) to get a
+                             per-ticker threading.Lock that prevents execute() / exit_monitor races.
 
     Returns:
         List of exit events that occurred this evaluation.
@@ -69,6 +72,9 @@ def evaluate_exits(
     exits: list[dict] = []
 
     for pos in positions:
+        _tlock = ticker_lock_getter(pos["ticker"].upper()) if ticker_lock_getter else None
+        if _tlock:
+            _tlock.acquire()
         try:
             exit_event = _evaluate_position(
                 pos, db_path, alpaca_client, buffer_reporter, bot_token, chat_id
@@ -77,6 +83,9 @@ def evaluate_exits(
                 exits.append(exit_event)
         except Exception as e:
             logger.error("Exit evaluation failed for position %d (%s): %s", pos["id"], pos["ticker"], e)
+        finally:
+            if _tlock:
+                _tlock.release()
 
     return exits
 

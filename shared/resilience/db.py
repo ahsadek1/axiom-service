@@ -11,6 +11,8 @@ TABLE OWNERSHIP — NON-NEGOTIABLE:
   The rule: money movement → begin_immediate. State/history → service_state.py.
 
 Do NOT call begin_immediate on service_state.py tables. Ever.
+
+Status: ✅ Option A confirmed — execution tables only
 """
 
 from __future__ import annotations
@@ -19,21 +21,40 @@ import sqlite3
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Generator
+from typing import Generator, Optional
 
 
 # ---------------------------------------------------------------------------
 # begin_immediate — serialized write transaction
 # ---------------------------------------------------------------------------
 
+# C3 fix — SQL injection guard: only these tables are allowed in idempotent_insert
+_ALLOWED_TABLES = frozenset({
+    "active_positions",
+    "capital_ledger",
+    "processed_picks",
+    "trade_log",
+})
+
+
 @contextmanager
-def begin_immediate(db_path: str) -> Generator[sqlite3.Connection, None, None]:
+def begin_immediate(
+    db_path: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Generator[sqlite3.Connection, None, None]:
     """
-    Open a SQLite connection and begin a IMMEDIATE transaction.
+    Serialized write transaction for execution tables.
 
     IMMEDIATE acquires a reserved lock at BEGIN time, preventing the
-    concurrent read-then-write race (C6 from adversarial review). All
-    writers queue; no partial reads from concurrent sessions.
+    concurrent read-then-write race. All writers queue; no partial reads
+    from concurrent sessions.
+
+    C1 fix: accepts an optional existing connection. When conn is provided,
+    the caller owns the connection lifecycle — we do NOT close it. When
+    conn is None (default), we open and close it ourselves. This eliminates
+    65 open/close cycles per scanner loop and prevents deadlock from
+    BEGIN IMMEDIATE on a new connection when the caller already holds a
+    read transaction on the same file.
 
     Use for ALL writes to execution tables:
         active_positions, capital_ledger, processed_picks, trade_log
@@ -42,6 +63,8 @@ def begin_immediate(db_path: str) -> Generator[sqlite3.Connection, None, None]:
 
     Args:
         db_path — absolute path to the SQLite database file.
+        conn    — optional existing sqlite3.Connection. If provided, the
+                  caller owns the connection; we won't close it.
 
     Yields:
         sqlite3.Connection with row_factory = sqlite3.Row
@@ -49,29 +72,38 @@ def begin_immediate(db_path: str) -> Generator[sqlite3.Connection, None, None]:
     Raises:
         Re-raises any exception after ROLLBACK. Caller sees the original error.
 
-    Example:
+    Example (single call — owns connection):
         with begin_immediate(DB_PATH) as conn:
-            existing = conn.execute(
-                "SELECT qty FROM active_positions WHERE ticker=?", (ticker,)
-            ).fetchone()
-            if existing:
-                conn.execute("UPDATE active_positions SET qty=? WHERE ticker=?",
-                             (new_qty, ticker))
-            else:
-                conn.execute("INSERT INTO active_positions ...")
-        # COMMIT happens here automatically
+            conn.execute("UPDATE active_positions SET qty=? WHERE ticker=?",
+                         (new_qty, ticker))
+
+    Example (scanner loop — reuse connection, 65 inserts, 1 open/close):
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            for ticker in pool:
+                with begin_immediate(DB_PATH, conn=conn) as c:
+                    idempotent_insert(DB_PATH, ..., conn=c)
+        finally:
+            conn.close()
     """
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
+    owned = conn is None
+    if owned:
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -382,8 +382,9 @@ class SubmitRequest(BaseModel):
         v = v.upper().strip()
         if not v:
             raise ValueError("ticker cannot be empty")
-        if not re.match(r'^[A-Z0-9\.]{1,6}$', v):
-            raise ValueError(f"ticker '{v}' invalid — must be 1-6 uppercase alphanumeric characters")
+        if not re.match(r'^[A-Z]{1,10}$', v):
+            # GAP-12: whitelist uppercase letters only (1-10 chars); reject digits/dots/symbols
+            raise ValueError(f"ticker '{v}' invalid — must be 1-10 uppercase letters only (A-Z)")
         return v
 
     @field_validator("score")

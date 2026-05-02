@@ -345,6 +345,73 @@ class AlpacaClient:
     # ── Private alias for backward-compat with recovery path call ─────────────
     _get_order_by_client_id = get_order_by_client_id
 
+    # ── GAP-8: Safe order lookup and cancellation ─────────────────────────────
+
+    def get_order(self, order_id: str) -> Optional[dict]:
+        """
+        Fetch a single order by its Alpaca order_id.
+
+        Returns the order dict if found, None on 404 or error.
+        """
+        try:
+            url = f"{ALPACA_PAPER_URL}/v2/orders/{order_id}"
+            resp = requests.get(url, headers=self._headers, timeout=10)
+            if resp.status_code == 404:
+                return None
+            self._raise_for_status(resp)
+            return resp.json()
+        except AlpacaError as e:
+            if e.status_code == 404:
+                return None
+            logger.warning("get_order failed for %s: %s", order_id, e)
+            return None
+        except Exception as e:
+            logger.warning("get_order error for %s: %s", order_id, e)
+            return None
+
+    def cancel_order_safe(self, order_id: str) -> bool:
+        """
+        Cancel an order only if it is in a cancellable state (new or partially_filled).
+
+        If the order is already filled, logs a warning and does NOT cancel.
+        If the order is not found, logs and returns False.
+
+        Returns:
+            True if cancel was attempted (order was in cancellable state), False otherwise.
+        """
+        order = self.get_order(order_id)
+        if order is None:
+            logger.warning("cancel_order_safe: order %s not found — skipping cancel", order_id)
+            return False
+        status = order.get("status", "unknown")
+        if status in ("filled", "partially_filled"):
+            logger.warning(
+                "cancel_order_safe: order %s is %s — NOT cancelling (already filled)",
+                order_id, status,
+            )
+            return False
+        try:
+            url = f"{ALPACA_PAPER_URL}/v2/orders/{order_id}"
+            resp = requests.delete(url, headers=self._headers, timeout=10)
+            if resp.status_code in (200, 204):
+                logger.info("cancel_order_safe: order %s cancelled (was %s)", order_id, status)
+                return True
+            if resp.status_code == 422:
+                # Unprocessable — order already in terminal state on Alpaca
+                logger.warning(
+                    "cancel_order_safe: order %s returned 422 during cancel (status=%s) — already terminal",
+                    order_id, status,
+                )
+                return False
+            self._raise_for_status(resp)
+            return True
+        except AlpacaError as e:
+            logger.warning("cancel_order_safe: cancel failed for %s: %s", order_id, e)
+            return False
+        except Exception as e:
+            logger.warning("cancel_order_safe: cancel error for %s: %s", order_id, e)
+            return False
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get(self, url: str, params: Optional[dict] = None):

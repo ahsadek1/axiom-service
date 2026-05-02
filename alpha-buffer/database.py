@@ -93,6 +93,9 @@ def init_db(db_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_submissions_window_ticker
                 ON submissions(window_id, ticker, direction);
 
+            CREATE INDEX IF NOT EXISTS idx_submissions_agent_ticker_dir
+                ON submissions(agent, ticker, direction, window_id);
+
             CREATE TABLE IF NOT EXISTS concordance_results (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 window_id       TEXT    NOT NULL,

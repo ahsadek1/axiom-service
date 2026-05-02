@@ -123,6 +123,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("alpha_exec.main")
 
+# GAP-9: Add rotating file handler so logs survive service restarts and don't fill disk.
+# 10 MB per file, 3 backups = up to 40 MB total log retention.
+import os as _os_log
+_LOG_PATH = _os_log.getenv("ALPHA_EXEC_LOG_PATH", "/tmp/alpha_exec.log")
+try:
+    from logging.handlers import RotatingFileHandler as _RFH
+    _rfh = _RFH(_LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3)
+    _rfh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_rfh)
+    logger.info("GAP-9: RotatingFileHandler attached — log path=%s (10MB × 3)", _LOG_PATH)
+except Exception as _log_err:
+    logger.warning("GAP-9: RotatingFileHandler setup failed (non-fatal): %s", _log_err)
+
 ET       = pytz.timezone("America/New_York")
 settings = load_settings()
 
@@ -431,7 +444,7 @@ def _is_market_hours() -> bool:
         return False
     open_t  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
     close_t = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return open_t <= now <= close_t
+    return open_t <= now < close_t  # GAP-3: exclude 16:00:00 exactly (market is closed)
 
 
 def _preflight_check() -> tuple[bool, str]:
@@ -535,6 +548,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("API key probe: alpaca → %s (%s)", _alpaca_result.status, _alpaca_result.message)
     init_db(settings.alpha_db_path)
+
+    # ── V2 integration: reconcile DB vs Alpaca on startup ────────────────────
+    try:
+        from execution_v2 import reconcile_on_startup as _v2_reconcile
+        def _v2_sync_alert(msg): logger.warning("[V2 Reconcile] %s", msg)
+        _v2_reconcile(settings.alpha_db_path, _v2_sync_alert)
+        logger.info("[V2] Startup reconciliation complete")
+    except Exception as _v2_err:
+        logger.warning("[V2] Reconcile skipped: %s", _v2_err)
 
     # ── Block 2: Startup Preflight Gate ───────────────────────────────────────
     global _SERVICE_MODE, _standby_reason, _standby_alerted
@@ -758,17 +780,32 @@ def _run_startup_reconciliation() -> None:
                 "Startup reconciliation: closed %d stale position(s): %s",
                 len(closed_ids), summary,
             )
+            # GAP-10: CHRONICLE log is unconditional — always write even if Telegram fails.
             try:
                 import sys as _sys
                 _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+                from shared.mandate_logger import log_incident as _log_incident, FAILURE_GHOST_POSITION
+                _log_incident(
+                    agent        = "alpha-execution",
+                    component    = "startup_reconciliation",
+                    failure_type = FAILURE_GHOST_POSITION,
+                    damage       = f"Closed {len(closed_ids)} stale position(s): {summary}",
+                    root_cause   = "Service restart found DB positions absent from Alpaca",
+                    fix_applied  = "auto-closed by startup reconciliation",
+                )
+                logger.info("GAP-10: CHRONICLE incident logged for startup reconciliation")
+            except Exception as _chr_err:
+                logger.warning("GAP-10: CHRONICLE log failed (non-fatal): %s", _chr_err)
+            # Telegram alert — best-effort; failure logged but does NOT suppress CHRONICLE entry
+            try:
                 from shared.notification_router import notify_warn as _nw
                 _nw(
                     "alpha-execution",
                     "Alpha Execution — Startup Reconciliation",
                     f"Closed {len(closed_ids)} stale position(s):\n" + "\n".join(f"  • {s}" for s in closed_ids),
                 )
-            except Exception:
-                pass
+            except Exception as _tg_err:
+                logger.warning("GAP-10: Telegram startup reconciliation alert failed (non-fatal): %s", _tg_err)
         else:
             logger.info("Startup reconciliation: all DB positions confirmed in Alpaca — clean state")
 
@@ -785,11 +822,12 @@ def _run_exit_monitor() -> None:
     app_state["exit_monitor_run_count"]  += 1
     try:
         events = evaluate_exits(
-            db_path         = settings.alpha_db_path,
-            alpaca_client   = _get_alpaca(),
-            buffer_reporter = _get_reporter(),
-            bot_token       = settings.telegram_bot_token,
-            chat_id         = settings.ahmed_chat_id,
+            db_path             = settings.alpha_db_path,
+            alpaca_client       = _get_alpaca(),
+            buffer_reporter     = _get_reporter(),
+            bot_token           = settings.telegram_bot_token,
+            chat_id             = settings.ahmed_chat_id,
+            ticker_lock_getter  = _get_ticker_lock,  # GAP-6: per-ticker lock prevents execute/exit race
         )
         app_state["exit_monitor_last_event_count"] = len(events)
         app_state["exit_monitor_last_error"]       = None
@@ -1145,6 +1183,16 @@ def execute(
             content={"executed": False, "reason": earnings_rejection, "earnings_gate": True},
         )
 
+    # GAP-4: Guard against zero/negative position_size or price before division
+    if _position_size_usd <= 0 or current_price <= 0:
+        logger.error(
+            "GAP-4: Degenerate sizing rejected — position_size_usd=%.2f current_price=%.2f ticker=%s",
+            _position_size_usd, current_price, body.ticker,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"executed": False, "reason": f"degenerate sizing: position_size_usd={_position_size_usd} current_price={current_price}"},
+        )
     contracts = max(1, int(_position_size_usd / (current_price * 100)))
 
     # ── Atomic limit check + PENDING slot reservation (Cipher Finding 1+2 fix) ─
@@ -1280,7 +1328,20 @@ def execute(
                 ticker=body.ticker)
         except Exception:
             pass
-        return JSONResponse(content={"executed": False, "mode": "dry_run", "order_preview": order_preview})
+        return JSONResponse(content={
+            "executed":      False,
+            "status":        "rejected",
+            "reason":        "auto_execute_disabled",
+            "mode":          "dry_run",
+            "order_preview": order_preview,
+        })  # GAP-7: explicit status/reason so OMNI/callers know this was a gate rejection
+
+    # ── GAP-6: Acquire per-ticker lock before order placement ─────────────────
+    # Prevents execute() and _run_exit_monitor() from racing on the same ticker:
+    # the exit monitor cannot close a position for ticker X while execute() is
+    # mid-flight placing an order for ticker X.
+    _ticker_lock = _get_ticker_lock(body.ticker.upper())
+    _ticker_lock.acquire()
 
     # ── Place Order via Alpaca OUTSIDE lock (network call) ────────────────────
     short_symbol = None
@@ -1305,6 +1366,7 @@ def execute(
                 "short=%s == long=%s for %s — rejecting order",
                 short_symbol, long_symbol, body.ticker,
             )
+            _ticker_lock.release(); _ticker_lock = None  # GAP-6: release before early return
             return JSONResponse(
                 status_code=422,
                 content={
@@ -1500,8 +1562,8 @@ def execute(
                 fail_count = _ticker_fail_counts[_ticker]
                 _svc_state.write("ticker_fail_counts", _ticker_fail_counts)  # GAP-002
                 if fail_count >= _TICKER_FAIL_THRESHOLD:
-                    _skipped_tickers.add(_ticker)
-                    _svc_state.write("skipped_tickers", list(_skipped_tickers))  # GAP-002
+                    _skipped_tickers[_ticker] = datetime.now(ET)
+                    _svc_state.write("skipped_tickers", list(_skipped_tickers.keys()))  # GAP-002
                     logger.critical(
                         "CIRCUIT BREAKER TRIPPED: %s failed execution %dx — "
                         "auto-added to session skip list",
@@ -1520,6 +1582,7 @@ def execute(
                         _ticker, fail_count, _TICKER_FAIL_THRESHOLD,
                     )
 
+            _ticker_lock.release(); _ticker_lock = None  # GAP-6: release before early return
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1565,6 +1628,7 @@ def execute(
             _nw("alpha-execution", "VOID trade", _fill.void_reason, ticker=body.ticker)
         except Exception:
             pass
+        _ticker_lock.release(); _ticker_lock = None  # GAP-6: release before early return
         return JSONResponse(
             status_code=503,
             content={"status": "void", "reason": _fill.void_reason, "executed": False},
@@ -1600,6 +1664,9 @@ def execute(
         long_contract_symbol  = long_symbol or "",
         entry_price           = _confirmed_price,
     )
+    # GAP-6: Release per-ticker lock — position is now durable in DB
+    _ticker_lock.release()
+    _ticker_lock = None
     position_id = pending_id
 
     # ── Fix A: Post-confirmation position verification (2026-04-24) ──────────────

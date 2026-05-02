@@ -12,7 +12,7 @@ PRAGMA foreign_keys=ON;
 -- Includes DB trigger for position cap enforcement
 -- Existing 'positions' table is preserved untouched
 
-CREATE TABLE IF NOT EXISTS active_positions_v2 (
+CREATE TABLE IF NOT EXISTS active_positions (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker              TEXT    NOT NULL,
     arena               TEXT    NOT NULL DEFAULT 'alpha' CHECK (arena IN ('alpha','prime')),
@@ -38,14 +38,14 @@ CREATE TABLE IF NOT EXISTS active_positions_v2 (
 );
 
 -- Position cap trigger: max 3 concurrent positions
-CREATE TRIGGER IF NOT EXISTS enforce_position_cap_v2
-BEFORE INSERT ON active_positions_v2
+CREATE TRIGGER IF NOT EXISTS enforce_position_cap
+BEFORE INSERT ON active_positions
 WHEN (
-    SELECT COUNT(*) FROM active_positions_v2
+    SELECT COUNT(*) FROM active_positions
     WHERE status IN ('pending','open')
 ) >= 3
 BEGIN
-    SELECT RAISE(ABORT, 'POSITION_CAP_V2: max 3 concurrent positions');
+    SELECT RAISE(ABORT, 'POSITION_CAP: max 3 concurrent positions');
 END;
 
 -- processed_picks: replaces in-memory _picks_today / _processed_ids

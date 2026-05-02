@@ -86,6 +86,14 @@ def resolve_spread(
         long_strike  = _round_strike(current_price * (1 + SPREAD_WIDTH_PCT + WING_WIDTH_PCT), is_etf)
         option_type  = "call"
 
+    # GAP-5: Reject zero-width spreads — rounding can collapse both legs to the same strike
+    if short_strike == long_strike:
+        raise ValueError(
+            f"zero-width spread rejected: short={short_strike} long={long_strike} "
+            f"for {ticker} {direction} at price={current_price:.2f} "
+            f"(SPREAD_WIDTH_PCT={SPREAD_WIDTH_PCT}, WING_WIDTH_PCT={WING_WIDTH_PCT})"
+        )
+
     return SpreadParams(
         underlying      = ticker.upper(),
         direction       = direction,
