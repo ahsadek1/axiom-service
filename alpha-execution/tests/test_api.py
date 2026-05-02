@@ -11,15 +11,20 @@ import pytest
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
-os.environ.setdefault("NEXUS_WEBHOOK_SECRET", "test-alpha-exec-secret")
+# conftest.py sets NEXUS_WEBHOOK_SECRET before this module loads — read it back.
+# All setdefault calls here are no-ops if conftest already set the value.
+os.environ.setdefault("NEXUS_WEBHOOK_SECRET", "x" * 64)
 os.environ.setdefault("ALPHA_EXEC_DB_PATH",   tempfile.mktemp(suffix=".db"))
 os.environ.setdefault("ALPACA_API_KEY",        "test-alpaca-key")
 os.environ.setdefault("ALPACA_SECRET_KEY",     "test-alpaca-secret")
 os.environ.setdefault("ALPHA_BUFFER_URL",      "http://localhost:8002")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN",    "9999:TEST")
 os.environ.setdefault("AHMED_CHAT_ID",         "8573754783")
+os.environ.setdefault("AXIOM_URL",             "http://localhost:8001")
+os.environ.setdefault("AXIOM_SECRET",          "test-axiom-secret")
 
-SECRET  = "test-alpha-exec-secret"
+# SECRET must match whatever conftest set for NEXUS_WEBHOOK_SECRET.
+SECRET  = os.environ["NEXUS_WEBHOOK_SECRET"]
 HEADERS = {"X-Nexus-Secret": SECRET}
 
 VALID_EXECUTE = {
@@ -36,21 +41,36 @@ VALID_EXECUTE = {
 }
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def client():
-    from main import app
-    from database import init_db
-    init_db(os.environ["ALPHA_EXEC_DB_PATH"])
-    with TestClient(app) as c:
-        yield c
+    # Patch preflight, market hours, and contract resolution so tests run
+    # without real Alpaca credentials or real options chain data.
+    from contract_resolver import SpreadParams
+    _mock_spread = SpreadParams(
+        underlying="NVDA", direction="bullish", option_type="put",
+        short_strike=880.0, long_strike=870.0, expiration_date="2026-05-16",
+        target_dte=14, current_price=900.0, is_etf=False,
+    )
+    with patch("main._preflight_check", return_value=(True, "")), \
+         patch("main._run_preflight_retry_loop"), \
+         patch("main._is_market_hours", return_value=True), \
+         patch("main.resolve_available_contract", return_value=_mock_spread), \
+         patch("database.count_open_positions_alpaca", return_value=0):
+        from main import app
+        import main as _m
+        _m._SERVICE_MODE = "active"
+        from database import init_db
+        init_db(os.environ["ALPHA_EXEC_DB_PATH"])
+        with TestClient(app) as c:
+            yield c
 
 
 class TestHealth:
     def test_health_200(self, client):
-        assert client.get("/health").status_code == 200
+        assert client.get("/health", headers=HEADERS).status_code == 200
 
     def test_health_says_alpha(self, client):
-        assert "alpha-execution" in client.get("/health").json()["service"]
+        assert "alpha-execution" in client.get("/health", headers=HEADERS).json()["service"]
 
 
 class TestExecute:

@@ -849,10 +849,12 @@ app = FastAPI(
     title    = "Alpha Execution Engine",
     version  = "3.0.0",
     lifespan = lifespan,
-    # GENESIS-STRESS-F4-001: Apply auth dependency globally so 403 fires
-    # before Pydantic body validation (422). Prevents body schema leakage.
-    dependencies=[Depends(_auth_dependency)],
 )
+
+# Protected router — auth required for all routes included here.
+# /health is intentionally NOT included here so it remains unauthenticated.
+from fastapi import APIRouter as _APIRouter
+_protected = _APIRouter(dependencies=[Depends(_auth_dependency)])
 
 
 # ── Request Models ────────────────────────────────────────────────────────────
@@ -985,7 +987,7 @@ def health() -> JSONResponse:
     })
 
 
-@app.post("/execute")
+@_protected.post("/execute")
 def execute(
     body: ExecuteRequest,
     x_nexus_secret: str = Header(default=""),
@@ -1858,7 +1860,7 @@ def execute(
     })
 
 
-@app.get("/positions")
+@_protected.get("/positions")
 def get_positions(x_nexus_secret: str = Header(default="")) -> JSONResponse:
     """Return all open Alpha positions."""
     verify_secret(x_nexus_secret)
@@ -1869,7 +1871,7 @@ def get_positions(x_nexus_secret: str = Header(default="")) -> JSONResponse:
     })
 
 
-@app.get("/trades")
+@_protected.get("/trades")
 def get_trades_summary(x_nexus_secret: str = Header(default="")) -> JSONResponse:
     """
     Return Alpha execution summary for SOVEREIGN observability.
@@ -1921,7 +1923,7 @@ def get_trades_summary(x_nexus_secret: str = Header(default="")) -> JSONResponse
     })
 
 
-@app.get("/exit-monitor/status")
+@_protected.get("/exit-monitor/status")
 def exit_monitor_status(x_nexus_secret: str = Header(default="")) -> JSONResponse:
     """
     Return current exit monitor scheduler state.
@@ -1955,7 +1957,7 @@ def exit_monitor_status(x_nexus_secret: str = Header(default="")) -> JSONRespons
     })
 
 
-@app.post("/resume")
+@_protected.post("/resume")
 def resume_execution(x_nexus_secret: str = Header(default="")) -> JSONResponse:
     """Resume execution after a failure-triggered pause.
 
@@ -1980,7 +1982,7 @@ class _SovDirective(BaseModel):
     from_agent: str = "sovereign"
 
 
-@app.post("/sovereign/directive", status_code=200)
+@_protected.post("/sovereign/directive", status_code=200)
 def sovereign_directive(
     body: _SovDirective,
     x_nexus_secret: str = Header(default=""),
@@ -2031,7 +2033,7 @@ def sovereign_directive(
 # ── GAP-006: /log_tail — Runtime log access (2026-04-27) ─────────────────────
 # Gives OMNI, integrity checker, and SOVEREIGN visibility into recent logs
 # without requiring SSH or Railway dashboard access. Authenticated.
-@app.get("/log_tail")
+@_protected.get("/log_tail")
 def log_tail(
     lines:          int = 50,
     filter_str:     str = "",
@@ -2072,7 +2074,7 @@ def log_tail(
         return JSONResponse({"ok": False, "error": str(e)})
 
 
-@app.get("/admin/reconciler-status", status_code=200)
+@_protected.get("/admin/reconciler-status", status_code=200)
 def admin_reconciler_status(
     x_nexus_secret: str = Header(default=""),
 ) -> JSONResponse:
@@ -2101,7 +2103,7 @@ def admin_reconciler_status(
     })
 
 
-@app.get("/sovereign/status", status_code=200)
+@_protected.get("/sovereign/status", status_code=200)
 def sovereign_status(
     x_nexus_secret: str = Header(default=""),
 ) -> JSONResponse:
@@ -2191,3 +2193,5 @@ def _send_entry_notification(
         )
     except Exception:
         pass
+
+app.include_router(_protected)

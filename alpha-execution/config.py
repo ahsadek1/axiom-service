@@ -59,6 +59,7 @@ class Settings:
     alpha_db_path:         str
     alpaca_api_key:        str
     alpaca_secret_key:     str
+    alpaca_url:            str
     alpha_buffer_url:      str
     telegram_bot_token:    str
     ahmed_chat_id:         str
@@ -97,6 +98,7 @@ def load_settings() -> Settings:
         nexus_webhook_secret = required["NEXUS_WEBHOOK_SECRET"],
         alpha_db_path        = required["ALPHA_EXEC_DB_PATH"],
         alpaca_api_key       = required["ALPACA_API_KEY"],
+        alpaca_url           = os.getenv("ALPACA_URL", "https://paper-api.alpaca.markets"),
         alpaca_secret_key    = required["ALPACA_SECRET_KEY"],
         alpha_buffer_url     = required["ALPHA_BUFFER_URL"],
         telegram_bot_token   = required["TELEGRAM_BOT_TOKEN"],

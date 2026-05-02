@@ -68,7 +68,8 @@ def init_db(db_path: str) -> None:
                 closed_at             TEXT,
                 close_reason          TEXT,   -- DTE_ROLL, DTE_CLOSE, PROFIT_TARGET, TRAILING_STOP
                 pnl_pct               REAL,
-                pnl_usd               REAL
+                pnl_usd               REAL,
+                hard_backstop_pct     REAL    -- absolute loss floor (e.g. -0.50 = -50%); NULL = use default
             );
             
 
@@ -250,13 +251,39 @@ def cancel_pending_position(db_path: str, position_id: int) -> None:
     Delete a pending reservation when Alpaca order placement fails.
 
     Ensures failed orders leave no DB trace — no phantom positions.
+    If the DELETE misses (row not in pending status), falls back to
+    UPDATE status=canceled and logs an ERROR (force_canceled_pending_miss).
     """
+    import logging as _logging
+    _log = _logging.getLogger("alpha_exec.database")
     with get_conn(db_path) as conn:
-        conn.execute(
+        cursor = conn.execute(
             "DELETE FROM positions WHERE id=? AND status='pending'",
             (position_id,),
         )
         conn.commit()
+        if cursor.rowcount == 0:
+            # DELETE missed — check if row exists and is not already terminal.
+            row = conn.execute(
+                "SELECT status FROM positions WHERE id=?", (position_id,)
+            ).fetchone()
+            if row is None:
+                # No row at all — nothing to do.
+                return
+            if row["status"] in ("closed", "canceled"):
+                # Already terminal — leave it alone.
+                return
+            # Row exists in non-terminal, non-pending state (e.g. 'open').
+            # Force cancel so no zombie position lingers.
+            _log.error(
+                "cancel_pending_position: pending_miss for id=%s — "                "row not in pending status; forcing canceled",
+                position_id,
+            )
+            conn.execute(
+                "UPDATE positions SET status='canceled', "                "close_reason='force_canceled_pending_miss' "                "WHERE id=?",
+                (position_id,),
+            )
+            conn.commit()
 
 
 def count_new_positions_today(db_path: str) -> int:

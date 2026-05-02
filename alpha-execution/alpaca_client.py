@@ -219,7 +219,8 @@ class AlpacaClient:
         if limit_debit is not None:
             body["limit_price"] = str(round(limit_debit, 2))
         if client_order_id:
-            body["client_order_id"] = client_order_id
+            # Alpaca max client_order_id length is 48 chars
+            body["client_order_id"] = client_order_id[:48]
 
         resp = requests.post(
             f"{ALPACA_PAPER_URL}/v2/orders",

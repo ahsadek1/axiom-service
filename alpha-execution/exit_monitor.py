@@ -17,6 +17,10 @@ Exit rules (approved Apr 10, 2026):
 import logging
 from datetime import date, datetime, timezone
 from typing import Optional
+import zoneinfo as _zoneinfo
+
+# _ET: Eastern Time zone — used by EOD force-close logic and test patching.
+_ET = _zoneinfo.ZoneInfo("America/New_York")
 
 from ails_reporter import post_outcome as _post_ails_outcome
 
@@ -70,6 +74,38 @@ def evaluate_exits(
         return []
 
     exits: list[dict] = []
+
+    # -- EOD Force-Close Gate (15:50 ET) ----------------------------------
+    # Near market close, force-close all open positions to prevent overnight
+    # carry. Runs before individual position evaluation.
+    now_et = datetime.now(_ET)
+    _is_eod = (
+        now_et.weekday() < 5
+        and (now_et.hour == 15 and now_et.minute >= 50)
+    )
+    if _is_eod:
+        for pos in positions:
+            logger.warning(
+                "EOD_FORCE_CLOSE: position %d (%s) -- forcing close at %s ET",
+                pos["id"], pos["ticker"], now_et.strftime("%H:%M")
+            )
+            try:
+                alpaca_client.close_position(pos["ticker"])
+                exits.append({
+                    "position_id": pos["id"],
+                    "ticker":      pos["ticker"],
+                    "reason":      "EOD_FORCE_CLOSE",
+                    "pnl_pct":     None,
+                })
+            except Exception as _eod_err:
+                logger.error("EOD close FAILED for %s: %s", pos["ticker"], _eod_err)
+                exits.append({
+                    "position_id": pos["id"],
+                    "ticker":      pos["ticker"],
+                    "reason":      "CLOSE_FAILED",
+                    "error":       str(_eod_err),
+                })
+        return exits
 
     for pos in positions:
         _tlock = ticker_lock_getter(pos["ticker"].upper()) if ticker_lock_getter else None
