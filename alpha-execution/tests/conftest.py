@@ -40,13 +40,27 @@ for key, val in _TEST_ENV.items():
 # Fake Alpaca client — fast, no network, safe for test isolation
 # ---------------------------------------------------------------------------
 class _FakeAlpaca:
-    """Minimal stub — returns empty results, never makes network calls."""
+    """Minimal stub — returns safe defaults, never makes network calls."""
     def get_positions(self): return []
-    def get_position(self, symbol): return None
+    def get_position(self, symbol):
+        # Return non-zero qty so Fix A phantom check doesn't trigger
+        return {"qty": "1", "symbol": symbol or "FAKE"}
     def get_account(self): return {"status": "ACTIVE", "equity": "100000", "cash": "100000"}
     def get_latest_price(self, ticker): return 500.0
     def place_spread_order(self, **kw): return {"id": "fake-order-001", "status": "accepted"}
     def close_position(self, symbol): return {"id": "fake-close-001"}
+    def _get_order_by_client_id(self, coid): return None
+    def get_order_by_client_id(self, coid): return None
+    def get_option_contracts(self, underlying, **kw):
+        # Return plausible option contracts for spread resolution
+        # Centered around 500.0 (our default get_latest_price)
+        return [
+            {"symbol": f"{underlying}P00480000", "strike_price": "480.0", "expiration_date": "2026-05-16"},
+            {"symbol": f"{underlying}P00490000", "strike_price": "490.0", "expiration_date": "2026-05-16"},
+            {"symbol": f"{underlying}P00500000", "strike_price": "500.0", "expiration_date": "2026-05-16"},
+            {"symbol": f"{underlying}C00510000", "strike_price": "510.0", "expiration_date": "2026-05-16"},
+            {"symbol": f"{underlying}C00520000", "strike_price": "520.0", "expiration_date": "2026-05-16"},
+        ]
     # Returns None so Block 4 (pre-submission existence check) does not skip order placement
     def get_order_by_client_id(self, client_order_id): return None
     _get_order_by_client_id = get_order_by_client_id
@@ -102,9 +116,18 @@ def _test_isolation():
         _m.app_state["go_verdicts_today"] = 0
         _m._skipped_tickers.clear()
         _m._ticker_fail_counts.clear()
+        # Reset rate limiter token bucket to full capacity
+        try:
+            with _m._execute_rate_limiter._lock:
+                _m._execute_rate_limiter._tokens = _m._execute_rate_limiter._capacity
+        except Exception:
+            pass
         # Reset webhook secret to original conftest value (some test modules
-        # change os.environ["NEXUS_WEBHOOK_SECRET"] at module load time).
+        # change os.environ["NEXUS_WEBHOOK_SECRET"] directly inside test methods).
+        # Reset BOTH os.environ AND settings so that any _make_client() call that
+        # internally calls load_settings() also gets the canonical value.
         _CONFTEST_SECRET = _TEST_ENV["NEXUS_WEBHOOK_SECRET"]
+        os.environ["NEXUS_WEBHOOK_SECRET"] = _CONFTEST_SECRET
         try:
             object.__setattr__(_m.settings, "nexus_webhook_secret", _CONFTEST_SECRET)
         except Exception:
@@ -120,17 +143,36 @@ def _test_isolation():
         except Exception:
             pass
         yield
-    # Teardown: restore critical state using the ORIGINAL conftest secret,
-    # NOT os.environ (which test modules may have overwritten).
+    # Teardown: restore critical state.
+    # Always rebuild settings from _TEST_ENV (not os.environ, which tests may
+    # have overwritten). This handles the case where a test replaced
+    # main.settings with a MagicMock and the finally block didn't restore it.
     _CONFTEST_SECRET = _TEST_ENV["NEXUS_WEBHOOK_SECRET"]
     try:
         import main as _m
+        # Temporarily reset env to conftest values so load_settings() returns
+        # the canonical test settings (some tests permanently change os.environ).
+        _saved_env = {}
+        for _k, _v in _TEST_ENV.items():
+            _saved_env[_k] = os.environ.get(_k)
+            os.environ[_k] = _v
+        try:
+            _m.settings = _m.load_settings()
+        finally:
+            for _k, _sv in _saved_env.items():
+                if _sv is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _sv
         _m._SERVICE_MODE = "active"
         _m.app_state["first_exec_failed"] = False
         _m.app_state["execution_paused"] = False
+    except Exception:
+        # Fallback: at least reset the critical fields if Settings() fails
         try:
+            _m._SERVICE_MODE = "active"
+            _m.app_state["first_exec_failed"] = False
+            _m.app_state["execution_paused"] = False
             object.__setattr__(_m.settings, "nexus_webhook_secret", _CONFTEST_SECRET)
         except Exception:
             pass
-    except Exception:
-        pass
