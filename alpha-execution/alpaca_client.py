@@ -228,6 +228,21 @@ class AlpacaClient:
             headers = self._headers,
             timeout = 10,
         )
+
+        # 422 idempotency recovery: if a client_order_id was provided, Alpaca
+        # returns 422 when the order already exists.  Look it up and return it
+        # rather than raising — this makes place_spread_order safe to call
+        # more than once with the same COID (e.g. after restart / dup signal).
+        if resp.status_code == 422 and client_order_id:
+            existing = self.get_order_by_client_id(client_order_id[:48])
+            if existing is not None:
+                logger.info(
+                    "place_spread_order 422 → recovered existing order %s for COID %s",
+                    existing.get("id"), client_order_id,
+                )
+                return existing
+            # No existing order found despite 422 — fall through to raise
+
         self._raise_for_status(resp)
         return resp.json()
 
@@ -333,7 +348,11 @@ class AlpacaClient:
             if resp.status_code == 404:
                 return None
             self._raise_for_status(resp)
-            return resp.json()
+            result = resp.json()
+            # Handle both single-order dict and list responses gracefully
+            if isinstance(result, list):
+                return result[0] if result else None
+            return result
         except AlpacaError as e:
             if e.status_code == 404:
                 return None
