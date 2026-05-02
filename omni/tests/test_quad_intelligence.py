@@ -206,3 +206,91 @@ class TestCallBrainIndividual:
     def test_deepseek_routes_to_deepseek(self, mock_fn):
         result = _call_brain(BRAIN_DEEPSEEK, '{"ticker":"NVDA"}', "test-key")
         mock_fn.assert_called_once()
+
+
+class TestHardDeadline:
+    """
+    GAP-BRAIN-HANG: Verify that run_all_brains returns error results for any
+    brains that hang past the hard deadline (as_completed timeout), instead of
+    blocking the synthesis worker forever.
+
+    Root cause of May 1 2026 incident: as_completed(futures) had no timeout
+    AND ThreadPoolExecutor was used as a context manager (shutdown(wait=True)),
+    so even when as_completed would have timed out, the executor exit would have
+    blocked waiting for all threads. Both issues are now fixed.
+    """
+
+    def test_hard_deadline_returns_error_for_hung_brains(self):
+        """When brains hang past the hard deadline, run_all_brains returns
+        immediately with error results for hung brains — does not block.
+
+        Uses a 0.3s patched deadline so the test completes in <2s.
+        Hung brains sleep 30s — long enough to prove the deadline fires,
+        short enough that threads exit quickly after the test completes.
+        """
+        import time
+        from concurrent.futures import as_completed as real_as_completed
+
+        def slow_brain(brain_name, context_json, api_key):
+            """Claude returns instantly; the other 3 sleep 30s (simulates hung TCP)."""
+            if brain_name == BRAIN_CLAUDE:
+                return {"vote": "GO", "confidence": 90, "concern_1": "", "concern_2": "",
+                        "echo_chamber": False, "reasoning": "fast"}
+            time.sleep(30)  # Long enough to prove deadline fires; exits after test
+            return {"vote": "GO", "confidence": 50, "concern_1": "", "concern_2": "",
+                    "echo_chamber": False, "reasoning": "late"}
+
+        def patched_as_completed(fs, timeout=None):
+            """Override deadline to 0.3s so test finishes quickly."""
+            return real_as_completed(fs, timeout=0.3)
+
+        with patch("quad_intelligence._call_brain", side_effect=slow_brain), \
+             patch("quad_intelligence.as_completed", patched_as_completed):
+            start = time.time()
+            results = run_all_brains(
+                context={},
+                anthropic_api_key="k",
+                openai_api_key="k",
+                gemini_api_key="k",
+                deepseek_api_key="k",
+            )
+            elapsed = time.time() - start
+
+        # Must return within 2s (not block for 30s)
+        assert elapsed < 2.0, f"run_all_brains blocked for {elapsed:.1f}s — deadline not working"
+
+        # All 4 brains must have an entry
+        assert len(results) == 4, f"Expected 4 results, got {len(results)}: {list(results)}"
+
+        # Hung brains must have error results
+        hung_no_error = [
+            n for n in [BRAIN_O3MINI, BRAIN_GEMINI, BRAIN_DEEPSEEK]
+            if "error" not in results.get(n, {})
+        ]
+        assert not hung_no_error, f"Hung brains missing error result: {hung_no_error}"
+
+        # Claude (fast brain) must have a real result
+        assert "error" not in results.get(BRAIN_CLAUDE, {"error": "missing"}), \
+            "Claude (fast brain) should have completed normally"
+
+    def test_all_brains_complete_normally(self):
+        """When all brains complete before the deadline, results are correct
+        and no error results are assigned."""
+
+        def instant_brain(brain_name, context_json, api_key):
+            return {"vote": "GO", "confidence": 85, "concern_1": "", "concern_2": "",
+                    "echo_chamber": False, "reasoning": "instant"}
+
+        with patch("quad_intelligence._call_brain", side_effect=instant_brain):
+            results = run_all_brains(
+                context={},
+                anthropic_api_key="k",
+                openai_api_key="k",
+                gemini_api_key="k",
+                deepseek_api_key="k",
+            )
+
+        assert len(results) == 4
+        for brain_name, result in results.items():
+            assert "error" not in result, f"Brain {brain_name} returned error unexpectedly"
+            assert result["vote"] == "GO"

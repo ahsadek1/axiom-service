@@ -115,30 +115,44 @@ def run_all_brains(
     context_json = json.dumps(context, indent=2, default=str)
 
     results: dict[str, dict] = {}
+    # GAP-BRAIN-HANG: Hard deadline for all brain calls combined.
+    # BRAIN_TIMEOUT_SECONDS covers per-request network timeout, but a hung TCP
+    # connection (established, server never responds) can block indefinitely
+    # without raising — holding the synthesis pool worker and semaphore.
+    # as_completed(timeout=HARD_DEADLINE) raises concurrent.futures.TimeoutError
+    # if not all futures complete in time, so unfinished brains get error results
+    # and synthesis continues immediately.
+    #
+    # CRITICAL: Do NOT use ThreadPoolExecutor as a context manager here.
+    # The context manager calls shutdown(wait=True) on exit, which blocks waiting
+    # for all threads — defeating the deadline entirely if brains are stuck in
+    # requests.post(). Instead, call shutdown(wait=False): hung threads eventually
+    # exit on their own via the per-request timeout (BRAIN_TIMEOUT_SECONDS).
+    _HARD_DEADLINE = BRAIN_TIMEOUT_SECONDS + 30  # 30s grace over per-request timeout
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(
-                _call_brain,
-                brain_name,
-                context_json,
-                api_keys[brain_name],
-            ): brain_name
-            for brain_name in ALL_BRAINS
-        }
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omni-brain")
+    futures = {
+        executor.submit(
+            _call_brain,
+            brain_name,
+            context_json,
+            api_keys[brain_name],
+        ): brain_name
+        for brain_name in ALL_BRAINS
+    }
 
-        for future in as_completed(futures):
+    completed_brains: set = set()
+    try:
+        for future in as_completed(futures, timeout=_HARD_DEADLINE):
             brain_name = futures[future]
             try:
-                result = future.result(timeout=BRAIN_TIMEOUT_SECONDS + 5)
-            except TimeoutError:
-                logger.warning("Brain %s timed out after %ds", brain_name, BRAIN_TIMEOUT_SECONDS)
-                result = _error_result(brain_name, f"timeout after {BRAIN_TIMEOUT_SECONDS}s")
+                result = future.result()  # future already done — no extra timeout needed
             except Exception as e:
                 logger.warning("Brain %s raised exception: %s", brain_name, e)
                 result = _error_result(brain_name, str(e)[:200])
 
             results[brain_name] = result
+            completed_brains.add(brain_name)
             if "error" not in result:
                 logger.info(
                     "Brain %s voted %s (confidence=%s)",
@@ -146,6 +160,23 @@ def run_all_brains(
                     result.get("vote", "UNKNOWN"),
                     result.get("confidence", "?"),
                 )
+    except TimeoutError:
+        # Some brains did not complete within the hard deadline.
+        # Assign error results to any that didn't finish — synthesis continues
+        # with whatever brains responded.
+        hung_brains = [name for name in ALL_BRAINS if name not in completed_brains]
+        logger.critical(
+            "run_all_brains HARD DEADLINE hit (%ds) — brains still pending: %s",
+            _HARD_DEADLINE, hung_brains,
+        )
+        for brain_name in hung_brains:
+            results[brain_name] = _error_result(
+                brain_name, f"hard deadline exceeded after {_HARD_DEADLINE}s"
+            )
+    finally:
+        # Don't wait for hung threads — they will exit on their own when the
+        # per-request timeout fires. Blocking here re-introduces the hang.
+        executor.shutdown(wait=False)
 
     return results
 
