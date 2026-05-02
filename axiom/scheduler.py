@@ -7,12 +7,17 @@ Scheduler state held in-memory — jobs defined at startup, not persisted.
 """
 
 import logging
+import sys
+import os
 from datetime import datetime, date
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+from resilience.health import AxiomHealthReport
 
 logger = logging.getLogger("axiom.scheduler")
 
@@ -79,9 +84,40 @@ def create_scheduler(app_state: dict) -> BackgroundScheduler:
         replace_existing=True,
     )
 
+    # Every 5 minutes — resilience health check (external data sources + local DB)
+    # SPEC: AXIOM_30_SPEC v1.0 — check_all() runs in scheduler only, NOT in /health handler
+    scheduler.add_job(
+        func    = lambda: _run_health_check(app_state),
+        trigger = IntervalTrigger(minutes=5),
+        id      = "resilience_health_check",
+        name    = "Resilience health check",
+        replace_existing=True,
+    )
 
     logger.info("Axiom scheduler created with %d jobs", len(scheduler.get_jobs()))
     return scheduler
+
+
+def _run_health_check(app_state: dict) -> None:
+    """
+    Run Axiom resilience health check and store result in app_state.
+
+    Called every 5 minutes by the scheduler.
+    Results are served by /health endpoint's resilience_status field.
+
+    Never raises — failure logged, _health_report left as previous value
+    (stale is better than crashing the scheduler).
+    """
+    try:
+        report = AxiomHealthReport()
+        report.check_all(app_state)
+        app_state["_health_report"] = report
+        logger.info(
+            "Resilience health check: overall=%s degraded=%s",
+            report.overall, report.degraded_sources,
+        )
+    except Exception as e:
+        logger.error("Resilience health check failed: %s", e)
 
 
 def _is_market_hours(now: datetime = None) -> bool:
@@ -120,10 +156,14 @@ def _run_premarket_brief(app_state: dict) -> None:
             app_state.get("last_vix"),
         )
         app_state["last_vix"] = vix
+        if app_state.get("_vix_cache"):
+            app_state["_vix_cache"].update(vix)
 
         from regime import classify_regime
         regime = classify_regime(vix, is_estimated)
         app_state["regime"] = regime
+        if app_state.get("_regime_cache"):
+            app_state["_regime_cache"].update(regime)
 
         pool = app_state.get("pool", [])
         generate_premarket_brief(
@@ -212,6 +252,8 @@ def _run_tier2_if_open(app_state: dict, force: bool = False) -> None:
                 app_state.get("last_vix"),
             )
             app_state["last_vix"] = vix
+            if app_state.get("_vix_cache"):
+                app_state["_vix_cache"].update(vix)
             regime = classify_regime(vix, is_estimated)
             logger.warning(
                 "ORACLE unavailable — regime fallback: VIX=%.1f, class=%s",
@@ -219,6 +261,8 @@ def _run_tier2_if_open(app_state: dict, force: bool = False) -> None:
             )
 
         app_state["regime"] = regime
+        if app_state.get("_regime_cache"):
+            app_state["_regime_cache"].update(regime)
 
         # ── Step 2: Tier 2 filter ─────────────────────────────────────────────
         anchor_stocks = app_state.get("anchor_stocks", [])

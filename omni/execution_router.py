@@ -65,6 +65,9 @@ def route_to_execution(
         "echo_chamber":      synthesis_verdict.get("echo_chamber_flagged"),
         "brain_summary":     synthesis_verdict.get("brain_summary", {}),
         "axiom_risk_score":  synthesis_verdict.get("axiom_risk_score"),
+        # CONTRACT-1: include auto_execute for observability. Execution services
+        # gate on their own NEXUS_AUTO_EXECUTE env var -- this field is informational only.
+        "auto_execute":      True,
     }
 
     try:

@@ -28,6 +28,11 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).parent.parent))
 from shared.sovereign_comms import get_instructions, report
 
+# ── Axiom 30% Resilience Layer ─────────────────────────────────────────────
+from resilience.state import make_vix_cache, make_regime_cache
+from resilience.db import assess_db_write
+from resilience.health import AxiomHealthReport
+
 from config import load_settings, MAX_POSITIONS, MAX_RISK_PER_TRADE, MIN_DTE, MAX_DTE, VIX_PAUSE_THRESHOLD, MIN_IVR_CREDIT_SPREAD, MAX_IVR_DEBIT_SPREAD
 
 # P0-A: Stale deploy detection
@@ -85,6 +90,10 @@ app_state: dict = {
     "deepseek_api_key":          os.getenv("DEEPSEEK_API_KEY", ""),
     "start_time":                datetime.now(ET).isoformat(),
     "status":                    "starting",
+    # Resilience layer — populated in lifespan startup
+    "_vix_cache":                None,
+    "_regime_cache":             None,
+    "_health_report":            None,
 }
 
 # ── Block 2: STANDBY mode ─────────────────────────────────────────────────────
@@ -266,6 +275,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app_state["scheduler"] = scheduler
     app_state["status"]    = "ready"
 
+    # Resilience layer — init FreshValue caches after state is populated
+    app_state["_vix_cache"]    = make_vix_cache()
+    app_state["_regime_cache"] = make_regime_cache()
+    # Pre-seed caches if startup classification succeeded
+    if app_state.get("last_vix") is not None:
+        app_state["_vix_cache"].update(app_state["last_vix"])
+    if app_state.get("regime") is not None:
+        app_state["_regime_cache"].update(app_state["regime"])
+
     logger.info("Axiom service ready — scheduler running %d jobs", len(scheduler.get_jobs()))
     report("axiom", "INFO", {"event": "started", "port": int(os.getenv("PORT", "8001"))})
     _instr = get_instructions("axiom")
@@ -345,6 +363,8 @@ def health() -> JSONResponse:
         "uptime_since":         app_state.get("start_time"),
         "code_hash":           _CODE_HASH,
         "stale_deploy":        (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
+        "resilience_status":   (app_state["_health_report"].to_dict()
+                                if app_state.get("_health_report") else None),
     })
 
 
@@ -475,6 +495,12 @@ def assess_stock(
             "model":          "axiom-risk-engine-v3",
         })
 
+    # Resilience — advisory VIX staleness check (additive, does NOT replace regime is None gate)
+    _vix_cache = app_state.get("_vix_cache")
+    if _vix_cache and _vix_cache.get() is None:
+        logger.warning("VIX cache stale in /assess (age=%ds) — using last_vix fallback",
+                       _vix_cache.age_seconds)
+
     # Basic risk scoring
     hard_stops: list[str] = []
     flags:      list[str] = []
@@ -570,10 +596,9 @@ def assess_stock(
         "model":          "axiom-risk-engine-v3",
     }
 
-    # Cache to DB
+    # Cache to DB — BEGIN IMMEDIATE (resilience layer: prevents concurrent write race)
     try:
-        from database import save_risk_assessment
-        save_risk_assessment(
+        assess_db_write(
             db_path     = settings.axiom_db_path,
             ticker      = ticker,
             window_id   = window_id,

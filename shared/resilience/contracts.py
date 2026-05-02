@@ -11,6 +11,8 @@ or execution logic.
 
 from __future__ import annotations
 
+import math
+
 
 class DataContractError(Exception):
     """
@@ -68,6 +70,8 @@ def require_float(
         v = float(value)
     except (TypeError, ValueError):
         raise DataContractError(source, field, "not numeric", raw=value)
+    if math.isnan(v) or math.isinf(v):
+        raise DataContractError(source, field, "NaN/Inf not allowed", raw=value)
     if min_val is not None and v < min_val:
         raise DataContractError(source, field, f"below minimum {min_val}", raw=v)
     if max_val is not None and v > max_val:
