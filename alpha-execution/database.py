@@ -114,6 +114,30 @@ def count_open_positions(db_path: str) -> int:
     return row["cnt"] if row else 0
 
 
+def count_open_positions_alpaca(alpaca_url: str, alpaca_key: str,
+                                alpaca_secret: str) -> int:
+    """
+    V2 C1 fix: Query Alpaca live for combined position count.
+    This is the cross-service ground truth — covers both Alpha Railway
+    and OMNI local sharing the same Alpaca paper account.
+    Raises RuntimeError if Alpaca is unreachable — caller handles.
+    """
+    import requests as _req
+    try:
+        r = _req.get(
+            f"{alpaca_url}/v2/positions",
+            headers={
+                "APCA-API-KEY-ID":     alpaca_key,
+                "APCA-API-SECRET-KEY": alpaca_secret,
+            },
+            timeout=5,
+        )
+        r.raise_for_status()
+        return len(r.json())
+    except Exception as e:
+        raise RuntimeError(f"Alpaca position count unavailable: {e}") from e
+
+
 def reserve_position_slot(
     db_path:           str,
     ticker:            str,

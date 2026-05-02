@@ -149,9 +149,38 @@ else:
 # Thread-safe lock for position-limit checks + app_state mutations
 _execute_lock = threading.Lock()
 _state_lock   = threading.Lock()  # OMNI M-NEW-3: guards app_state counter mutations
-_skipped_tickers: set = set()    # GAP-001: tickers skipped for session due to INVALID_PAYLOAD (422)
+# GAP-2: _skipped_tickers is now a dict {ticker: datetime_added} with 30-min TTL.
+# Replaces the old permanent set — a ticker banned for one bad order should not stay
+# banned all day. Use _is_ticker_skipped() to check + auto-expire.
+_skipped_tickers: dict = {}      # ticker → datetime added (ET); 30-min TTL per GAP-2
 _ticker_fail_counts: dict = {}   # GAP-CB: consecutive execution failures per ticker
 _TICKER_FAIL_THRESHOLD = 3       # GAP-CB: auto-skip after this many consecutive failures
+_SKIPPED_TICKER_TTL_S  = 1800   # GAP-2: 30 minutes
+
+# GAP-6: Per-ticker locks — prevent exit_monitor/execute race condition on same position
+_ticker_locks: dict = {}          # ticker → threading.Lock
+_ticker_locks_mutex = threading.Lock()  # guards the dict itself
+
+
+def _get_ticker_lock(ticker: str) -> threading.Lock:
+    """Get (or lazily create) the per-ticker threading.Lock. Thread-safe (GAP-6)."""
+    with _ticker_locks_mutex:
+        if ticker not in _ticker_locks:
+            _ticker_locks[ticker] = threading.Lock()
+        return _ticker_locks[ticker]
+
+
+def _is_ticker_skipped(ticker: str) -> bool:
+    """Check if ticker is in skip list. Expires entries older than 30 min (GAP-2 TTL)."""
+    from datetime import timedelta
+    now = datetime.now(ET)
+    cutoff = now - timedelta(seconds=_SKIPPED_TICKER_TTL_S)
+    # Expire stale entries inline (best-effort, no lock needed — worst case: brief extra skip)
+    expired = [t for t, added in list(_skipped_tickers.items()) if added < cutoff]
+    for t in expired:
+        _skipped_tickers.pop(t, None)
+        logger.info("GAP-2: skip-list TTL expired for %s (was added at %s)", t, _skipped_tickers.get(t))
+    return ticker.upper() in _skipped_tickers
 
 # ── Block 2: Startup Preflight Gate ──────────────────────────────────────────
 # Module-level mode flag.  "active" = normal; "standby" = preflight failed.
@@ -165,7 +194,12 @@ _prior_state = _svc_state.restore()
 _STATE_RESTORED = bool(_prior_state)  # GAP-002: expose in /health
 if _prior_state.get("execution_paused"):    app_state["execution_paused"] = True
 # Block 3: trades_today is derived from DB (count_new_positions_today) — do not seed from prior state
-if _prior_state.get("skipped_tickers"):     _skipped_tickers.update(_prior_state["skipped_tickers"])
+# GAP-2: restore skipped_tickers as dict with current time as added-time.
+# Prior state stored only ticker names (list); restore with now() so the 30-min TTL
+# applies from the moment of restart, not from an unknown prior time.
+if _prior_state.get("skipped_tickers"):
+    _restore_ts = datetime.now(ET)
+    _skipped_tickers.update({t: _restore_ts for t in _prior_state["skipped_tickers"]})
 if _prior_state.get("ticker_fail_counts"):  _ticker_fail_counts.update(_prior_state["ticker_fail_counts"])
 
 # FLAW 4 fix: Validate restored state against live Alpaca before trusting it.
@@ -183,14 +217,15 @@ def _validate_restored_state() -> None:
         for t in stale_fails:
             del _ticker_fail_counts[t]
             logger.info("FLAW4: cleared stale ticker_fail_count for %s (no live Alpaca position)", t)
-        # Clear skipped tickers not in live positions either
-        stale_skipped = {t for t in _skipped_tickers if t not in live_positions}
-        _skipped_tickers.difference_update(stale_skipped)
+        # Clear skipped tickers not in live positions either (GAP-2: _skipped_tickers is now a dict)
+        stale_skipped = {t for t in list(_skipped_tickers.keys()) if t not in live_positions}
+        for t in stale_skipped:
+            _skipped_tickers.pop(t, None)
         if stale_skipped:
             logger.info("FLAW4: cleared stale skipped_tickers: %s", stale_skipped)
         if stale_fails or stale_skipped:
             _svc_state.write_many({"ticker_fail_counts": dict(_ticker_fail_counts),
-                                   "skipped_tickers": list(_skipped_tickers)})
+                                   "skipped_tickers": list(_skipped_tickers.keys())})
         logger.info("FLAW4: restore validation complete. live_positions=%s", live_positions)
     except Exception as _e:
         logger.warning("FLAW4: restore validation failed (non-fatal): %s", _e)
@@ -269,8 +304,8 @@ def _get_reporter() -> BufferReporter:
 def _get_current_vix() -> Optional[float]:
     """
     Fetch current VIX from Axiom's /health endpoint.
-    Returns None if Axiom is unreachable or VIX is unavailable.
-    Non-blocking — fails gracefully.
+    Returns 999.0 (brake-trigger value) if Axiom is unreachable — fail SAFE (GAP-1).
+    Non-blocking — never raises.
     """
     try:
         import requests as _req
@@ -283,7 +318,13 @@ def _get_current_vix() -> Optional[float]:
             vix = resp.json().get("vix")
             return float(vix) if vix is not None else None
     except Exception as e:
-        logger.warning("VIX fetch from Axiom failed: %s", e)
+        # GAP-1: Fail SAFE — if Axiom is unreachable we cannot verify VIX is below brake.
+        # Return 999.0 so _check_vix_brake() fires the FULL brake and halts new positions.
+        # "fail open" (return None) is not acceptable — the system must not trade blind.
+        logger.warning(
+            "VIX fetch from Axiom failed — failing SAFE (returning 999.0 to trigger VIX brake): %s", e
+        )
+        return 999.0
     return None
 
 
@@ -868,7 +909,7 @@ def health() -> JSONResponse:
         "alpaca_reachable":   alpaca_ok,
         "execution_paused":      app_state.get("execution_paused", False),
         "first_exec_failed":     app_state.get("first_exec_failed", False),
-        "skipped_tickers":       list(_skipped_tickers),  # GAP-001: 422-skipped tickers this session
+        "skipped_tickers":       list(_skipped_tickers.keys()),  # GAP-2: TTL dict, show active keys
         "ticker_fail_counts":    dict(_ticker_fail_counts),  # GAP-CB: consecutive failures per ticker
         "circuit_breaker_threshold": _TICKER_FAIL_THRESHOLD,
         "vix":                   current_vix,
@@ -957,8 +998,8 @@ def execute(
             },
         )
 
-    # GAP-001: Skip gate — reject tickers that caused a 422 INVALID_PAYLOAD this session
-    if body.ticker.upper() in _skipped_tickers:
+    # GAP-001/GAP-2: Skip gate — reject tickers in the 30-min skip list
+    if _is_ticker_skipped(body.ticker.upper()):
         logger.warning("Ticker %s in session skip list (prior 422) — rejecting", body.ticker)
         return JSONResponse(
             status_code=422,
@@ -1113,6 +1154,32 @@ def execute(
     # reservation, so only one can pass the limit check.
     pending_id = None
     with _execute_lock:
+        # V2 C1 fix: Alpaca live query is combined cap ground truth across all services.
+        # Local DB count is secondary. If Alpaca unreachable: fail closed (block execution).
+        try:
+            from database import count_open_positions_alpaca
+            alpaca_live_count = count_open_positions_alpaca(
+                settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
+            )
+            if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
+                logger.info(
+                    "Alpha execution blocked: Alpaca shows %d/%d live positions (combined cap)",
+                    alpaca_live_count, MAX_CONCURRENT_POSITIONS
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "executed": False,
+                        "reason": f"POSITION_CAP: Alpaca shows {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open positions (combined across all services)",
+                    },
+                )
+        except RuntimeError as _alpaca_err:
+            logger.warning("Alpaca live position check failed: %s — blocking as safety measure", _alpaca_err)
+            return JSONResponse(
+                status_code=503,
+                content={"executed": False, "reason": f"Cannot verify position count: {_alpaca_err}"},
+            )
+
         open_count  = count_open_positions(settings.alpha_db_path)  # includes 'pending'
         today_count = count_new_positions_today(settings.alpha_db_path)
 
@@ -1390,7 +1457,7 @@ def execute(
                 )
 
             if error_class == ExecutionErrorClass.INVALID_PAYLOAD:
-                if body.ticker.upper() not in _skipped_tickers:
+                if not _is_ticker_skipped(body.ticker.upper()):
                     threading.Thread(
                         target=_run_healer_sync,
                         args=(e, body.ticker, app_state, _state_lock,
