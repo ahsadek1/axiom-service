@@ -360,15 +360,15 @@ def _get_current_vix() -> Optional[float]:
     """
     Return cached VIX (FreshValue, 5-min TTL). Falls back to live fetch on cache miss.
     Returns 999.0 (brake-trigger value) if Axiom is unreachable — fail SAFE (GAP-1).
+    FreshValue.get() returns None when stale (not an exception) — use None as the
+    cache-miss signal to trigger a live fetch.
     """
-    try:
-        return _vix_fresh.get()   # raises StaleStateError if TTL expired
-    except Exception:
-        pass
-    # Cache miss or stale — fetch live and refresh cache
+    cached = _vix_fresh.get()   # None if stale or never populated
+    if cached is not None:
+        return cached
+    # Cache miss or stale — fetch live and refresh via update() (thread-safe)
     vix = _fetch_vix_from_axiom()
-    _vix_fresh._value = vix
-    _vix_fresh._updated_at = __import__('datetime').datetime.utcnow()
+    _vix_fresh.update(vix)  # atomic: acquires lock, sets value + resets clock
     return vix
 
 

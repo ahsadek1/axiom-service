@@ -46,18 +46,16 @@ def _get_prime_vix_cached(axiom_url: str, axiom_secret: str) -> float:
     Falls back to live Axiom fetch on cache miss.
     Returns 0.0 (pass-through) on any error — existing fail-open for Prime preserved.
     """
-    try:
-        return _prime_vix_fresh.get()
-    except Exception:
-        pass
-    # Cache miss — fetch live
+    cached = _prime_vix_fresh.get()  # None if stale or never populated
+    if cached is not None:
+        return cached
+    # Cache miss — fetch live and update via update() (thread-safe)
     try:
         import requests as _r
         resp = _r.get(f"{axiom_url}/health",
                       headers={"X-Axiom-Secret": axiom_secret}, timeout=4)
         vix = float(resp.json().get("vix", 0) or 0)
-        _prime_vix_fresh._value = vix
-        _prime_vix_fresh._updated_at = __import__('datetime').datetime.utcnow()
+        _prime_vix_fresh.update(vix)  # atomic: acquires lock, resets clock
         return vix
     except Exception as _e:
         return 0.0  # fail-open: Prime VIX gate is advisory
