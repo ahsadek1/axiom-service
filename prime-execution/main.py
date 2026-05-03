@@ -10,6 +10,7 @@ Port: 8006 (local), $PORT (Railway).
 
 import logging
 import os
+import re
 import secrets
 import threading
 from contextlib import asynccontextmanager
@@ -101,6 +102,36 @@ def _compute_module_hash() -> str:
 
 _CODE_HASH = _compute_module_hash()
 
+# P3 fix: cache module hash with 60s TTL — avoids rehashing all .py files on every /health call
+import time as _time_p
+_cached_module_hash_p: str = _CODE_HASH
+_cached_module_hash_ts_p: float = _time_p.monotonic()
+_module_hash_lock_p = threading.Lock()
+
+
+def _get_cached_module_hash_p() -> str:
+    """Return module hash, recomputing at most once per 60 seconds."""
+    global _cached_module_hash_p, _cached_module_hash_ts_p
+    with _module_hash_lock_p:
+        if _time_p.monotonic() - _cached_module_hash_ts_p > 60:
+            _cached_module_hash_p = _compute_module_hash()
+            _cached_module_hash_ts_p = _time_p.monotonic()
+    return _cached_module_hash_p
+
+
+# P1 fix: per-ticker lock (GAP-6 equivalent for Prime)
+# Prevents exit_monitor + /execute race on same position
+_ticker_locks_p: dict = {}
+_ticker_locks_p_mutex = threading.Lock()
+
+
+def _get_ticker_lock_p(ticker: str) -> threading.Lock:
+    """Get (or lazily create) a per-ticker threading.Lock for Prime. Thread-safe."""
+    with _ticker_locks_p_mutex:
+        if ticker not in _ticker_locks_p:
+            _ticker_locks_p[ticker] = threading.Lock()
+        return _ticker_locks_p[ticker]
+
 logging.basicConfig(
     level  = logging.INFO,
     format = "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -118,6 +149,7 @@ app_state: dict = {
     "last_reconcile_at":           None,
     "last_reconcile_mismatches":   0,
     "was_paused_for_reconcile":    False,
+    "reconcile_paused_at":          None,   # P2 fix: timestamp when reconciler triggered pause (auto-clear after 4h)
     "auto_execute":  os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true",
     "mode":          "live" if os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true" else "dry_run",
     # Exit monitor state (S10 fix)
@@ -544,11 +576,12 @@ def _run_exit_monitor() -> None:
     app_state["exit_monitor_run_count"]  += 1
     try:
         events = evaluate_exits(
-            db_path         = settings.prime_db_path,
-            alpaca_client   = _get_alpaca(),
-            buffer_reporter = _get_reporter(),
-            bot_token       = settings.telegram_bot_token,
-            chat_id         = settings.ahmed_chat_id,
+            db_path             = settings.prime_db_path,
+            alpaca_client       = _get_alpaca(),
+            buffer_reporter     = _get_reporter(),
+            bot_token           = settings.telegram_bot_token,
+            chat_id             = settings.ahmed_chat_id,
+            ticker_lock_getter  = _get_ticker_lock_p,  # P1 fix: per-ticker lock (prevents execute/exit race)
         )
         app_state["exit_monitor_last_event_count"] = len(events)
         app_state["exit_monitor_last_error"]       = None
@@ -695,7 +728,8 @@ def health() -> JSONResponse:
         "mode":                app_state.get("mode", "dry_run"),
         "state_restored":      _STATE_RESTORED_P,
         "code_hash":           _CODE_HASH,
-        "stale_deploy":        (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
+        # P1 fix: /tmp sentinel is cleared on reboot — rely on hash comparison only (P3: cached 60s TTL)
+        "stale_deploy":        _CODE_HASH != _get_cached_module_hash_p(),
         "resilience_status":   _resilience,
     })
 
@@ -808,16 +842,47 @@ def execute(
         logger.warning("C-11: VIX check failed (%s) — proceeding (fail-open for prime)", _ve)
         app_state.setdefault("vix_brake_prime", "UNKNOWN")
 
-    # ── Reconciler pause check (read-only — no lock needed) ───────────────────
+    # ── Reconciler pause check with P2 auto-clear (4h max) ─────────────────────
     if app_state.get("execution_paused"):
-        return JSONResponse(
-            status_code = 503,
-            content     = {
-                "executed": False,
-                "reason":   "Execution paused — position reconciliation mismatch detected. "
-                            "Resolve positions then wait for next reconciler cycle.",
-            },
-        )
+        # P2 fix: auto-clear after 4h — prevents indefinite stall over weekends
+        paused_at = app_state.get("reconcile_paused_at")
+        if paused_at:
+            import time as _t_chk
+            paused_hours = (_t_chk.time() - paused_at) / 3600
+            if paused_hours >= 4.0:
+                with _state_lock:
+                    app_state["execution_paused"] = False
+                    app_state["reconcile_paused_at"] = None
+                    _svc_state.write("execution_paused", False)
+                try:
+                    from shared.resilience.alerts import alert_ahmed as _aa
+                    _aa(
+                        f"Prime auto-resumed after {paused_hours:.1f}h reconciler pause.\n"
+                        f"Verify positions are correct before market open.",
+                        key="prime-reconcile-auto-resume",
+                        severity="WARNING",
+                    )
+                except Exception:
+                    pass
+                logger.warning("P2: Prime auto-resumed after %.1fh reconciler pause", paused_hours)
+            else:
+                return JSONResponse(
+                    status_code = 503,
+                    content     = {
+                        "executed": False,
+                        "reason":   f"Execution paused (reconciler mismatch, {paused_hours:.1f}h ago). "
+                                    "Auto-clears at 4h or send RESUME directive.",
+                    },
+                )
+        else:
+            return JSONResponse(
+                status_code = 503,
+                content     = {
+                    "executed": False,
+                    "reason":   "Execution paused — position reconciliation mismatch detected. "
+                                "Resolve positions then wait for next reconciler cycle.",
+                },
+            )
 
     alpaca = _get_alpaca()
 
@@ -911,8 +976,12 @@ def execute(
     # Block 4: Pre-submission order existence check
     # Check Alpaca directly before submitting — prevents duplicate equity orders
     # after restart or OMNI retry on the same window.
-    _prime_coid = f"nexus-prime-{body.ticker}-{body.verdict[:4] if body.verdict else 'go'}"
-    _prime_coid = _prime_coid[:48].replace(" ", "-")
+    # P2 fix: validate COID format — Alpaca requires alphanumeric + hyphens only
+    _verdict_slug = re.sub(r"[^A-Za-z0-9]", "", body.verdict[:4]) if body.verdict else "go"
+    if not _verdict_slug:
+        _verdict_slug = "go"
+    _prime_coid = f"nexus-prime-{re.sub(r'[^A-Za-z0-9]', '', body.ticker)}-{_verdict_slug}"
+    _prime_coid = _prime_coid[:48]  # Alpaca COID max length
     _existing_prime_order = alpaca.get_order_by_client_id(_prime_coid)
     if _existing_prime_order is not None:
         _ep_status = _existing_prime_order.get("status", "unknown")

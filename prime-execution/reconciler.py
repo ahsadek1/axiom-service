@@ -120,6 +120,7 @@ def _run_reconciler_locked(
     # ── Critical fix: Alpaca failure = unknown state = pause ─────────────────
     if alpaca_error is not None:
         app_state["execution_paused"]          = True
+        app_state["reconcile_paused_at"]       = __import__('time').time()  # P2 fix: timestamp for auto-clear
         app_state["last_reconcile_at"]         = now
         app_state["last_reconcile_mismatches"] = -1   # -1 signals API failure
 
@@ -209,6 +210,11 @@ def _run_reconciler_locked(
     app_state["execution_paused"]          = execution_paused
     app_state["last_reconcile_at"]         = now
     app_state["last_reconcile_mismatches"] = mismatch_count
+    # P2 fix: stamp pause timestamp for auto-clear logic in main.py
+    if execution_paused:
+        app_state["reconcile_paused_at"] = __import__('time').time()
+    else:
+        app_state["reconcile_paused_at"] = None
 
     # Log to DB
     log_reconciliation(

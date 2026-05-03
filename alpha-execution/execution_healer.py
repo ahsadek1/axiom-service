@@ -147,6 +147,8 @@ def _notify_sovereign(result: HealResult, ticker: str, error_msg: str) -> None:
 def _notify_ahmed(result: HealResult, ticker: str, error_msg: str) -> None:
     """
     Page Ahmed via Telegram — only called when escalation is required.
+    P1 fix: routes through alert_ahmed() with per-ticker+error-class dedup key.
+    Prevents flooding Ahmed when healer retries the same error class repeatedly.
     Fire-and-forget — never raises.
     """
     text = (
@@ -158,17 +160,17 @@ def _notify_ahmed(result: HealResult, ticker: str, error_msg: str) -> None:
         f"Why it failed: {result.summary}\n"
         f"Execution is PAUSED. Resume via POST /resume after fixing the issue."
     )
-    if not TELEGRAM_BOT_TOKEN:
-        logger.warning("No TELEGRAM_BOT_TOKEN — cannot page Ahmed")
-        return
     try:
-        _requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": AHMED_CHAT_ID, "text": text},
-            timeout=5,
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+        from shared.resilience.alerts import alert_ahmed as _aa
+        _aa(
+            text,
+            key=f"alpha-healer-{ticker}-{result.error_class.value}",
+            severity="CRITICAL",
         )
     except Exception as e:
-        logger.warning("Ahmed Telegram notification failed: %s", e)
+        logger.warning("Ahmed alert_ahmed notification failed: %s", e)
 
 
 # ── Resolution Handlers ───────────────────────────────────────────────────────

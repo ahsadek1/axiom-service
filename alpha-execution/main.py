@@ -44,6 +44,22 @@ def _compute_module_hash() -> str:
 
 _CODE_HASH = _compute_module_hash()
 
+# P3 fix: cache module hash with 60s TTL — avoids rehashing all .py files on every /health call
+_cached_module_hash: str = _CODE_HASH
+_cached_module_hash_ts: float = _time.monotonic() if '_time' in dir() else __import__('time').monotonic()
+_module_hash_lock = threading.Lock() if 'threading' in dir() else __import__('threading').Lock()
+
+
+def _get_cached_module_hash() -> str:
+    """Return module hash, recomputing at most once per 60 seconds."""
+    global _cached_module_hash, _cached_module_hash_ts
+    import time as _t
+    with _module_hash_lock:
+        if _t.monotonic() - _cached_module_hash_ts > 60:
+            _cached_module_hash = _compute_module_hash()
+            _cached_module_hash_ts = _t.monotonic()
+    return _cached_module_hash
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
 from shared.service_state import ServiceStateWriter as _StateWriter
@@ -129,7 +145,13 @@ logger = logging.getLogger("alpha_exec.main")
 # GAP-9: Add rotating file handler so logs survive service restarts and don't fill disk.
 # 10 MB per file, 3 backups = up to 40 MB total log retention.
 import os as _os_log
-_LOG_PATH = _os_log.getenv("ALPHA_EXEC_LOG_PATH", "/tmp/alpha_exec.log")
+# P1 fix: default to persistent path — /tmp is cleared on reboot, losing crash diagnostics
+_LOG_PATH = _os_log.getenv(
+    "ALPHA_EXEC_LOG_PATH",
+    "/Users/ahmedsadek/nexus/logs/alpha-execution/alpha_exec.log"
+)
+# Ensure log directory exists before attaching handler
+_os_log.makedirs(_os_log.path.dirname(_LOG_PATH), exist_ok=True)
 try:
     from logging.handlers import RotatingFileHandler as _RFH
     _rfh = _RFH(_LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3)
@@ -425,13 +447,27 @@ def _check_earnings_gate(ticker: str, expiration_date: str, polygon_key: str) ->
         # Old logic (expiry + BLOCK_DAYS) blocked trades for earnings AFTER expiry — nonsensical.
         imminent_cutoff = today + _td(days=EARNINGS_BLOCK_DAYS)
 
-        # Polygon earnings calendar endpoint
+        # P3 fix: retry Polygon with backoff — single timeout miss was silently skipping the gate
+        # (a risk exposure, not a data error). Max 2 retries, 2s backoff.
         url = (
             f"https://api.polygon.io/v2/reference/financials/{ticker}"
             f"?limit=4&type=Q&apiKey={polygon_key}"
         )
-        resp = _req.get(url, timeout=8)
-        if resp.status_code != 200:
+        resp = None
+        import time as _t_earn
+        for _attempt in range(3):  # 0, 1, 2
+            try:
+                resp = _req.get(url, timeout=8)
+                if resp.status_code == 200:
+                    break
+                logger.warning("EARNINGS GATE: Polygon returned %d for %s (attempt %d)", resp.status_code, ticker, _attempt + 1)
+            except Exception as _re:
+                logger.warning("EARNINGS GATE: Polygon request failed for %s (attempt %d): %s", ticker, _attempt + 1, _re)
+                resp = None
+            if _attempt < 2:
+                _t_earn.sleep(2)
+
+        if resp is None or resp.status_code != 200:
             # Fallback: try the newer earnings endpoint
             url2 = (
                 f"https://api.polygon.io/v3/reference/tickers/{ticker}"
@@ -439,7 +475,7 @@ def _check_earnings_gate(ticker: str, expiration_date: str, polygon_key: str) ->
             )
             resp2 = _req.get(url2, timeout=5)
             if resp2.status_code != 200:
-                logger.warning("EARNINGS GATE: Polygon returned %d for %s — gate skipped", resp.status_code, ticker)
+                logger.warning("EARNINGS GATE: Polygon unavailable for %s after retries — gate skipped", ticker)
                 return None
             # Can't get earnings from ticker endpoint alone — skip
             return None
@@ -1009,7 +1045,10 @@ def health() -> JSONResponse:
         "mode":               app_state.get("mode", "dry_run"),
         "state_restored":     _STATE_RESTORED,
         "code_hash":          _CODE_HASH,
-        "stale_deploy":       (not _os.path.exists("/tmp/nexus_deploy_in_progress")) and _CODE_HASH != _compute_module_hash(),
+        # P1 fix: /tmp sentinel is cleared on reboot — rely on hash comparison only.
+        # Hash is computed at module load (_CODE_HASH); recomputing here detects hot-patches.
+        # Cache the recomputed hash to avoid rehashing all .py files on every /health call (P3 fix).
+        "stale_deploy":       _CODE_HASH != _get_cached_module_hash(),
         "resilience_status":  _resilience,
     })
 
@@ -1172,9 +1211,14 @@ def execute(
     vix_rejection = _check_vix_brake(current_vix, body.direction)
     if vix_rejection:
         logger.warning("VIX BRAKE FIRED for %s: %s", body.ticker, vix_rejection)
+        # P2 fix: dedup via alert_ahmed — one alert per 30 min, not one per /execute call
         try:
-            from shared.notification_router import notify_warn as _nw
-            _nw("alpha-execution", "VIX BRAKE", vix_rejection, ticker=body.ticker)
+            from shared.resilience.alerts import alert_ahmed as _aa
+            _aa(
+                f"VIX BRAKE ACTIVE: {vix_rejection}\nAll /execute calls blocked until VIX clears.",
+                key="alpha-vix-brake-active",
+                severity="WARNING",
+            )
         except Exception:
             pass
         return JSONResponse(
