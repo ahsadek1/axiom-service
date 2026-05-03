@@ -47,6 +47,8 @@ _CODE_HASH = _compute_module_hash()
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
 from shared.service_state import ServiceStateWriter as _StateWriter
+from shared.resilience.state import FreshValue as _FreshValue
+from datetime import timedelta as _timedelta
 _svc_state = _StateWriter("alpha-execution")  # GAP-002: durable state across restarts
 
 
@@ -321,11 +323,20 @@ def _get_reporter() -> BufferReporter:
     return BufferReporter(settings.alpha_buffer_url, settings.nexus_webhook_secret)
 
 
-def _get_current_vix() -> Optional[float]:
+# B3 — FreshValue VIX cache (5-min TTL, background refresh every 3 min)
+# Eliminates live Axiom HTTP call on every /execute.
+# Stale VIX is explicit — existing brake handles None cleanly (GAP-1 preserved).
+_vix_fresh: _FreshValue[Optional[float]] = _FreshValue(
+    value=None,
+    max_age=_timedelta(minutes=5),
+    label="alpha-vix-cache"
+)
+
+
+def _fetch_vix_from_axiom() -> Optional[float]:
     """
-    Fetch current VIX from Axiom's /health endpoint.
-    Returns 999.0 (brake-trigger value) if Axiom is unreachable — fail SAFE (GAP-1).
-    Non-blocking — never raises.
+    Fetch VIX directly from Axiom /health. Returns 999.0 on failure (fail SAFE).
+    Called by the background refresh thread and on cache miss.
     """
     try:
         import requests as _req
@@ -338,14 +349,27 @@ def _get_current_vix() -> Optional[float]:
             vix = resp.json().get("vix")
             return float(vix) if vix is not None else None
     except Exception as e:
-        # GAP-1: Fail SAFE — if Axiom is unreachable we cannot verify VIX is below brake.
-        # Return 999.0 so _check_vix_brake() fires the FULL brake and halts new positions.
-        # "fail open" (return None) is not acceptable — the system must not trade blind.
         logger.warning(
             "VIX fetch from Axiom failed — failing SAFE (returning 999.0 to trigger VIX brake): %s", e
         )
         return 999.0
     return None
+
+
+def _get_current_vix() -> Optional[float]:
+    """
+    Return cached VIX (FreshValue, 5-min TTL). Falls back to live fetch on cache miss.
+    Returns 999.0 (brake-trigger value) if Axiom is unreachable — fail SAFE (GAP-1).
+    """
+    try:
+        return _vix_fresh.get()   # raises StaleStateError if TTL expired
+    except Exception:
+        pass
+    # Cache miss or stale — fetch live and refresh cache
+    vix = _fetch_vix_from_axiom()
+    _vix_fresh._value = vix
+    _vix_fresh._updated_at = __import__('datetime').datetime.utcnow()
+    return vix
 
 
 def _check_vix_brake(vix: Optional[float], direction: str) -> Optional[str]:
@@ -577,9 +601,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "Block 2: PREFLIGHT FAILED — entering STANDBY mode. Reason: %s", _pf_reason
         )
         try:
-            from shared.notification_router import notify_escalate as _ne
-            _ne("alpha-execution", "STANDBY MODE — PREFLIGHT FAILED",
-                f"Alpha Execution is in STANDBY. Retrying every 30s.\nReason: {_pf_reason}")
+            from shared.resilience.alerts import alert_ahmed as _aa
+            _aa(
+                f"Alpha Execution entered STANDBY.\nReason: {_pf_reason}\nRetrying every 30s.",
+                key="alpha-exec-standby",
+                severity="CRITICAL",
+            )
         except Exception:
             pass
         import threading as _threading
@@ -1755,11 +1782,13 @@ def execute(
                 extra={"gate": "post_confirm_position_check", "position_id": position_id},
             )
             try:
-                from shared.notification_router import notify_escalate as _ne
-                _ne("alpha-execution",
-                    "PHANTOM POSITION DETECTED",
-                    f"Fill confirmed but zero Alpaca legs. Position #{position_id} auto-closed.",
-                    ticker=body.ticker)
+                from shared.resilience.alerts import alert_ahmed as _aa
+                _aa(
+                    f"PHANTOM POSITION: Fill confirmed but zero Alpaca legs.\n"
+                    f"Position #{position_id} auto-closed. Ticker: {body.ticker}",
+                    key=f"alpha-phantom-{position_id}",
+                    severity="CRITICAL",
+                )
             except Exception:
                 pass
             # Return 503 — the order technically filled but left no position

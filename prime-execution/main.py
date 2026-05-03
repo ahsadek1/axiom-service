@@ -31,6 +31,36 @@ import sys as _sys_p
 import os.path as _osp
 _sys_p.path.insert(0, _osp.join(_osp.dirname(_osp.abspath(__file__)), ".."))
 from shared.service_state import ServiceStateWriter as _ServiceStateWriter
+from shared.resilience.state import FreshValue as _FreshValue
+from datetime import timedelta as _timedelta
+
+# B3 — FreshValue VIX cache (5-min TTL) — eliminates live Axiom call on every /execute
+_prime_vix_fresh: _FreshValue = _FreshValue(
+    value=None, max_age=_timedelta(minutes=5), label="prime-vix-cache"
+)
+
+
+def _get_prime_vix_cached(axiom_url: str, axiom_secret: str) -> float:
+    """
+    Return cached VIX for Prime gate check (5-min TTL).
+    Falls back to live Axiom fetch on cache miss.
+    Returns 0.0 (pass-through) on any error — existing fail-open for Prime preserved.
+    """
+    try:
+        return _prime_vix_fresh.get()
+    except Exception:
+        pass
+    # Cache miss — fetch live
+    try:
+        import requests as _r
+        resp = _r.get(f"{axiom_url}/health",
+                      headers={"X-Axiom-Secret": axiom_secret}, timeout=4)
+        vix = float(resp.json().get("vix", 0) or 0)
+        _prime_vix_fresh._value = vix
+        _prime_vix_fresh._updated_at = __import__('datetime').datetime.utcnow()
+        return vix
+    except Exception as _e:
+        return 0.0  # fail-open: Prime VIX gate is advisory
 _svc_state = _ServiceStateWriter("prime-execution")
 from database import (
     cancel_pending_position,
@@ -444,9 +474,12 @@ async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
             "Block 2: PREFLIGHT FAILED — entering STANDBY mode. Reason: %s", _pf_reason
         )
         try:
-            from shared.notification_router import notify_escalate as _ne
-            _ne("prime-execution", "STANDBY MODE — PREFLIGHT FAILED",
-                f"Prime Execution is in STANDBY. Retrying every 30s.\nReason: {_pf_reason}")
+            from shared.resilience.alerts import alert_ahmed as _aa
+            _aa(
+                f"Prime Execution entered STANDBY.\nReason: {_pf_reason}\nRetrying every 30s.",
+                key="prime-exec-standby",
+                severity="CRITICAL",
+            )
         except Exception:
             pass
         import threading as _th
@@ -756,15 +789,10 @@ def execute(
         )
 
     # ── C-11: Prime VIX Gate — block new equity positions above VIX halt threshold ──────
+    # B3: Uses FreshValue cache (5-min TTL) — no live Axiom call on every /execute
     try:
-        import requests as _req_vix
         from config import VIX_PAUSE_THRESHOLD_PRIME, AXIOM_URL_PRIME, AXIOM_SECRET_PRIME
-        _axiom_h = _req_vix.get(
-            f"{AXIOM_URL_PRIME}/health",
-            headers={"X-Axiom-Secret": AXIOM_SECRET_PRIME},
-            timeout=4,
-        ).json()
-        _vix = float(_axiom_h.get("vix", 0) or 0)
+        _vix = _get_prime_vix_cached(AXIOM_URL_PRIME, AXIOM_SECRET_PRIME)
         if _vix >= VIX_PAUSE_THRESHOLD_PRIME:
             logger.warning(
                 "C-11: Prime VIX gate — VIX=%.1f >= %.1f, blocking new position for %s",
