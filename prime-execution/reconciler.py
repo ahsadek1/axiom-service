@@ -120,9 +120,13 @@ def _run_reconciler_locked(
     # ── Critical fix: Alpaca failure = unknown state = pause ─────────────────
     if alpaca_error is not None:
         app_state["execution_paused"]          = True
-        app_state["reconcile_paused_at"]       = __import__('time').time()  # P2 fix: timestamp for auto-clear
-        app_state["last_reconcile_at"]         = now
+        _paused_ts = __import__('time').time()
+        app_state["reconcile_paused_at"] = _paused_ts   # P2 fix: timestamp for auto-clear
+        app_state["last_reconcile_at"]   = now
         app_state["last_reconcile_mismatches"] = -1   # -1 signals API failure
+        # Bug 4 fix: persist so auto-clear survives service restarts
+        if "svc_state" in app_state:
+            app_state["svc_state"].write("reconcile_paused_at", str(_paused_ts))
 
         log_reconciliation(
             db_path          = db_path,
@@ -212,9 +216,15 @@ def _run_reconciler_locked(
     app_state["last_reconcile_mismatches"] = mismatch_count
     # P2 fix: stamp pause timestamp for auto-clear logic in main.py
     if execution_paused:
-        app_state["reconcile_paused_at"] = __import__('time').time()
+        _paused_ts2 = __import__('time').time()
+        app_state["reconcile_paused_at"] = _paused_ts2
+        # Bug 4 fix: persist so auto-clear survives service restarts
+        if "svc_state" in app_state:
+            app_state["svc_state"].write("reconcile_paused_at", str(_paused_ts2))
     else:
         app_state["reconcile_paused_at"] = None
+        if "svc_state" in app_state:
+            app_state["svc_state"].write("reconcile_paused_at", "")
 
     # Log to DB
     log_reconciliation(

@@ -46,18 +46,19 @@ _CODE_HASH = _compute_module_hash()
 
 # P3 fix: cache module hash with 60s TTL — avoids rehashing all .py files on every /health call
 _cached_module_hash: str = _CODE_HASH
-_cached_module_hash_ts: float = _time.monotonic() if '_time' in dir() else __import__('time').monotonic()
-_module_hash_lock = threading.Lock() if 'threading' in dir() else __import__('threading').Lock()
+# Bug 3 fix: explicit import instead of fragile dir() check
+import time as _time_hash
+_cached_module_hash_ts: float = _time_hash.monotonic()
+_module_hash_lock = threading.Lock()
 
 
 def _get_cached_module_hash() -> str:
     """Return module hash, recomputing at most once per 60 seconds."""
     global _cached_module_hash, _cached_module_hash_ts
-    import time as _t
     with _module_hash_lock:
-        if _t.monotonic() - _cached_module_hash_ts > 60:
+        if _time_hash.monotonic() - _cached_module_hash_ts > 60:
             _cached_module_hash = _compute_module_hash()
-            _cached_module_hash_ts = _t.monotonic()
+            _cached_module_hash_ts = _time_hash.monotonic()
     return _cached_module_hash
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -378,19 +379,38 @@ def _fetch_vix_from_axiom() -> Optional[float]:
     return None
 
 
+# Bug 1 fix: FreshValue.get() returns None for BOTH "cache stale" AND "cached value IS None"
+# (e.g. when Axiom returns vix=None during market close). This caused infinite re-fetching.
+# Solution: track last fetch time separately. Cache is considered populated once fetched,
+# even if the value is None. Use a thread-safe lock + timestamp.
+_vix_last_fetch_time: float = 0.0
+_vix_last_fetch_lock = threading.Lock()
+_VIX_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
 def _get_current_vix() -> Optional[float]:
     """
-    Return cached VIX (FreshValue, 5-min TTL). Falls back to live fetch on cache miss.
+    Return cached VIX with 5-min TTL. Falls back to live Axiom fetch on miss.
     Returns 999.0 (brake-trigger value) if Axiom is unreachable — fail SAFE (GAP-1).
-    FreshValue.get() returns None when stale (not an exception) — use None as the
-    cache-miss signal to trigger a live fetch.
+
+    Bug 1 fix: uses explicit timestamp-based TTL instead of FreshValue.get()==None,
+    which was indistinguishable from a cached None value (valid during market close).
     """
-    cached = _vix_fresh.get()   # None if stale or never populated
-    if cached is not None:
-        return cached
-    # Cache miss or stale — fetch live and refresh via update() (thread-safe)
+    global _vix_last_fetch_time
+    import time as _t_vix
+    now = _t_vix.time()
+
+    with _vix_last_fetch_lock:
+        age = now - _vix_last_fetch_time
+        if _vix_last_fetch_time > 0 and age < _VIX_CACHE_TTL_SECONDS:
+            # Cache hit — return whatever was last fetched (even None)
+            return _vix_fresh.get() if _vix_fresh.is_fresh else _fetch_vix_from_axiom()
+
+    # Cache miss or expired — fetch live
     vix = _fetch_vix_from_axiom()
-    _vix_fresh.update(vix)  # atomic: acquires lock, sets value + resets clock
+    with _vix_last_fetch_lock:
+        _vix_last_fetch_time = _t_vix.time()
+    _vix_fresh.update(vix if vix is not None else 0.0)  # Never store None in FreshValue
     return vix
 
 
@@ -1211,13 +1231,15 @@ def execute(
     vix_rejection = _check_vix_brake(current_vix, body.direction)
     if vix_rejection:
         logger.warning("VIX BRAKE FIRED for %s: %s", body.ticker, vix_rejection)
-        # P2 fix: dedup via alert_ahmed — one alert per 30 min, not one per /execute call
+        # P2 fix: dedup via alert_ahmed — one alert per 30 min per brake level
+        # Bug 2 fix: separate dedup keys for FULL vs ELEVATED — they have different risk impact
+        _vix_brake_level = "FULL" if "FULL" in vix_rejection else "ELEVATED"
         try:
             from shared.resilience.alerts import alert_ahmed as _aa
             _aa(
-                f"VIX BRAKE ACTIVE: {vix_rejection}\nAll /execute calls blocked until VIX clears.",
-                key="alpha-vix-brake-active",
-                severity="WARNING",
+                f"VIX BRAKE {_vix_brake_level} ACTIVE: {vix_rejection}\nAll /execute calls blocked until VIX clears.",
+                key=f"alpha-vix-brake-{_vix_brake_level}",
+                severity="CRITICAL" if _vix_brake_level == "FULL" else "WARNING",
             )
         except Exception:
             pass

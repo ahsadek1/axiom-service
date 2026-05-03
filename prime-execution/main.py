@@ -35,10 +35,13 @@ from shared.service_state import ServiceStateWriter as _ServiceStateWriter
 from shared.resilience.state import FreshValue as _FreshValue
 from datetime import timedelta as _timedelta
 
-# B3 — FreshValue VIX cache (5-min TTL) — eliminates live Axiom call on every /execute
-_prime_vix_fresh: _FreshValue = _FreshValue(
-    value=None, max_age=_timedelta(minutes=5), label="prime-vix-cache"
-)
+# B3 — VIX cache with explicit timestamp TTL (5-min)
+# Bug 1/Prime fix: FreshValue.get()==None is ambiguous (stale vs valid None from Axiom).
+# Use explicit fetch timestamp so None values are cached correctly.
+_prime_vix_last_fetch: float = 0.0
+_prime_vix_last_value: float = 0.0
+_prime_vix_lock = threading.Lock()
+_PRIME_VIX_TTL = 300  # 5 minutes
 
 
 def _get_prime_vix_cached(axiom_url: str, axiom_secret: str) -> float:
@@ -46,19 +49,31 @@ def _get_prime_vix_cached(axiom_url: str, axiom_secret: str) -> float:
     Return cached VIX for Prime gate check (5-min TTL).
     Falls back to live Axiom fetch on cache miss.
     Returns 0.0 (pass-through) on any error — existing fail-open for Prime preserved.
+    Bug fix: uses timestamp-based TTL so VIX=None from Axiom is cached correctly
+    and does not cause infinite re-fetching every /execute call.
     """
-    cached = _prime_vix_fresh.get()  # None if stale or never populated
-    if cached is not None:
-        return cached
-    # Cache miss — fetch live and update via update() (thread-safe)
+    global _prime_vix_last_fetch, _prime_vix_last_value
+    import time as _t_pvix
+    now = _t_pvix.time()
+
+    with _prime_vix_lock:
+        if _prime_vix_last_fetch > 0 and (now - _prime_vix_last_fetch) < _PRIME_VIX_TTL:
+            return _prime_vix_last_value  # Cache hit — even if value is 0.0
+
+    # Cache miss — fetch live
     try:
         import requests as _r
         resp = _r.get(f"{axiom_url}/health",
                       headers={"X-Axiom-Secret": axiom_secret}, timeout=4)
         vix = float(resp.json().get("vix", 0) or 0)
-        _prime_vix_fresh.update(vix)  # atomic: acquires lock, resets clock
+        with _prime_vix_lock:
+            _prime_vix_last_fetch = _t_pvix.time()
+            _prime_vix_last_value = vix
         return vix
     except Exception as _e:
+        with _prime_vix_lock:
+            _prime_vix_last_fetch = _t_pvix.time()  # Cache the failure too — don't hammer Axiom
+            _prime_vix_last_value = 0.0
         return 0.0  # fail-open: Prime VIX gate is advisory
 _svc_state = _ServiceStateWriter("prime-execution")
 from database import (
@@ -143,6 +158,7 @@ settings = load_settings()
 
 app_state: dict = {
     "settings":                    settings,
+    "svc_state":                   _svc_state,   # Bug 4 fix: expose for reconciler persistence
     "start_time":                  datetime.now(ET).isoformat(),
     "trades_today":                0,
     "execution_paused":            False,
@@ -168,6 +184,12 @@ _prior_state_p = _svc_state.restore()
 _STATE_RESTORED_P = bool(_prior_state_p)
 if _prior_state_p.get("execution_paused"):        app_state["execution_paused"] = True
 if _prior_state_p.get("was_paused_for_reconcile"): app_state["was_paused_for_reconcile"] = True
+# Bug 4 fix: restore reconcile_paused_at from service_state so auto-clear survives restarts
+if _prior_state_p.get("reconcile_paused_at"):
+    try:
+        app_state["reconcile_paused_at"] = float(_prior_state_p["reconcile_paused_at"])
+    except (ValueError, TypeError):
+        app_state["reconcile_paused_at"] = None
 # Block 3: trades_today is derived from DB — do NOT seed from prior state (DB is truth)
 
 # ── Block 2: Service mode ─────────────────────────────────────────────────────
