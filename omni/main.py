@@ -749,12 +749,15 @@ def _synthesis_silence_watcher() -> None:
 
                     logger.critical("SILENCE DIAGNOSIS: %s", _diagnosis)
 
-                    # Alert Ahmed via Telegram
+                    # Alert Ahmed via Telegram — deduped (30-min cooldown via alert_ahmed)
                     try:
-                        from shared.notification_router import notify_escalate as _ne
-                        _ne("omni", "OMNI SILENCE ALERT",
-                            f"No synthesis in {silent_min:.0f} minutes during market hours. "
-                            f"Diagnosis: {_diagnosis}")
+                        from shared.resilience.alerts import alert_ahmed as _aa
+                        _aa(
+                            f"OMNI SILENCE: No synthesis in {silent_min:.0f} min during market hours.\n"
+                            f"Diagnosis: {_diagnosis}",
+                            key="omni-silence-alert",
+                            severity="CRITICAL",
+                        )
                     except Exception as _te:
                         logger.error("Silence alert notification failed: %s", _te)
                     # Also notify Sovereign via message bus
@@ -896,9 +899,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _omni_standby_active = True
         _omni_standby_reason = f"Anthropic API key invalid: {_anthropic_result.message}"
         try:
-            from shared.notification_router import notify_escalate as _ne
-            _ne("omni", "OMNI STANDBY — Anthropic API Failed",
-                f"OMNI cannot synthesize without Claude. Retrying every 30s.\nReason: {_omni_standby_reason}")
+            from shared.resilience.alerts import alert_ahmed as _aa
+            _aa(
+                f"OMNI entered STANDBY — Anthropic API failed.\nReason: {_omni_standby_reason}\nRetrying every 30s.",
+                key="omni-standby",
+                severity="CRITICAL",
+            )
         except Exception:
             pass
         threading.Thread(

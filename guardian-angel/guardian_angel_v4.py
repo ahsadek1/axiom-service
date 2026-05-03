@@ -94,7 +94,9 @@ BASELINE_WINDOW_DAYS: int = int(os.environ.get("BASELINE_WINDOW_DAYS", "30"))
 ANOMALY_SIGMA: float = float(os.environ.get("ANOMALY_SIGMA", "3.0"))
 AI_CONFIDENCE_THRESHOLD: float = float(os.environ.get("AI_CONFIDENCE_THRESHOLD", "0.80"))
 
-HEARTBEAT_PATH: str = "/tmp/nexus_guardian_heartbeat"
+# P1 fix: moved from /tmp (cleared on reboot) to persistent path.
+# /tmp wipe on reboot meant GA crash post-reboot left no stale heartbeat to detect.
+HEARTBEAT_PATH: str = "/Users/ahmedsadek/nexus/data/guardian_heartbeat"
 
 # ── Block 9: CHRONICLE cron log ───────────────────────────────────────────────
 CHRONICLE_DB_PATH: str = "/Users/ahmedsadek/nexus/data/chronicle.db"
@@ -2954,7 +2956,7 @@ def _start_health_server(guardian_ref: Any) -> None:
     import json as _json
 
     HEALTH_PORT = 8009
-    HEARTBEAT_FILE = "/tmp/nexus_guardian_heartbeat"
+    HEARTBEAT_FILE = "/Users/ahmedsadek/nexus/data/guardian_heartbeat"
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802

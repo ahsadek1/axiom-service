@@ -488,6 +488,17 @@ def submit_pick(
             "Submission BLOCKED by circuit breaker (%s): %s/%s from %s",
             cb_status.status, body.ticker, body.direction, body.agent,
         )
+        # P2: Alert Ahmed when circuit breaker opens — deduped 30-min cooldown
+        try:
+            from shared.resilience.alerts import alert_ahmed as _aa
+            _aa(
+                f"Alpha Buffer circuit breaker OPEN ({cb_status.status}).\n"
+                f"Submissions blocked. Reason: {cb_status.notes}",
+                key=f"alpha-buffer-cb-{cb_status.status}",
+                severity="WARNING",
+            )
+        except Exception:
+            pass
         return JSONResponse(
             status_code = 503,
             content     = {
