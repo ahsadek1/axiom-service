@@ -28,9 +28,18 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 
+# F1 fix (Cipher adversarial review 2026-05-03):
+# Use canonical RESILIENCE-DB via triad_db — not a separate orphaned file.
+# rollback.py was writing to /nexus/data/resilience.db while triad_db uses
+# /nexus/shared/resilience/resilience.db. Audit trail was silently missing.
+from shared.resilience.triad_db import (
+    log_deployment as _triad_log_deployment,
+    mark_deployment_healthy as _triad_mark_healthy,
+    mark_deployment_rolled_back as _triad_mark_rolled_back,
+)
+
 logger = logging.getLogger("genesis.resilience.rollback")
 
-RESILIENCE_DB_PATH = "/Users/ahmedsadek/nexus/data/resilience.db"
 NEXUS_ROOT = "/Users/ahmedsadek/nexus"
 HEALTH_TIMEOUT = 5
 
@@ -54,68 +63,38 @@ SERVICES_PORTS: dict[str, int] = {
 }
 
 
-@contextmanager
-def _resilience_conn():
-    """SQLite connection to RESILIENCE-DB with BEGIN IMMEDIATE."""
-    conn = sqlite3.connect(RESILIENCE_DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def _ensure_schema() -> None:
-    """Ensure deployment_history table exists in RESILIENCE-DB."""
-    conn = sqlite3.connect(RESILIENCE_DB_PATH, timeout=10)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS deployment_history (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            service         TEXT    NOT NULL,
-            pre_deploy_sha  TEXT    NOT NULL,
-            deploy_time     TEXT    NOT NULL,
-            rollback_time   TEXT,
-            rollback_sha    TEXT,
-            rollback_status TEXT,
-            notes           TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+# Module-level registry: service_name -> triad_db deployment_id
+# Populated by tag_pre_deploy(), consumed by auto_rollback()
+_deployment_ids: dict[str, int] = {}
+# Module-level registry: service_name -> pre_deploy_sha
+_pre_deploy_shas: dict[str, str] = {}
 
 
 def tag_pre_deploy(service_name: str, sha: str) -> None:
     """
-    Record the pre-deploy git SHA in RESILIENCE-DB before any deploy.
+    Record the pre-deploy git SHA in canonical RESILIENCE-DB (triad_db) before any deploy.
 
-    Call this immediately before deploying new code. This SHA is the
-    rollback target if the deploy goes unhealthy.
+    Uses triad_db.log_deployment() — writes to the same DB as all other
+    resilience events (not an orphaned separate file).
 
     Args:
         service_name: Name of the service being deployed.
         sha:          Current git SHA (pre-deploy state).
     """
-    try:
-        os.makedirs(os.path.dirname(RESILIENCE_DB_PATH), exist_ok=True)
-        _ensure_schema()
-        with _resilience_conn() as conn:
-            conn.execute(
-                "INSERT INTO deployment_history (service, pre_deploy_sha, deploy_time) VALUES (?,?,?)",
-                (service_name, sha, datetime.utcnow().isoformat())
-            )
-        logger.info("tag_pre_deploy: service=%s sha=%s", service_name, sha)
-    except Exception as e:
-        logger.error("tag_pre_deploy failed for %s: %s", service_name, e)
+    deployment_id = _triad_log_deployment(
+        service=service_name,
+        pre_deploy_sha=sha,
+        post_deploy_sha="pending",  # updated on health verification
+        deployed_by="genesis",
+    )
+    _deployment_ids[service_name] = deployment_id
+    _pre_deploy_shas[service_name] = sha
+    logger.info("tag_pre_deploy: service=%s sha=%s deployment_id=%d", service_name, sha, deployment_id)
 
 
 def _get_pre_deploy_sha(service_name: str) -> Optional[str]:
     """
-    Retrieve most recent pre_deploy_sha for a service from RESILIENCE-DB.
+    Retrieve the pre-deploy SHA stored by tag_pre_deploy().
 
     Args:
         service_name: Name of the service.
@@ -123,18 +102,7 @@ def _get_pre_deploy_sha(service_name: str) -> Optional[str]:
     Returns:
         SHA string, or None if not found.
     """
-    try:
-        conn = sqlite3.connect(RESILIENCE_DB_PATH, timeout=10)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT pre_deploy_sha FROM deployment_history WHERE service=? ORDER BY id DESC LIMIT 1",
-            (service_name,)
-        ).fetchone()
-        conn.close()
-        return row["pre_deploy_sha"] if row else None
-    except Exception as e:
-        logger.error("_get_pre_deploy_sha failed for %s: %s", service_name, e)
-        return None
+    return _pre_deploy_shas.get(service_name)
 
 
 def check_post_deploy_health(service_name: str, port: int, window_minutes: int = 5) -> bool:
@@ -252,25 +220,20 @@ def auto_rollback(service_name: str) -> bool:
         logger.error("auto_rollback: failed for %s: %s", service_name, error_msg)
         success = False
 
-    # Step 4: Log to RESILIENCE-DB
-    try:
-        _ensure_schema()
-        conn = sqlite3.connect(RESILIENCE_DB_PATH, timeout=10)
-        conn.execute("""
-            UPDATE deployment_history
-            SET rollback_time=?, rollback_sha=?, rollback_status=?, notes=?
-            WHERE service=? AND rollback_time IS NULL
-            ORDER BY id DESC LIMIT 1
-        """, (
-            rollback_time, pre_sha,
-            "success" if success else "failed",
-            error_msg or "",
+    # Step 4: Log to canonical RESILIENCE-DB via triad_db (F1 fix)
+    deployment_id = _deployment_ids.get(service_name, -1)
+    if deployment_id > 0:
+        if success:
+            _triad_mark_healthy(deployment_id)
+        _triad_mark_rolled_back(
+            deployment_id,
+            reason=f"auto_rollback: {'success' if success else 'failed'} — {error_msg or 'ok'}"
+        )
+    else:
+        logger.warning(
+            "auto_rollback: no deployment_id for %s — rollback not logged to RESILIENCE-DB",
             service_name
-        ))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error("auto_rollback: RESILIENCE-DB log failed: %s", e)
+        )
 
     # Step 5: Alert Ahmed (fail-open)
     try:

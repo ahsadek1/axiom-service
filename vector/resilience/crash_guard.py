@@ -79,7 +79,8 @@ def send_emergency_alert(message: str) -> None:
     """
     Send a direct Telegram alert using BOT credentials from environment.
 
-    Uses TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars.
+    Uses TELEGRAM_BOT_TOKEN + AHMED_CHAT_ID env vars.
+    Falls back to TELEGRAM_CHAT_ID for backward compatibility.
     Never raises — logs any failures and continues.
 
     Args:
@@ -88,10 +89,12 @@ def send_emergency_alert(message: str) -> None:
     import requests
 
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    # F2 fix: standardize to AHMED_CHAT_ID (matches alerts.py + alert_router.py)
+    # Fall back to TELEGRAM_CHAT_ID for backward compatibility if AHMED_CHAT_ID not set
+    chat_id = os.getenv("AHMED_CHAT_ID", "") or os.getenv("TELEGRAM_CHAT_ID", "")
 
     if not token or not chat_id:
-        logger.warning("send_emergency_alert: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+        logger.warning("send_emergency_alert: TELEGRAM_BOT_TOKEN or AHMED_CHAT_ID not set")
         return
 
     text = f"🚨 VECTOR EMERGENCY\n{message}"[:4000]

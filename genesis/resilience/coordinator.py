@@ -191,12 +191,20 @@ def _get_open_position_count() -> int:
     """
     Query Alpha + Prime execution for open position count.
 
+    F3 fix (Cipher adversarial review 2026-05-03):
+    Previously returned 999 immediately on the first port failure, permanently
+    blocking chaos testing whenever alpha-exec is down — even during valid
+    maintenance windows. Now accumulates errors separately from counts and
+    only returns 999 if BOTH ports fail to respond.
+
     Returns:
-        Total open positions across both systems. Returns 999 on error (safe default).
+        Total open positions across both systems.
+        Returns 999 only if both endpoints are unreachable (safe default).
     """
     import requests as req
     secret = os.getenv("NEXUS_SECRET", "")
     total = 0
+    failures = 0
 
     for port, header in [(8005, "X-Nexus-Secret"), (8006, "X-Nexus-Prime-Secret")]:
         try:
@@ -210,7 +218,12 @@ def _get_open_position_count() -> int:
             total += count
         except Exception as e:
             logger.warning("_get_open_position_count: failed to check port %d: %s", port, e)
-            return 999  # Safe default — don't run chaos if we can't verify
+            failures += 1
+
+    if failures == 2:
+        # Both endpoints unreachable — cannot verify position state
+        logger.warning("_get_open_position_count: both ports unreachable — returning 999 (safe default)")
+        return 999
 
     return total
 

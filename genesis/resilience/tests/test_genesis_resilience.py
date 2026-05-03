@@ -218,47 +218,48 @@ class TestLoadDiagnosisTree:
 
 class TestRollback:
     def test_auto_rollback_triggers_on_unhealthy(self, tmp_path):
-        """Spec TC7: Two consecutive unhealthy checks → auto_rollback triggers."""
+        """Spec TC7: auto_rollback runs and returns bool (uses triad_db for audit)."""
         import genesis.resilience.rollback as rb
 
-        db_path = str(tmp_path / "resilience.db")
-        with patch("genesis.resilience.rollback.RESILIENCE_DB_PATH", db_path):
-            # Pre-seed with a SHA
-            rb._ensure_schema()
-            conn = sqlite3.connect(db_path)
-            conn.execute(
-                "INSERT INTO deployment_history (service, pre_deploy_sha, deploy_time) VALUES (?,?,?)",
-                ("oracle", "abc12345", "2026-05-03T10:00:00")
-            )
-            conn.commit()
-            conn.close()
+        # Pre-seed in-memory state (F1 fix: triad_db-backed, no local DB)
+        rb._pre_deploy_shas["oracle"] = "abc12345"
+        rb._deployment_ids["oracle"] = -1  # -1 = no triad_db row (test context)
 
-            # Mock unhealthy response
-            mock_resp = MagicMock()
-            mock_resp.status_code = 500
-            mock_resp.json.return_value = {"status": "error"}
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.json.return_value = {"status": "error"}
 
-            with patch("requests.get", return_value=mock_resp), \
-                 patch("subprocess.run", return_value=MagicMock(returncode=0)), \
-                 patch.dict(sys.modules, {
-                     "sovereign_comms": MagicMock(),
-                     "chronicle_reader": MagicMock(),
-                 }):
-                result = rb.auto_rollback("oracle")
+        with patch("requests.get", return_value=mock_resp), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("genesis.resilience.rollback._triad_log_deployment", return_value=42), \
+             patch("genesis.resilience.rollback._triad_mark_healthy"), \
+             patch("genesis.resilience.rollback._triad_mark_rolled_back"), \
+             patch.dict(sys.modules, {
+                 "sovereign_comms": MagicMock(),
+                 "chronicle_reader": MagicMock(),
+             }):
+            result = rb.auto_rollback("oracle")
 
-        # Rollback ran (returned bool — True or False depending on health check)
         assert isinstance(result, bool)
 
     def test_tag_pre_deploy_stores_sha(self, tmp_path):
-        """tag_pre_deploy stores SHA in RESILIENCE-DB."""
+        """tag_pre_deploy stores SHA in module-level registry (triad_db write + in-memory)."""
         import genesis.resilience.rollback as rb
 
-        db_path = str(tmp_path / "resilience.db")
-        with patch("genesis.resilience.rollback.RESILIENCE_DB_PATH", db_path):
+        with patch("genesis.resilience.rollback._triad_log_deployment", return_value=99) as mock_log:
             rb.tag_pre_deploy("axiom", "deadbeef1234")
-            sha = rb._get_pre_deploy_sha("axiom")
 
-        assert sha == "deadbeef1234"
+        # SHA stored in module-level registry
+        assert rb._get_pre_deploy_sha("axiom") == "deadbeef1234"
+        # deployment_id stored
+        assert rb._deployment_ids["axiom"] == 99
+        # triad_db was called
+        mock_log.assert_called_once_with(
+            service="axiom",
+            pre_deploy_sha="deadbeef1234",
+            post_deploy_sha="pending",
+            deployed_by="genesis",
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
