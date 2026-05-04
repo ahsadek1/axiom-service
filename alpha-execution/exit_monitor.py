@@ -89,13 +89,100 @@ def evaluate_exits(
                 "EOD_FORCE_CLOSE: position %d (%s) -- forcing close at %s ET",
                 pos["id"], pos["ticker"], now_et.strftime("%H:%M")
             )
+            # BUG-FIX (RE-003 / Axiom 3.1): EOD path now updates DB after Alpaca close.
+            # Previously Alpaca was closed but DB stayed 'open' forever — phantom positions
+            # triggered reconciler pause every morning and lost all AILS outcome data.
+            #
+            # BUG-FIX (RE-006): get P&L AFTER close attempt so that if Alpaca already
+            # closed the position (404), we detect it and use a separate P&L lookup
+            # rather than reporting 0.0% LOSS based on a missing position.
+            _eod_pnl = _get_current_pnl(pos, alpaca_client) or 0.0
             try:
-                alpaca_client.close_position(pos["ticker"])
+                short_sym = pos.get("short_contract_symbol")
+                long_sym  = pos.get("long_contract_symbol")
+                _short_404 = False
+                _long_404  = False
+                _eod_close_reason = "EOD_FORCE_CLOSE"  # default; updated below if 404
+                if short_sym and long_sym:
+                    try:
+                        alpaca_client.close_position(short_sym)
+                    except Exception as _e_short:
+                        logger.warning("EOD short leg close failed %s: %s", short_sym, _e_short)
+                        if "404" in str(_e_short) or "position not found" in str(_e_short).lower():
+                            _short_404 = True
+                    try:
+                        alpaca_client.close_position(long_sym)
+                    except Exception as _e_long:
+                        logger.warning("EOD long leg close failed %s: %s", long_sym, _e_long)
+                        if "404" in str(_e_long) or "position not found" in str(_e_long).lower():
+                            _long_404 = True
+                    # BUG-FIX (RE-006): If both legs returned 404, Alpaca already closed
+                    # this position (e.g. stop-loss triggered, option expired, or broker
+                    # auto-close). Re-fetch P&L from Alpaca order history.
+                    if _short_404 and _long_404:
+                        logger.warning(
+                            "EOD_ALREADY_CLOSED_BY_ALPACA: position %d (%s) — "
+                            "both legs returned 404; querying order history for actual P&L",
+                            pos["id"], pos["ticker"],
+                        )
+                        try:
+                            _pnl_from_orders = _get_pnl_from_closed_orders(
+                                pos, alpaca_client
+                            )
+                            if _pnl_from_orders is not None:
+                                _eod_pnl = _pnl_from_orders
+                                logger.info(
+                                    "RE-006: recovered actual P&L for %s from order history: %.4f",
+                                    pos["ticker"], _eod_pnl,
+                                )
+                            else:
+                                logger.warning(
+                                    "RE-006: could not recover P&L for %s from order history "
+                                    "— leaving as 0.0 (ALREADY_CLOSED_BY_ALPACA)",
+                                    pos["ticker"],
+                                )
+                        except Exception as _re006_err:
+                            logger.warning("RE-006 P&L recovery failed for %s: %s", pos["ticker"], _re006_err)
+                else:
+                    alpaca_client.close_position(pos["ticker"])
+                # Mark DB closed — reason reflects whether Alpaca had already closed it
+                _eod_close_reason = (
+                    "EOD_ALREADY_CLOSED_BY_ALPACA"
+                    if (_short_404 and _long_404)
+                    else "EOD_FORCE_CLOSE"
+                )
+                _eod_pnl_usd = (pos.get("position_size_usd") or 0) * _eod_pnl
+                close_position(db_path, pos["id"], _eod_close_reason, _eod_pnl, _eod_pnl_usd)
+                # Report outcome to AILS and buffer
+                # G6 FIX (2026-05-03): guard against None buffer_reporter
+                # (test contexts pass None; production always has a real reporter)
+                if buffer_reporter is not None:
+                    try:
+                        buffer_reporter.report_outcome(
+                            ticker  = pos["ticker"],
+                            won     = _eod_pnl > 0,
+                            pnl_pct = _eod_pnl,
+                            pathway = pos.get("pathway", "P1"),
+                        )
+                    except Exception as _br_err:
+                        logger.warning("EOD buffer report failed for %s: %s", pos["ticker"], _br_err)
+                else:
+                    logger.debug("EOD buffer report skipped for %s — no reporter", pos["ticker"])
+                _post_ails_outcome(
+                    ticker           = pos["ticker"],
+                    strategy         = pos.get("option_type", "bull_put_spread"),
+                    regime           = "UNKNOWN",
+                    direction        = pos.get("direction", "bullish"),
+                    pnl_usd          = _eod_pnl_usd,
+                    win              = _eod_pnl > 0,
+                    system           = "alpha",
+                    concordance_path = pos.get("pathway"),
+                )
                 exits.append({
                     "position_id": pos["id"],
                     "ticker":      pos["ticker"],
-                    "reason":      "EOD_FORCE_CLOSE",
-                    "pnl_pct":     None,
+                    "reason":      _eod_close_reason,
+                    "pnl_pct":     _eod_pnl,
                 })
             except Exception as _eod_err:
                 logger.error("EOD close FAILED for %s: %s", pos["ticker"], _eod_err)
@@ -236,6 +323,57 @@ def _evaluate_position(
         }
 
     return None
+
+
+def _get_pnl_from_closed_orders(pos: dict, alpaca_client) -> Optional[float]:
+    """
+    BUG-FIX (RE-006): Recover actual P&L for a position that was already closed
+    by Alpaca before our EOD sweep (indicated by 404 on both legs).
+
+    Queries Alpaca's closed orders for the entry order IDs stored in the DB,
+    calculates net credit received vs debit paid, and returns P&L as a fraction
+    of position_size_usd.
+
+    Returns:
+        P&L as decimal (e.g. 0.20 = +20%) or None if unable to determine.
+    """
+    try:
+        short_order_id = pos.get("short_alpaca_order_id")
+        long_order_id  = pos.get("long_alpaca_order_id")
+        size_usd       = pos.get("position_size_usd") or 0
+        if not short_order_id or size_usd <= 0:
+            return None
+        # Fetch recent closed orders (last 50) and find matching ones
+        closed_orders = alpaca_client.get_orders(
+            status="closed", limit=50, direction="desc"
+        ) if hasattr(alpaca_client, "get_orders") else []
+        if not closed_orders:
+            return None
+        net_pnl_usd = 0.0
+        matched = 0
+        for order in closed_orders:
+            oid = order.get("id", "")
+            filled_avg = float(order.get("filled_avg_price") or 0)
+            filled_qty = float(order.get("filled_qty") or 0)
+            side       = order.get("side", "")
+            # Only count filled legs we care about
+            if oid not in (short_order_id, long_order_id):
+                continue
+            matched += 1
+            # sell (short leg / credit leg) = received premium
+            # buy  (long leg / debit leg)   = paid premium
+            if side == "sell":
+                net_pnl_usd += filled_avg * filled_qty * 100  # credit received
+            else:
+                net_pnl_usd -= filled_avg * filled_qty * 100  # debit paid
+        if matched == 0:
+            logger.warning("RE-006: no matching orders found for pos %d in closed history", pos.get("id"))
+            return None
+        logger.info("RE-006: pos %d net_pnl_usd=%.2f from %d matched order(s)", pos.get("id"), net_pnl_usd, matched)
+        return net_pnl_usd / size_usd
+    except Exception as _e:
+        logger.warning("RE-006 _get_pnl_from_closed_orders error: %s", _e)
+        return None
 
 
 def _get_current_pnl(pos: dict, alpaca_client) -> Optional[float]:
