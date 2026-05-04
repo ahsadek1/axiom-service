@@ -525,7 +525,36 @@ def _check_earnings_gate(ticker: str, expiration_date: str, polygon_key: str) ->
 
 
 def _is_market_hours() -> bool:
-    """Return True if within market hours (9:30 AM – 4:00 PM ET, weekdays)."""
+    """Return True if within market hours (9:30 AM – 4:00 PM ET, weekdays).
+
+    MOCK_SESSION_MODE override:
+    If the env var MOCK_SESSION_MODE=true is set, this function returns True
+    unconditionally so the mock trading framework can exercise the real execution
+    path on weekends/after-hours against the Alpaca PAPER account.
+
+    SAFETY CONSTRAINT: This bypass is paper-only. The service is hardwired to
+    ALPACA_PAPER_URL and ALPACA_PAPER=true — it cannot reach live capital.
+    The override will scream loudly if somehow misconfigured (see assertion below).
+
+    This flag must be set explicitly via environment variable only.
+    No hardcoded default. No config file fallback. Off unless MOCK_SESSION_MODE=true.
+    """
+    if os.getenv("MOCK_SESSION_MODE", "").lower() == "true":
+        # Safety assertion — must never fire against live capital
+        alpaca_url = os.getenv("ALPACA_BASE_URL", ALPACA_PAPER_URL)
+        if "paper" not in alpaca_url:
+            logger.critical(
+                "MOCK_SESSION_MODE=true but ALPACA_BASE_URL=%s — NOT a paper account. "
+                "REFUSING market hours bypass. Fix your config.",
+                alpaca_url,
+            )
+            return False  # Fail closed — do not bypass if not paper
+        logger.warning(
+            "MOCK_SESSION_MODE active — market hours gate bypassed. "
+            "Paper account only (%s). Do NOT set this in production.",
+            alpaca_url,
+        )
+        return True
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
