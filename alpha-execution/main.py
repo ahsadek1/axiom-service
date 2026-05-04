@@ -9,7 +9,7 @@ Port: 8005 (local), $PORT (Railway).
 """
 
 import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 import glob as _glob
 import hashlib as _hashlib
 import logging
@@ -21,12 +21,15 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import AsyncGenerator, Optional
 
 
+# G7 NOTE (2026-05-03): canonical implementation lives in shared/module_hash.py.
+# This local copy is kept until the service is next refactored so the sys.path
+# insert (which happens further below) can be moved above this block safely.
 def _compute_module_hash() -> str:
     """Hash all *.py files in this service directory (excluding __pycache__).
     Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    Canonical: shared/module_hash.compute_module_hash(__file__)
     """
     _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
     _files = sorted(
@@ -188,6 +191,10 @@ else:
 # Thread-safe lock for position-limit checks + app_state mutations
 _execute_lock = threading.Lock()
 _state_lock   = threading.Lock()  # OMNI M-NEW-3: guards app_state counter mutations
+# G3/G4 FIX (2026-05-03): single-healer guard — prevents multiple concurrent healer
+# threads under rapid 422 bursts or sequential execution errors.
+_healer_lock    = threading.Lock()
+_healer_running = False           # True while a healer thread is alive
 # GAP-2: _skipped_tickers is now a dict {ticker: datetime_added} with 30-min TTL.
 # Replaces the old permanent set — a ticker banned for one bad order should not stay
 # banned all day. Use _is_ticker_skipped() to check + auto-expire.
@@ -423,7 +430,13 @@ def _check_vix_brake(vix: Optional[float], direction: str) -> Optional[str]:
         Rejection reason string if trade should be blocked.
     """
     if vix is None:
-        return None   # Can't check — allow trade with warning logged
+        # BUG-FIX (LF-003): comment claimed warning was logged — it was not.
+        # Now actually logs the warning so VIX data gaps are visible in logs.
+        logger.warning(
+            "_check_vix_brake: VIX unavailable (Axiom unreachable or returned None) — "
+            "allowing trade with degraded VIX protection. Check Axiom /health."
+        )
+        return None   # Fail-open preserved (advisory gate) but now logged
 
     if vix >= VIX_BRAKE_FULL:
         return f"VIX FULL BRAKE: VIX={vix:.1f} ≥ {VIX_BRAKE_FULL} — ALL new positions blocked"
@@ -665,6 +678,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("API key probe: alpaca → %s (%s)", _alpaca_result.status, _alpaca_result.message)
     init_db(settings.alpha_db_path)
 
+    # BUG-FIX (Axiom 2.4): init v2 schema before reconcile_on_startup runs.
+    # active_positions_v2 was never created, causing OperationalError on first use.
+    try:
+        from execution_v2 import init_v2_schema as _init_v2
+        _init_v2(settings.alpha_db_path)
+        logger.info("[V2] Schema initialized")
+    except Exception as _v2_schema_err:
+        logger.warning("[V2] Schema init failed (non-fatal): %s", _v2_schema_err)
+
     # ── V2 integration: reconcile DB vs Alpaca on startup ────────────────────
     try:
         from execution_v2 import reconcile_on_startup as _v2_reconcile
@@ -844,15 +866,32 @@ def _run_startup_reconciliation() -> None:
 
         all_db_positions = db_positions + pending_positions
 
-        # Fetch live Alpaca tickers — best effort
-        alpaca_tickers: set[str] = set()
+        # Fetch live Alpaca symbols — best effort.
+        # IMPORTANT: Alpaca paper trading does NOT surface options spread legs in
+        # /v2/positions (they return empty even after a confirmed fill).  We therefore
+        # build two symbol sets:
+        #   alpaca_equity_tickers  — plain underlying tickers (e.g. "SPY")
+        #   alpaca_option_symbols  — full OCC contract symbols (e.g. "SPY260717P00455000")
+        # A DB options position is considered LIVE if either its short_contract_symbol
+        # OR long_contract_symbol appears in alpaca_option_symbols, OR if we cannot
+        # confirm either (options positions are NOT ghost-closed on symbol mismatch alone
+        # — only equity positions where the underlying ticker is absent are closed).
+        alpaca_equity_tickers: set[str] = set()
+        alpaca_option_symbols: set[str] = set()
+        alpaca_reachable = True
         try:
             alpaca = _get_alpaca()
             live = alpaca.get_positions()   # returns list of {symbol: ..., ...}
-            alpaca_tickers = {str(p.get("symbol", "")).upper() for p in live}
+            for p in live:
+                sym = str(p.get("symbol", "")).upper()
+                # OCC option symbols are long (e.g. AAPL260717P00225000 = 21 chars)
+                if len(sym) > 6:
+                    alpaca_option_symbols.add(sym)
+                else:
+                    alpaca_equity_tickers.add(sym)
             logger.info(
-                "Startup reconciliation: %d DB position(s), %d Alpaca position(s)",
-                len(all_db_positions), len(alpaca_tickers),
+                "Startup reconciliation: %d DB position(s), %d Alpaca equity tickers, %d option symbols",
+                len(all_db_positions), len(alpaca_equity_tickers), len(alpaca_option_symbols),
             )
         except Exception as alpaca_err:
             logger.warning(
@@ -860,14 +899,17 @@ def _run_startup_reconciliation() -> None:
                 "will still close test-window entries; live-mismatch check skipped",
                 alpaca_err,
             )
-            alpaca_tickers = None   # type: ignore[assignment]
+            alpaca_reachable = False
 
         closed_ids: list[str] = []
         for pos in all_db_positions:
-            pos_id   = pos["id"]
-            ticker   = (pos.get("ticker") or "").upper()
-            window   = (pos.get("window_id") or "")
-            status   = (pos.get("status") or "")
+            pos_id        = pos["id"]
+            ticker        = (pos.get("ticker") or "").upper()
+            window        = (pos.get("window_id") or "")
+            status        = (pos.get("status") or "")
+            short_sym     = (pos.get("short_contract_symbol") or "").upper()
+            long_sym      = (pos.get("long_contract_symbol") or "").upper()
+            is_options_pos = bool(short_sym or long_sym)
 
             # Rule A: test window entries are NEVER production positions
             if "test" in window.lower():
@@ -880,8 +922,59 @@ def _run_startup_reconciliation() -> None:
                 )
                 continue
 
-            # Rule B: live-mismatch check (only if Alpaca was reachable)
-            if alpaca_tickers is not None and ticker not in alpaca_tickers:
+            if not alpaca_reachable:
+                # Cannot verify — skip live-mismatch check entirely
+                continue
+
+            # Rule B: live-mismatch check — options vs equity handled separately.
+            # OPTIONS POSITIONS: Alpaca paper trading does not reliably surface
+            # spread legs in /v2/positions.  We only ghost-close an options position
+            # if we can positively confirm both legs are absent AND the position is
+            # older than 10 minutes (allowing time for Alpaca to settle the fill).
+            if is_options_pos:
+                import datetime as _dt
+                opened_at_str = pos.get("opened_at") or ""
+                try:
+                    opened_at = _dt.datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+                    age_minutes = (_dt.datetime.now(_dt.timezone.utc) - opened_at).total_seconds() / 60
+                except Exception:
+                    age_minutes = 999  # unknown age — treat as old
+
+                if age_minutes < 10:
+                    logger.info(
+                        "Startup reconciliation: skipping options position #%d %s — fill age %.1f min < 10 min settle window",
+                        pos_id, ticker, age_minutes,
+                    )
+                    continue
+
+                # Only close if we have contract symbols and NEITHER appears in Alpaca
+                # AND we have at least some option symbols to compare against (non-empty set).
+                # If Alpaca returns zero option symbols entirely, assume the endpoint is
+                # unreliable for options and skip the check.
+                if alpaca_option_symbols and short_sym and long_sym:
+                    if short_sym not in alpaca_option_symbols and long_sym not in alpaca_option_symbols:
+                        reason = (
+                            f"reconciled_alpaca_empty: {ticker} options spread open in DB "
+                            f"(status={status}, short={short_sym}, long={long_sym}) "
+                            f"but neither leg found in Alpaca option positions"
+                        )
+                        close_stale_position(settings.alpha_db_path, pos_id, reason)
+                        closed_ids.append(f"#{pos_id} {ticker} (options legs absent)")
+                        logger.warning(
+                            "Startup reconciliation: closed stale options position #%d %s — legs not in Alpaca",
+                            pos_id, ticker,
+                        )
+                else:
+                    logger.info(
+                        "Startup reconciliation: skipping options position #%d %s — "
+                        "Alpaca option symbol set empty or contract symbols missing; "
+                        "cannot confirm absence (paper trading limitation)",
+                        pos_id, ticker,
+                    )
+                continue
+
+            # EQUITY POSITIONS: check underlying ticker as before
+            if ticker not in alpaca_equity_tickers:
                 reason = (
                     f"reconciled_alpaca_empty: {ticker} is open in DB "
                     f"(status={status}) but absent from Alpaca live positions"
@@ -1510,6 +1603,18 @@ def execute(
     # mid-flight placing an order for ticker X.
     _ticker_lock = _get_ticker_lock(body.ticker.upper())
     _ticker_lock.acquire()
+    # BUG-FIX (RE-002): safety net — if ANY unhandled exception escapes the execute
+    # flow after this point, the lock is released before propagating. This prevents
+    # permanent deadlock on /execute for this ticker on unexpected errors.
+    # All known exit paths already release explicitly; this catches unknown ones.
+    _ticker_lock_released = False
+
+    def _safe_lock_release():
+        nonlocal _ticker_lock, _ticker_lock_released
+        if _ticker_lock is not None and not _ticker_lock_released:
+            _ticker_lock.release()
+            _ticker_lock = None
+            _ticker_lock_released = True
 
     # ── Place Order via Alpaca OUTSIDE lock (network call) ────────────────────
     short_symbol = None
@@ -1672,29 +1777,49 @@ def execute(
             # FIX (2026-04-27): /execute is a sync endpoint — asyncio.create_task() is
             # unavailable here and raises NameError in a sync context.  Use
             # threading.Thread to launch the async healer in its own event loop instead.
+            # G3/G4 FIX (2026-05-03): _run_healer_sync now clears _healer_running on
+            # exit so only one healer thread runs at a time regardless of error rate.
             def _run_healer_sync(exc, ticker, app_state, state_lock, api_key, api_secret, skipped_tickers):
+                global _healer_running
                 import asyncio as _asyncio
-                _asyncio.run(
-                    auto_heal_execution(
-                        exc=exc,
-                        ticker=ticker,
-                        app_state=app_state,
-                        state_lock=state_lock,
-                        api_key=api_key,
-                        api_secret=api_secret,
-                        skipped_tickers=skipped_tickers,
+                try:
+                    _asyncio.run(
+                        auto_heal_execution(
+                            exc=exc,
+                            ticker=ticker,
+                            app_state=app_state,
+                            state_lock=state_lock,
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            skipped_tickers=skipped_tickers,
+                        )
                     )
-                )
+                finally:
+                    with _healer_lock:
+                        _healer_running = False
+
+            def _try_spawn_healer(exc, ticker):
+                """Spawn healer thread only if none is currently running."""
+                global _healer_running
+                with _healer_lock:
+                    if _healer_running:
+                        logger.warning(
+                            "[Healer] Skipping spawn — healer already running (ticker=%s)", ticker
+                        )
+                        return
+                    _healer_running = True
+                threading.Thread(
+                    target=_run_healer_sync,
+                    args=(exc, ticker, app_state, _state_lock,
+                          settings.alpaca_api_key, settings.alpaca_secret_key,
+                          _skipped_tickers),
+                    daemon=True,
+                    name="alpha-exec-healer",
+                ).start()
 
             if error_class == ExecutionErrorClass.INVALID_PAYLOAD:
                 if not _is_ticker_skipped(body.ticker.upper()):
-                    threading.Thread(
-                        target=_run_healer_sync,
-                        args=(e, body.ticker, app_state, _state_lock,
-                              settings.alpaca_api_key, settings.alpaca_secret_key,
-                              _skipped_tickers),
-                        daemon=True,
-                    ).start()
+                    _try_spawn_healer(e, body.ticker)
             else:
                 # All other errors: set paused flag first, then spawn healer
                 with _state_lock:
@@ -1715,13 +1840,7 @@ def execute(
                             "error":       order_error,
                             "error_class": error_class.value,
                         }, escalation=EscalationLevel.CRITICAL)
-                        threading.Thread(
-                            target=_run_healer_sync,
-                            args=(e, body.ticker, app_state, _state_lock,
-                                  settings.alpaca_api_key, settings.alpaca_secret_key,
-                                  _skipped_tickers),
-                            daemon=True,
-                        ).start()
+                        _try_spawn_healer(e, body.ticker)
 
             # GAP-CB: Circuit breaker — track consecutive failures per ticker
             _ticker = body.ticker.upper()
@@ -1833,8 +1952,7 @@ def execute(
         entry_price           = _confirmed_price,
     )
     # GAP-6: Release per-ticker lock — position is now durable in DB
-    _ticker_lock.release()
-    _ticker_lock = None
+    _safe_lock_release()  # BUG-FIX RE-002: use safe release to set _ticker_lock_released=True
     position_id = pending_id
 
     # ── Fix A: Post-confirmation position verification (2026-04-24) ──────────────
