@@ -233,16 +233,40 @@ def run_scan_cycle(
             if "orats" not in result.degraded_sources:
                 result.degraded_sources.append("orats")
 
+        # FIX-STALE-IVR: After market close ORATS returns IVR=0/None (stale).
+        # Passing IVR=0 to Axiom triggers IVR < 30 hard block on every ticker,
+        # generating a false 100% skip rate. Skip with 'stale_ivr' instead.
+        _ivr = ctx.vol.iv_rank
+        if _ivr is None or _ivr <= 0:
+            logger.warning(
+                "[Scanner] %s: IVR is %s — likely stale after-hours data. Skipping as stale_ivr.",
+                ticker, _ivr,
+            )
+            result.log_skip("stale_ivr")
+            continue
+
         # Fetch Axiom risk assessment
         axiom = fetch_axiom_score(ticker, axiom_url, nexus_secret,
-                                  ivr=ctx.vol.iv_rank)
+                                  ivr=_ivr)
         if axiom is None:
             result.log_skip("axiom_unavailable")
             continue
 
         # Axiom hard stops — skip immediately
+        # FIX-STALE-IVR: If all hard stops are IVR-related and market is closed,
+        # treat as stale data, not a trading signal.
         if axiom.get("hard_stops"):
             stops = axiom["hard_stops"]
+            _is_ivr_stop = all("IVR" in s or "ivr" in s.lower() for s in stops)
+            _market_closed = not get_scanning_allowed(market_state)
+            if _is_ivr_stop and _market_closed:
+                logger.warning(
+                    "[Scanner] %s: Axiom IVR hard stop during market-closed window — "
+                    "treating as stale data, not a trading signal: %s",
+                    ticker, stops[0][:80],
+                )
+                result.log_skip("stale_ivr_axiom")
+                continue
             logger.info("[Scanner] %s blocked by Axiom: %s", ticker, stops[0][:60])
             result.log_skip("axiom_hard_stop")
             record_pick(db_path, pick_id, ticker, direction, window_id,
