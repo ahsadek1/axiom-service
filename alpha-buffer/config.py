@@ -128,6 +128,46 @@ def load_settings() -> Settings:
     )
 
 
+def assert_axiom_secret(settings: Settings) -> None:
+    """
+    Warn loudly at startup if AXIOM_SECRET is missing.
+    C-01 universe gate fails open without it — every submission bypasses Axiom universe validation.
+    This is a critical security gate. Missing secret = silent fail open for every trade.
+
+    Does NOT crash the service (Axiom may not be required in all environments),
+    but sends a Telegram alert so the gap is never invisible.
+    Called from lifespan/startup after settings are loaded.
+    """
+    import logging as _logging
+    _log = _logging.getLogger("alpha-buffer.config")
+    if not settings.axiom_secret:
+        _log.critical(
+            "STARTUP RISK: AXIOM_SECRET is not set. "
+            "C-01 universe gate will fail open — all submissions will bypass Axiom universe validation. "
+            "Set AXIOM_SECRET in Railway environment variables immediately."
+        )
+        # Attempt Telegram alert so the gap surfaces immediately
+        try:
+            import requests as _req
+            if settings.telegram_bot_token and settings.ahmed_chat_id:
+                _req.post(
+                    f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                    json={
+                        "chat_id": settings.ahmed_chat_id,
+                        "text": (
+                            "\u26a0\ufe0f ALPHA-BUFFER STARTUP WARNING\n"
+                            "AXIOM_SECRET is not set.\n"
+                            "C-01 universe gate is DISABLED — all submissions bypass Axiom validation.\n"
+                            "Fix: Set AXIOM_SECRET in Railway env vars and redeploy."
+                        ),
+                    },
+                    timeout=5,
+                )
+        except Exception:
+            pass  # Alert is best-effort — the critical log is the primary signal
+
+
+
 # ── Startup Sanity Check (permanent guard against threshold drift) ────────────
 def assert_thresholds() -> None:
     """

@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from config import VALID_AGENTS, VALID_PATHWAYS, MIN_SUBMISSION_SCORE, load_settings, assert_thresholds
+from config import VALID_AGENTS, VALID_PATHWAYS, MIN_SUBMISSION_SCORE, load_settings, assert_thresholds, assert_axiom_secret
 from concordance import evaluate_concordance
 from circuit_breaker import (
     CircuitBreakerStatus,
@@ -295,7 +295,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     init_circuit_breaker(settings.alpha_db_path)
     # Permanent guard: fail loudly if concordance thresholds are miscalibrated
     # Prevents silent P2 starvation if MIN_SCORE_P2 is ever set above real agent output range
-    assert_thresholds()  # crashes startup if thresholds are wrong — better than silent 0 trades
+    assert_thresholds()   # crashes startup if thresholds are wrong — better than silent 0 trades
+    assert_axiom_secret(settings)  # FIX-AXIOM-SECRET: warn + alert if missing (C-01 gate silently fails open)
     logger.info("Alpha Buffer ready (solo_entries=%s)", settings.solo_entries_enabled)
     from shared.sovereign_comms import get_instructions, report
     report("alpha_buffer", "INFO", {"event": "started"})

@@ -1205,10 +1205,20 @@ def health() -> JSONResponse:
         import datetime as _dt_mod
         _et_today = _dt_mod.datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
         with get_conn(settings.omni_db_path) as _hconn:
+            # FIX-WINDOW-DATE (2026-05-04): SUBSTR(window_id,1,10) was broken for
+            # MOCK/CANARY/test window IDs that don't start with a date string.
+            # Filter by created_at date (UTC→ET adjusted) which is always reliable.
             _row = _hconn.execute(
                 "SELECT COUNT(*) AS total, "
                 "SUM(CASE WHEN verdict IN ('GO','STRONG_GO') THEN 1 ELSE 0 END) AS go_count "
-                "FROM synthesis_results WHERE SUBSTR(window_id,1,10) = ?",
+                "FROM synthesis_results "
+                "WHERE DATE(created_at, 'localtime') = ? "
+                "  AND window_id NOT LIKE 'MOCK%' "
+                "  AND window_id NOT LIKE 'CANARY%' "
+                "  AND window_id NOT LIKE 'debug%' "
+                "  AND window_id NOT LIKE 'gap%' "
+                "  AND window_id NOT LIKE 'INV%' "
+                "  AND window_id NOT LIKE 'silence%'",
                 (_et_today,)
             ).fetchone()
             _syntheses = int(_row["total"] or 0) if _row else 0
@@ -1578,11 +1588,13 @@ def _run_synthesis(
 
     # ── Step 4: Quad Intelligence ─────────────────────────────────────────────
     brain_results = run_all_brains(
-        context          = context,
+        context           = context,
         anthropic_api_key = settings.anthropic_api_key,
-        openai_api_key   = settings.openai_api_key,
-        gemini_api_key   = settings.gemini_api_key,
-        deepseek_api_key = settings.deepseek_api_key,
+        openai_api_key    = settings.openai_api_key,
+        gemini_api_key    = settings.gemini_api_key,
+        deepseek_api_key  = settings.deepseek_api_key,
+        bot_token         = settings.telegram_bot_token,   # FIX-GEMINI-HEALTH: for brain-down alerts
+        ahmed_chat_id     = settings.ahmed_chat_id,        # FIX-GEMINI-HEALTH
     )
 
     # ── Step 5: Compute verdict ───────────────────────────────────────────────

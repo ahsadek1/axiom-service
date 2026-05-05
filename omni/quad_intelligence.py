@@ -34,6 +34,18 @@ from config import (
     BRAIN_RETRY_COUNT,
 )
 
+# ── Brain Health Cache ────────────────────────────────────────────────────────
+# Cached health status for each brain. Reset on new synthesis cycle.
+# Key: brain_name, Value: dict with 'healthy': bool, 'checked_at': float
+_brain_health_cache: dict[str, dict] = {}
+_BRAIN_HEALTH_CACHE_TTL = 120  # seconds — recheck every 2 min during market hours
+
+_BRAIN_PING_TIMEOUT = 3.0  # seconds for health ping
+
+# GPT-4o is the fallback when Gemini is unresponsive.
+# It takes the Gemini PATTERN role when Gemini fails the health check.
+_BRAIN_GEMINI_FALLBACK = "gpt-4o-fallback"
+
 logger = logging.getLogger("omni.quad_intelligence")
 
 # ── Brain System Prompts ──────────────────────────────────────────────────────
@@ -84,15 +96,114 @@ BRAIN_ROLES = {
 }
 
 
+def _ping_gemini(api_key: str) -> bool:
+    """
+    Pre-flight health check for Gemini before committing to full synthesis call.
+    Sends a minimal 1-token prompt with a 3-second hard timeout.
+    Returns True if Gemini is responsive, False otherwise.
+
+    FIX-GEMINI-HEALTH: Added 2026-05-04 after Gemini went silent all afternoon
+    without any alert. This detects the failure before synthesis starts so we can
+    route to GPT-4o immediately instead of waiting for a 15s timeout per call.
+    """
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": "Reply OK"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 4,
+                    "temperature": 0.0,
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
+            },
+            timeout=_BRAIN_PING_TIMEOUT,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        logger.warning("Gemini health ping failed: %s", e)
+        return False
+
+
+def check_brain_health(
+    brain_name: str,
+    api_key: str,
+    bot_token: str = "",
+    ahmed_chat_id: str = "",
+) -> bool:
+    """
+    Check if a brain is healthy, using a short-lived cache to avoid pre-pinging
+    on every single synthesis call.
+
+    Currently only implemented for Gemini (the brain that failed silently on May 4).
+    Other brains (Claude, DeepSeek, o3-mini) are assumed healthy and rely on the
+    existing per-call retry + error result mechanism.
+
+    If Gemini fails the ping, sends a Telegram alert immediately (within 2 min of failure).
+
+    Returns True if the brain is (or is assumed) healthy.
+    """
+    import threading as _threading
+    now = time.time()
+
+    # Only health-check Gemini for now
+    if brain_name != BRAIN_GEMINI:
+        return True
+
+    cached = _brain_health_cache.get(brain_name)
+    if cached and (now - cached["checked_at"]) < _BRAIN_HEALTH_CACHE_TTL:
+        return cached["healthy"]
+
+    healthy = _ping_gemini(api_key)
+    _brain_health_cache[brain_name] = {"healthy": healthy, "checked_at": now}
+
+    if not healthy:
+        logger.critical(
+            "BRAIN HEALTH FAIL: %s is unresponsive (ping timeout/error). "
+            "Routing to GPT-4o fallback for PATTERN analysis.",
+            brain_name,
+        )
+        # Alert Ahmed immediately — fire-and-forget in background thread
+        if bot_token and ahmed_chat_id:
+            def _alert():
+                try:
+                    import requests as _r
+                    _r.post(
+                        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                        json={
+                            "chat_id": ahmed_chat_id,
+                            "text": (
+                                "\u26a0\ufe0f OMNI BRAIN ALERT\n"
+                                f"Gemini is unresponsive (health ping failed).\n"
+                                "Routing to GPT-4o for PATTERN analysis.\n"
+                                "Synthesis will continue with 4 brains (Claude + o3-mini + GPT-4o + DeepSeek)."
+                            ),
+                        },
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
+            _threading.Thread(target=_alert, daemon=True).start()
+
+    return healthy
+
+
 def run_all_brains(
     context: dict,
     anthropic_api_key: str,
     openai_api_key:    str,
     gemini_api_key:    str,
     deepseek_api_key:  str,
+    bot_token:         str = "",
+    ahmed_chat_id:     str = "",
 ) -> dict[str, dict]:
     """
     Run all 4 brains in parallel and collect their votes.
+
+    FIX-GEMINI-HEALTH (2026-05-04): Pre-flight Gemini health check before spawning
+    brain threads. If Gemini is unresponsive, GPT-4o takes the PATTERN role.
+    This prevents a 15s timeout cascade per synthesis call when Gemini is down.
 
     Args:
         context:           Full concordance + regime + Axiom context dict.
@@ -100,15 +211,30 @@ def run_all_brains(
         openai_api_key:    OpenAI API key for o3-mini.
         gemini_api_key:    Google Gemini API key.
         deepseek_api_key:  DeepSeek API key.
+        bot_token:         Telegram bot token for brain-down alerts.
+        ahmed_chat_id:     Ahmed's Telegram chat ID for alerts.
 
     Returns:
         Dict mapping brain name → brain result dict.
         Every brain has an entry — errors are recorded as error results, not omitted.
     """
+    # FIX-GEMINI-HEALTH: Pre-flight check — if Gemini is down, swap in GPT-4o
+    # This prevents 15s timeout per synthesis call when Gemini is unresponsive.
+    gemini_healthy = check_brain_health(
+        BRAIN_GEMINI, gemini_api_key,
+        bot_token=bot_token, ahmed_chat_id=ahmed_chat_id,
+    )
+    # Use GPT-4o as the PATTERN brain if Gemini is down.
+    # GPT-4o uses the same OpenAI endpoint/key as o3-mini.
+    if not gemini_healthy:
+        logger.warning(
+            "Gemini unhealthy — routing PATTERN role to GPT-4o for this synthesis cycle."
+        )
+
     api_keys = {
         BRAIN_CLAUDE:   anthropic_api_key,
         BRAIN_O3MINI:   openai_api_key,
-        BRAIN_GEMINI:   gemini_api_key,
+        BRAIN_GEMINI:   gemini_api_key if gemini_healthy else openai_api_key,  # GPT-4o fallback
         BRAIN_DEEPSEEK: deepseek_api_key,
     }
 
@@ -268,6 +394,13 @@ def _dispatch_api(brain_name: str, prompt: str, api_key: str) -> str:
     elif brain_name == BRAIN_O3MINI:
         return _call_openai(prompt, api_key)
     elif brain_name == BRAIN_GEMINI:
+        # FIX-GEMINI-HEALTH: If Gemini is down, run_all_brains passes the OpenAI key
+        # for the Gemini slot. Detect this and route to GPT-4o instead.
+        if api_key and api_key.startswith("sk-"):
+            logger.info(
+                "BRAIN GEMINI: routing to GPT-4o (OpenAI key detected — Gemini fallback active)"
+            )
+            return _call_gpt4o_pattern(prompt, api_key)
         return _call_gemini(prompt, api_key)
     elif brain_name == BRAIN_DEEPSEEK:
         return _call_deepseek(prompt, api_key)
@@ -371,6 +504,31 @@ def _call_gemini(prompt: str, api_key: str) -> str:
     except (KeyError, IndexError, TypeError, AttributeError) as e:
         logger.warning("Gemini response parsing error: %s | Response: %s", e, resp.text[:300])
         return ""
+
+
+def _call_gpt4o_pattern(prompt: str, api_key: str) -> str:
+    """Call GPT-4o as a drop-in replacement for Gemini's PATTERN brain role.
+
+    FIX-GEMINI-HEALTH (2026-05-04): Used when Gemini is unresponsive.
+    GPT-4o is fully capable of the structured JSON vote format.
+    Uses gpt-4o (not o3-mini) to keep the adversarial brain (o3-mini) distinct.
+    """
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+        },
+        json={
+            "model":      "gpt-4o",
+            "messages":   [{"role": "user", "content": prompt}],
+            "max_tokens": 1000,
+            "temperature": 0.2,
+        },
+        timeout=BRAIN_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 def _call_deepseek(prompt: str, api_key: str) -> str:
