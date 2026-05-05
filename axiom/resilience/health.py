@@ -64,7 +64,7 @@ class AxiomHealthReport:
 
     def _check_orats(self) -> None:
         """Ping ORATS /datav2/summaries with a known ticker (AAPL)."""
-        token = os.getenv("ORATS_TOKEN", "")
+        token = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY", "4476e955-241a-4540-b114-ebbf1a3a3b87")
         start = datetime.utcnow()
         try:
             r = requests.get(
