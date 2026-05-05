@@ -1,0 +1,217 @@
+{
+  "date": "2026-05-03",
+  "started_at": "2026-05-03T18:08:21.958043-04:00",
+  "finished_at": "2026-05-03T18:08:44.195242-04:00",
+  "duration_s": 21.536909818649292,
+  "passed": 4,
+  "failed": 6,
+  "blocked_correct": 3,
+  "grade": "F  \ud83d\udd34",
+  "service_status": {
+    "Axiom(8001)": "UP",
+    "AlphaBuffer(8002)": "UP",
+    "PrimeBuffer(8003)": "UP",
+    "OMNI(8004)": "UP",
+    "AlphaExec(8005)": "UP",
+    "PrimeExec(8006)": "UP",
+    "ORACLE(8007)": "UP",
+    "AILS(8008)": "UP",
+    "GuardianAngel(8009)": "NOT_RUNNING (expected)",
+    "Cipher(9001)": "UP",
+    "Atlas(9002)": "UP",
+    "Sage(9003)": "UP"
+  },
+  "scenarios": [
+    {
+      "id": 1,
+      "name": "Clean Concordance Baseline",
+      "passed": false,
+      "expected": "OMNI synthesis complete with valid verdict (GO/STRONG_GO expected in live session)",
+      "actual": "verdict=UNKNOWN | votes=0/0 | execution_ok=None | synthesis_id=None",
+      "duration_ms": 20.654916763305664,
+      "pipeline_steps": [
+        "A: Signal generated \u2192 AAPL/bullish P1 high-confidence",
+        "B: Concordance formed \u2192 3/3 agents, score=85.0, P1 pathway",
+        "C: Submitting to OMNI /concordance...",
+        "C: OMNI synthesis complete \u2192 verdict=UNKNOWN, votes=0/0",
+        "D: Axiom gates \u2192 axiom_blocked=False",
+        "E-F: Execution routing \u2192 execution_ok=None"
+      ],
+      "failure_point": "invalid_synthesis_response",
+      "diagnosis": null,
+      "fix_applied": null
+    },
+    {
+      "id": 2,
+      "name": "Agent Timeout \u2014 P2 Pathway",
+      "passed": false,
+      "expected": "P2 concordance synthesized, reduced sizing applied",
+      "actual": "verdict=UNKNOWN | brains_responded=0 | sizing=0x | execution_ok=None",
+      "duration_ms": 17.313718795776367,
+      "pipeline_steps": [
+        "A: Signal generated \u2192 AAPL/bearish (Sage timed out)",
+        "B: P2 concordance formed \u2192 2/3 agents (Cipher+Atlas), score=76.0, sizing=0.75x",
+        "C: Submitting to OMNI \u2192 P2 pathway, reduced sizing...",
+        "C: OMNI P2 synthesis \u2192 verdict=UNKNOWN, brains_responded=0, sizing=0"
+      ],
+      "failure_point": null,
+      "diagnosis": null,
+      "fix_applied": null
+    },
+    {
+      "id": 3,
+      "name": "Conditional Verdict \u2014 Must Block",
+      "passed": false,
+      "expected": "CONDITIONAL or NO_GO verdict, execution=False/None (BLOCKED)",
+      "actual": "verdict=UNKNOWN | execution_ok=None | votes_go=0/0 | BLOCK=\u274c FAILED TO BLOCK",
+      "duration_ms": 18.073081970214844,
+      "pipeline_steps": [
+        "A: Signal generated \u2192 AAPL/bullish, score=32 (BELOW quality threshold)",
+        "B: P3 concordance \u2192 1/3 agents (Cipher only), score=32.0, sizing=0.25x",
+        "C: Submitting to OMNI \u2192 brains should vote NO_GO/CONDITIONAL...",
+        "C: OMNI verdict \u2192 UNKNOWN",
+        "D: Execution dispatched? \u2192 False (must be False/None to PASS)"
+      ],
+      "failure_point": "execution_was_not_blocked",
+      "diagnosis": "verdict=UNKNOWN with execution_ok=None \u2014 CRITICAL: low-confidence trade NOT blocked",
+      "fix_applied": null
+    },
+    {
+      "id": 4,
+      "name": "VIX Brake Activation",
+      "passed": true,
+      "expected": "VIX data readable, brake mechanism verified wired, NORMAL regime correctly not braking",
+      "actual": "VIX=16.89 (NORMAL, brake_threshold=28) | VIX readable=True | Axiom hard_stop path verified | brake_would_fire_now=False (correctly False in NORMAL regime)",
+      "duration_ms": 14.851093292236328,
+      "pipeline_steps": [
+        "A: Current regime \u2192 VIX=16.89, classification=NORMAL",
+        "B: VIX data validity \u2192 readable=True, value=16.89",
+        "C: Axiom /assess (unlisted ticker) \u2192 risk_score=2.0, hard_stops=[]",
+        "D: VIX brake check \u2192 current_vix=16.89, threshold=28, brake_would_fire=False",
+        "E: VIX brake mechanism \u2192 hard_stop path verified in Axiom /assess code"
+      ],
+      "failure_point": null,
+      "diagnosis": null,
+      "fix_applied": null
+    },
+    {
+      "id": 5,
+      "name": "Primary Data Source Unavailable",
+      "passed": true,
+      "expected": "ORACLE context served, fallback chain operational, macro data available",
+      "actual": "engines=8 | data_sources=['fundamental', 'macro'] | macro_ok=True | cache_hit=39.7% | cache_tickers=0",
+      "duration_ms": 4656.32176399231,
+      "pipeline_steps": [
+        "A: ORACLE health \u2192 engines=8, cache_hit_rate=39.7%",
+        "B: ORACLE context for AAPL \u2192 HTTP 200",
+        "C: Data engines responded \u2192 ['fundamental', 'macro']",
+        "D: Macro data endpoint \u2192 OK",
+        "E: ORACLE cache \u2192 0 tickers warmed"
+      ],
+      "failure_point": null,
+      "diagnosis": null,
+      "fix_applied": null
+    },
+    {
+      "id": 6,
+      "name": "Earnings Gate Block",
+      "passed": false,
+      "expected": "Earnings gate verified (CONDITIONAL/NO_GO preferred when brains see earnings risk)",
+      "actual": "verdict=UNKNOWN | execution_ok=None | votes_go=0/0 | notes=[] | earnings_blocked=\u26a0\ufe0f check_manually",
+      "duration_ms": 4483.149766921997,
+      "pipeline_steps": [
+        "A: ORACLE context for MSFT \u2192 earnings-related fields: ['earnings_date', 'days_to_earnings', 'earnings_clear_25d', 'earnings_clear_45d']",
+        "B: Submitting MSFT concordance to OMNI (earnings within DTE+5 window)...",
+        "C: OMNI verdict for MSFT \u2192 UNKNOWN | exec=None",
+        "D: Synthesis notes \u2192 []"
+      ],
+      "failure_point": "synthesis_failed",
+      "diagnosis": "Note: Earnings gate is AI-context-driven. verdict=UNKNOWN. After-hours context may affect brain votes.",
+      "fix_applied": null
+    },
+    {
+      "id": 7,
+      "name": "DTE Boundary Condition",
+      "passed": false,
+      "expected": "Synthesis complete, DTE boundary correctly enforced (no off-by-one)",
+      "actual": "verdict=UNKNOWN | synthesis_id=None | positions_checked=0 | dte_ok=True",
+      "duration_ms": 9.448051452636719,
+      "pipeline_steps": [
+        "A: Axiom /anchor \u2192 ['anchor_stocks', 'count', 'as_of', '__status_code']",
+        "B: ORACLE intelligence cycle \u2192 unavailable",
+        "C: Submitting AAPL concordance to test spread DTE resolution...",
+        "C: OMNI verdict \u2192 UNKNOWN, synthesis_id=None",
+        "D: Alpha Execution positions \u2192 count=0"
+      ],
+      "failure_point": "synthesis_failed",
+      "diagnosis": null,
+      "fix_applied": null
+    },
+    {
+      "id": 8,
+      "name": "Duplicate Order Prevention",
+      "passed": true,
+      "expected": "Second (same P4 window) BLOCKED with 429 \u2014 dedup gate active",
+      "actual": "FIRST: verdict=ERROR id=None | SECOND: http=429 accepted=False reason=P4 already dispatched for AAPL in window MOCK_S8_DEDUP_2026-05-03-1400 | DEDUP=\u2705",
+      "duration_ms": 527.1878242492676,
+      "pipeline_steps": [
+        "A: Submitting FIRST concordance (P4 pathway, fixed window_id)...",
+        "B: Submitting SECOND concordance (same window_id, same ticker)...",
+        "A result: verdict=ERROR, synthesis_id=None, error=None",
+        "B result: http_error=429, accepted=False"
+      ],
+      "failure_point": null,
+      "diagnosis": null,
+      "fix_applied": null
+    },
+    {
+      "id": 9,
+      "name": "Position Limit Reached",
+      "passed": true,
+      "expected": "Position limit gate correctly fires at MAX_CONCURRENT_POSITIONS=10 (current: 0)",
+      "actual": "open=0/10 (below limit) | gate correctly NOT triggered | execution result: executed=False | reason=Outside market hours (9:30 AM \u2013 4:00 PM ET, weekdays only) | (Alpaca failure expected after-hours = \u2705 correct behavior)",
+      "duration_ms": 219.5420265197754,
+      "pipeline_steps": [
+        "A: Current open positions \u2192 0/10",
+        "B: Alpha Execution health \u2192 execution_paused=False, valid=True",
+        "C: Directly calling Alpha Execution /execute to test position limit gate...",
+        "C: Execute response \u2192 HTTP 422, executed=False, reason=Outside market hours (9:30 AM \u2013 4:00 PM ET, weekdays only)",
+        "D: Position gate test \u2192 gate verified at 0/10 capacity"
+      ],
+      "failure_point": null,
+      "diagnosis": null,
+      "fix_applied": null
+    },
+    {
+      "id": 10,
+      "name": "Complete Exit Lifecycle",
+      "passed": false,
+      "expected": "All 3 agents accepted by buffer, AILS outcome recorded with P&L",
+      "actual": "Buffer: 0/3 agents accepted | OMNI syntheses today: 1 | Open positions: 0 | AILS outcome: recorded | P&L tracked: +$175.00 (+0.95%)",
+      "duration_ms": 1029.1452407836914,
+      "pipeline_steps": [
+        "A: Submitting picks to Alpha Buffer (3 agents)...",
+        "  Cipher: accepted=False, concordance_triggered=False",
+        "  Atlas: accepted=False, concordance_triggered=False",
+        "  Sage: accepted=False, concordance_triggered=False",
+        "B: Alpha Buffer status \u2192 ? total subs",
+        "C: OMNI syntheses today \u2192 1",
+        "D: Alpha Execution open positions \u2192 0",
+        "E: Submitting outcome to AILS...",
+        "E: AILS outcome \u2192 OK, id=None",
+        "F: AILS EOD report \u2192 ['date', 'generated_at', 'regime', 'vix', 'summary']"
+      ],
+      "failure_point": "buffer_rejected_agents",
+      "diagnosis": "Buffer results: ['Cipher=False', 'Atlas=False', 'Sage=False'], AILS: {'status': 'ok', 'ticker': 'AAPL', 'win': True, '__status_code': 200}",
+      "fix_applied": null
+    }
+  ],
+  "tier1_issues": [
+    "S1 (Clean Concordance Baseline): invalid_synthesis_response",
+    "S3 (Conditional Verdict \u2014 Must Block): execution_was_not_blocked",
+    "S6 (Earnings Gate Block): synthesis_failed",
+    "S7 (DTE Boundary Condition): synthesis_failed",
+    "S10 (Complete Exit Lifecycle): buffer_rejected_agents"
+  ],
+  "fixes_applied": []
+}

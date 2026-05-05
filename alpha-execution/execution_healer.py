@@ -409,8 +409,16 @@ async def auto_heal_execution(
     # ── Apply state changes ──
     if error_class == ExecutionErrorClass.INVALID_PAYLOAD:
         # Skip ticker only — do NOT touch execution_paused (it was never set for 422)
-        skipped_tickers.add(ticker.upper())
-        logger.info("Ticker %s added to session skip list", ticker)
+        # BUG-FIX (RE-001): main.py passes _skipped_tickers as a dict {ticker: datetime},
+        # not a set. Calling .add() raised AttributeError on every 422, crashing the
+        # healer thread silently and leaving the ticker unskipped.
+        _ts = __import__("datetime").datetime.now(__import__("pytz").timezone("America/New_York"))
+        if isinstance(skipped_tickers, dict):
+            skipped_tickers[ticker.upper()] = _ts
+        else:
+            # Fallback for set-type callers (defensive)
+            skipped_tickers.add(ticker.upper())  # type: ignore[attr-defined]
+        logger.info("Ticker %s added to session skip list (healer: INVALID_PAYLOAD)", ticker)
 
     elif result.resume_approved:
         with state_lock:

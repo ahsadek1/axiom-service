@@ -611,6 +611,28 @@ def get_circuit_breaker_state(db_path: str) -> dict:
     return dict(row) if row else {"status": "NORMAL", "consecutive_losses": 0}
 
 
+# G8 FIX (2026-05-03): Column whitelist for update_circuit_breaker_state.
+# Dynamic SQL built from dict keys is safe today (internal callers only) but
+# becomes a SQL-injection vector the moment any API endpoint exposes these keys.
+# Whitelist enforced at write time; any unknown key raises ValueError immediately.
+_CIRCUIT_BREAKER_ALLOWED_COLUMNS: frozenset[str] = frozenset({
+    "status",
+    "consecutive_losses",
+    "daily_trades",
+    "daily_wins",
+    "daily_losses",
+    "daily_pnl_pct",
+    "weekly_losses",
+    "weekly_pnl_pct",
+    "portfolio_pnl_pct",
+    "last_trade_date",
+    "last_weekly_reset",
+    "last_updated",
+    "manual_override",
+    "manual_override_note",
+})
+
+
 def update_circuit_breaker_state(db_path: str, updates: dict) -> None:
     """
     Update circuit breaker state fields. Only updates provided fields.
@@ -618,9 +640,20 @@ def update_circuit_breaker_state(db_path: str, updates: dict) -> None:
     Args:
         db_path:  Path to database.
         updates:  Dict of field → value pairs to update.
+
+    Raises:
+        ValueError: If any key is not in the allowed column whitelist.
     """
     if not updates:
         return
+
+    # G8: validate all keys against whitelist before building SQL
+    unknown = set(updates.keys()) - _CIRCUIT_BREAKER_ALLOWED_COLUMNS
+    if unknown:
+        raise ValueError(
+            f"update_circuit_breaker_state: unknown column(s): {sorted(unknown)}. "
+            f"Allowed: {sorted(_CIRCUIT_BREAKER_ALLOWED_COLUMNS)}"
+        )
 
     now = datetime.now(timezone.utc).isoformat()
     updates["last_updated"] = now

@@ -200,8 +200,10 @@ _healer_running = False           # True while a healer thread is alive
 # banned all day. Use _is_ticker_skipped() to check + auto-expire.
 _skipped_tickers: dict = {}      # ticker → datetime added (ET); 30-min TTL per GAP-2
 _ticker_fail_counts: dict = {}   # GAP-CB: consecutive execution failures per ticker
+_void_counts: dict[str, int] = {}  # VOID CB: daily fill-timeout VOID count per ticker
 _TICKER_FAIL_THRESHOLD = 3       # GAP-CB: auto-skip after this many consecutive failures
 _SKIPPED_TICKER_TTL_S  = 1800   # GAP-2: 30 minutes
+MAX_VOID_PER_TICKER_PER_DAY = 2  # VOID CB: blacklist ticker after this many VOIDs/day
 
 # GAP-6: Per-ticker locks — prevent exit_monitor/execute race condition on same position
 _ticker_locks: dict = {}          # ticker → threading.Lock
@@ -275,6 +277,12 @@ def _validate_restored_state() -> None:
             _skipped_tickers.pop(t, None)
         if stale_skipped:
             logger.info("FLAW4: cleared stale skipped_tickers: %s", stale_skipped)
+        # Clear void_counts for tickers no longer in live positions
+        stale_voids = [t for t in list(_void_counts.keys()) if t not in live_positions]
+        for t in stale_voids:
+            del _void_counts[t]
+        if stale_voids:
+            logger.info("FLAW4: cleared stale void_counts: %s", stale_voids)
         if stale_fails or stale_skipped:
             _svc_state.write_many({"ticker_fail_counts": dict(_ticker_fail_counts),
                                    "skipped_tickers": list(_skipped_tickers.keys())})
@@ -779,7 +787,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             with _state_lock:
                 app_state["trades_today"] = 0
                 app_state["first_exec_failed"] = False
-            logger.info("SOVEREIGN DIRECTIVE: FLUSH — daily trade counter reset")
+                _void_counts.clear()
+            logger.info("SOVEREIGN DIRECTIVE: FLUSH — daily trade counter reset (void_counts cleared)")
             report("alpha_execution", "ack", {"directive": "FLUSH", "status": "applied"})
         else:
             logger.warning("SOVEREIGN DIRECTIVE: unrecognized '%s'", directive[:100])
@@ -996,13 +1005,16 @@ def _run_startup_reconciliation() -> None:
             try:
                 import sys as _sys
                 _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-                from shared.mandate_logger import log_incident as _log_incident, FAILURE_GHOST_POSITION
-                _log_incident(
+                from shared.mandate_logger import log_incident as _log_incident, update_incident, FAILURE_GHOST_POSITION
+                _inc_id = _log_incident(
                     agent        = "alpha-execution",
                     component    = "startup_reconciliation",
                     failure_type = FAILURE_GHOST_POSITION,
                     damage       = f"Closed {len(closed_ids)} stale position(s): {summary}",
                     root_cause   = "Service restart found DB positions absent from Alpaca",
+                )
+                update_incident(
+                    incident_id  = _inc_id,
                     fix_applied  = "auto-closed by startup reconciliation",
                 )
                 logger.info("GAP-10: CHRONICLE incident logged for startup reconciliation")
@@ -1266,14 +1278,16 @@ def execute(
             },
         )
 
-    # GAP-001/GAP-2: Skip gate — reject tickers in the 30-min skip list
+    # GAP-001/GAP-2: Skip gate — reject tickers in the session skip list.
+    # Tickers land here via: invalid payload 422, circuit breaker, or VOID circuit breaker.
     if _is_ticker_skipped(body.ticker.upper()):
-        logger.warning("Ticker %s in session skip list (prior 422) — rejecting", body.ticker)
+        _skip_reason = "void_circuit_breaker" if _void_counts.get(body.ticker.upper(), 0) >= MAX_VOID_PER_TICKER_PER_DAY else "prior_error_or_circuit_breaker"
+        logger.warning("Ticker %s in session skip list (%s) — rejecting", body.ticker, _skip_reason)
         return JSONResponse(
             status_code=422,
             content={
                 "executed": False,
-                "reason":   f"Ticker {body.ticker} skipped for session due to prior invalid payload error",
+                "reason":   f"Ticker {body.ticker} is on session skip list ({_skip_reason})",
             },
         )
 
@@ -1298,16 +1312,22 @@ def execute(
 
     # PROBE-2 P1-2: window_id format validation — explicit regex before any DB/Alpaca call.
     # Rejects malformed IDs early. Fragile substring match is no longer the only guard.
-    if _window_id != "unknown" and not _WINDOW_ID_RE.match(_window_id):
+    # GENESIS 2026-05-04: 'unknown' explicitly blocked — pre-market orders with missing
+    # window context must never reach Alpaca. The exemption for 'unknown' was a legacy
+    # escape hatch that allowed orphaned pre-market orders to execute (INCIDENT 2026-05-04).
+    # Any caller (OMNI, chain runner, etc.) must provide a valid window_id. If OMNI or the
+    # buffer defaults to 'unknown', that is a caller bug — fail loudly here, not silently.
+    if _window_id == "unknown" or not _WINDOW_ID_RE.match(_window_id):
         logger.warning(
-            "Alpha execution BLOCKED: window_id='%s' fails format contract for %s",
+            "Alpha execution BLOCKED: window_id='%s' fails format contract for %s — "
+            "'unknown' is not a valid production window ID (GENESIS fix 2026-05-04)",
             _window_id, body.ticker,
         )
         return JSONResponse(
             status_code=422,
             content={
                 "executed": False,
-                "reason":   f"window_id='{_window_id}' fails format contract (expected alphanumeric/hyphens/underscores/colons, 4-80 chars)",
+                "reason":   f"window_id='{_window_id}' is invalid — must be a recognized trading window ID (alphanumeric/hyphens/underscores/colons, 4-80 chars). 'unknown' is not accepted.",
                 "gate":     "window_id_format_guard",
             },
         )
@@ -1915,6 +1935,18 @@ def execute(
             _nw("alpha-execution", "VOID trade", _fill.void_reason, ticker=body.ticker)
         except Exception:
             pass
+        # VOID circuit breaker: blacklist ticker after MAX_VOID_PER_TICKER_PER_DAY VOIDs
+        _void_ticker = body.ticker.upper()
+        with _state_lock:
+            _void_counts[_void_ticker] = _void_counts.get(_void_ticker, 0) + 1
+            _void_n = _void_counts[_void_ticker]
+            if _void_n >= MAX_VOID_PER_TICKER_PER_DAY:
+                _skipped_tickers[_void_ticker] = datetime.now(ET)
+                _svc_state.write("skipped_tickers", list(_skipped_tickers.keys()))
+                logger.warning(
+                    "VOID CIRCUIT BREAKER: %s hit %d VOIDs today — blacklisted for rest of session",
+                    _void_ticker, _void_n,
+                )
         _ticker_lock.release(); _ticker_lock = None  # GAP-6: release before early return
         return JSONResponse(
             status_code=503,
@@ -2252,6 +2284,7 @@ def sovereign_directive(
         with _state_lock:
             app_state["trades_today"] = 0
             app_state["first_exec_failed"] = False
+            _void_counts.clear()
         report("alpha_execution", "ack", {"directive": d, "status": "applied"})
         return JSONResponse({"ok": True, "directive": d})
     elif d == "STATUS":

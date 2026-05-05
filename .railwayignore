@@ -1,0 +1,9 @@
+.venv
+__pycache__
+.git
+.pytest_cache
+*.pyc
+thesis-v2
+node_modules
+.direnv
+.terraform

@@ -366,7 +366,7 @@ def _process_dlq_cycle() -> None:
         from execution_dlq import process_dlq, get_dlq_stats
         from execution_router import route_execution
 
-        def _route_fn(payload: dict) -> tuple[bool, str | None]:
+        def _route_fn(payload: dict) -> tuple[bool, Optional[str]]:
             """Route a DLQ retry through the execution router."""
             try:
                 return route_execution(payload)
@@ -719,7 +719,36 @@ def _synthesis_silence_watcher() -> None:
                 silent_min = (time.time() - last_ts) / 60
 
             if silent_min >= _SILENCE_THRESHOLD_MIN:
-                if not _silence_alerted:
+                # GENESIS 2026-05-04: THESIS DEFENSIVE awareness.
+                # Before firing a CRITICAL silence alert, check whether THESIS has
+                # zeroed all sizing (sizing_multiplier=0.0). If so, silence is EXPECTED —
+                # no concordances will reach OMNI because THESIS blocked them upstream.
+                # Firing CRITICAL during intentional stand-aside days creates false-alarm
+                # noise and erodes signal quality of CRITICAL alerts.
+                _thesis_defensive = False
+                try:
+                    import sqlite3 as _sq3
+                    _ch_db = "/Users/ahmedsadek/nexus/data/chronicle.db"
+                    if os.path.exists(_ch_db):
+                        _ch = _sq3.connect(_ch_db, timeout=3)
+                        _ch.row_factory = _sq3.Row
+                        _th_row = _ch.execute(
+                            "SELECT sizing_multiplier, risk_reward_gate "
+                            "FROM thesis_context ORDER BY created_at DESC LIMIT 1"
+                        ).fetchone()
+                        _ch.close()
+                        if _th_row and float(_th_row["sizing_multiplier"]) == 0.0:
+                            _thesis_defensive = True
+                            logger.info(
+                                "OMNI silence (%0.f min) during THESIS DEFENSIVE posture "
+                                "(sizing_multiplier=0.0, gate=%s) — expected stand-aside behavior. "
+                                "No CRITICAL alert fired.",
+                                silent_min, _th_row["risk_reward_gate"],
+                            )
+                except Exception as _te:
+                    pass  # Chronicle unreachable — proceed with normal alert logic
+
+                if not _silence_alerted and not _thesis_defensive:
                     _silence_alerted = True
                     logger.critical(
                         "OMNI SILENCE DETECTED: no synthesis in %.0f min during market hours",
@@ -748,6 +777,10 @@ def _synthesis_silence_watcher() -> None:
                         _diagnosis = f"Diagnosis failed: {_de}"
 
                     logger.critical("SILENCE DIAGNOSIS: %s", _diagnosis)
+                elif _thesis_defensive:
+                    # Don't set _silence_alerted so that if THESIS posture changes mid-day
+                    # and silence continues, the alert fires correctly.
+                    pass
 
                     # Alert Ahmed via Telegram — deduped (30-min cooldown via alert_ahmed)
                     try:
@@ -1301,7 +1334,26 @@ def receive_concordance(
     concordance = body.model_dump()
     _pathway = concordance.get("pathway", "alpha")
     _ticker  = concordance["ticker"]
-    _win_id  = concordance.get("window_id", "unknown")
+    _win_id  = concordance.get("window_id") or ""
+
+    # GENESIS 2026-05-04: reject missing or 'unknown' window_id at the OMNI gate.
+    # A concordance with no valid window context cannot be safely routed to execution.
+    # Alpha-execution now hard-blocks 'unknown' — enforce the same contract here
+    # so the error surfaces at the source (OMNI dispatch) not downstream (alpha-exec).
+    if not _win_id or _win_id == "unknown":
+        logger.error(
+            "OMNI CONCORDANCE BLOCKED: missing/unknown window_id for ticker=%s pathway=%s — "
+            "concordance requires a valid trading window ID to proceed (GENESIS fix 2026-05-04)",
+            _ticker, _pathway,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "rejected",
+                "reason": "window_id is missing or 'unknown' — all concordances must carry a valid trading window ID",
+                "ticker": _ticker,
+            },
+        )
 
     # INV-15: Max 1 P4 signal per ticker per 15-minute window
     if concordance.get("pathway") == "P4":
@@ -1539,6 +1591,7 @@ def _run_synthesis(
         pathway            = concordance["pathway"],
         concordance_sizing = concordance["sizing_mult"],
         axiom_result       = axiom_result,
+        thesis_ctx         = thesis_ctx,
     )
 
     # G8 SYS-1: Alert on brain degradation (< 4 brains responded)

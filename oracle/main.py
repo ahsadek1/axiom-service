@@ -232,7 +232,7 @@ async def _startup_self_test() -> None:
         )
         try:
             import requests as _req
-            OMNI_BOT = "7973500599:AAHJuh_c-RN2xv-_WYVl7ev1mwF-IvqislE"
+            OMNI_BOT = "7973500599:AAGZYc2UtQ0sa9k_CrIUuXuvisikwt1Eq4c"
             msg = (
                 f"🔴 <b>ORACLE SELF-TEST FAILED</b>\n"
                 f"Data engines returning nulls on startup:\n{fail_str}\n"

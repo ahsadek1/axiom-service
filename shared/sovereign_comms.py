@@ -41,6 +41,36 @@ logger = logging.getLogger(__name__)
 SOVEREIGN_BUS_URL: str = os.getenv(
     "SOVEREIGN_BUS_URL", "http://192.168.1.141:9999"
 )
+NEXUS_HOST: str = os.getenv("NEXUS_HOST", "192.168.1.141")
+
+# ---------------------------------------------------------------------------
+# Agent Registry (used by push_directive / fleet_status / broadcast)
+# Override any entry via env var NEXUS_<AGENT_UPPER>_URL
+# ---------------------------------------------------------------------------
+
+def _agent_url(name: str, default_port: int) -> str:
+    env_key = f"NEXUS_{name.upper()}_URL"
+    return os.getenv(env_key, f"http://{NEXUS_HOST}:{default_port}")
+
+
+AGENT_REGISTRY: Dict[str, str] = {
+    "axiom":          _agent_url("axiom",          8001),
+    "alpha-buffer":   _agent_url("alpha_buffer",   8002),
+    "prime-buffer":   _agent_url("prime_buffer",   8003),
+    "omni":           _agent_url("omni",           8004),
+    "alpha-execution":_agent_url("alpha_execution",8005),
+    "prime-execution":_agent_url("prime_execution",8006),
+    "oracle":         _agent_url("oracle",         8007),
+    "ails":           _agent_url("ails",           8008),
+    "guardian-angel": _agent_url("guardian_angel", 8009),
+    "pipeline-sentinel": _agent_url("pipeline_sentinel", 8010),
+    "sovereign":      _agent_url("sovereign",      9000),
+    "cipher":         _agent_url("cipher",         9001),
+    "atlas":          _agent_url("atlas",          9002),
+    "sage":           _agent_url("sage",           9003),
+    "genesis":        _agent_url("genesis",        9004),
+    "primus":         _agent_url("primus",         9005),
+}
 GENESIS_BOT_TOKEN: str = os.getenv("GENESIS_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
 SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID: str = os.getenv(
     "SOVEREIGN_TELEGRAM_FALLBACK_CHAT_ID", "8573754783"
@@ -669,3 +699,187 @@ def get_instructions(agent_name: str) -> List[Dict[str, str]]:
         _write_watermark(wm_path, latest_ts)
 
     return new_messages
+
+
+# ---------------------------------------------------------------------------
+# V2 SOVEREIGN → AGENT command API
+# ---------------------------------------------------------------------------
+
+def push_directive(
+    agent: str,
+    directive: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Push a directive from SOVEREIGN to a named agent.
+
+    Attempts HTTP POST to {agent_url}/sovereign/directive first.
+    Falls back to bus POST on HTTP failure or non-200 response.
+    Returns immediately if agent is not in AGENT_REGISTRY.
+
+    Return dict keys: ok (bool), method (http|bus|failed), agent (str).
+    Never raises.
+
+    :param agent:     Target agent name (must be in AGENT_REGISTRY).
+    :param directive: Directive string, e.g. "HALT", "STATUS", "SET_THRESHOLD".
+    :param data:      Optional data payload dict.
+    :return:          Result dict with ok, method, agent.
+    """
+    if agent not in AGENT_REGISTRY:
+        logger.warning("sovereign_comms: push_directive to unknown agent '%s'", agent)
+        return {"ok": False, "method": "failed", "agent": agent, "reason": "unknown_agent"}
+
+    agent_url = AGENT_REGISTRY[agent]
+    body: Dict[str, Any] = {"directive": directive, "data": data, "from": "sovereign"}
+
+    # --- HTTP path ---
+    try:
+        resp = requests.post(
+            f"{agent_url}/sovereign/directive",
+            json=body,
+            timeout=_HTTP_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            try:
+                result: Dict[str, Any] = resp.json()
+            except Exception:
+                result = {}
+            result["ok"] = True
+            result["method"] = "http"
+            result["agent"] = agent
+            return result
+        logger.warning(
+            "sovereign_comms: push_directive HTTP %d for '%s' → bus fallback",
+            resp.status_code, agent,
+        )
+    except Exception as exc:
+        logger.warning(
+            "sovereign_comms: push_directive HTTP failed for '%s': %s → bus fallback",
+            agent, exc,
+        )
+
+    # --- Bus fallback ---
+    try:
+        bus_body = {
+            "from": "sovereign",
+            "to": agent,
+            "message": f"directive: {json.dumps({'directive': directive, 'data': data})}",
+        }
+        resp = requests.post(f"{SOVEREIGN_BUS_URL}/send", json=bus_body, timeout=_HTTP_TIMEOUT)
+        if resp.status_code < 300:
+            return {"ok": True, "method": "bus", "agent": agent}
+        logger.warning(
+            "sovereign_comms: push_directive bus HTTP %d for '%s'",
+            resp.status_code, agent,
+        )
+    except Exception as exc:
+        logger.warning(
+            "sovereign_comms: push_directive bus failed for '%s': %s",
+            agent, exc,
+        )
+
+    return {"ok": False, "method": "failed", "agent": agent}
+
+
+def fleet_status(
+    agents: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Query /health on each agent in parallel.
+
+    Returns dict of agent_name → {ok, status, ...}.
+    Unknown agents (not in AGENT_REGISTRY) return ok=False without a network call.
+    Never raises.
+
+    :param agents: List of agent names to query. Defaults to all in AGENT_REGISTRY.
+    :return:       Dict of agent_name → health result dict.
+    """
+    targets = agents if agents is not None else list(AGENT_REGISTRY.keys())
+    results: Dict[str, Dict[str, Any]] = {}
+    lock = threading.Lock()
+
+    def _check(name: str) -> None:
+        if name not in AGENT_REGISTRY:
+            with lock:
+                results[name] = {"ok": False, "status": "unknown_agent"}
+            return
+        url = f"{AGENT_REGISTRY[name]}/health"
+        try:
+            resp = requests.get(url, timeout=_HTTP_TIMEOUT)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                data["ok"] = True
+                with lock:
+                    results[name] = data
+            else:
+                with lock:
+                    results[name] = {"ok": False, "status": f"HTTP {resp.status_code}"}
+        except Exception as exc:
+            with lock:
+                results[name] = {"ok": False, "status": str(exc)}
+
+    threads = [threading.Thread(target=_check, args=(a,), daemon=True) for a in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=_HTTP_TIMEOUT + 1)
+
+    return results
+
+
+def broadcast(
+    directive: str,
+    data: Optional[Dict[str, Any]] = None,
+    targets: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Push a directive to multiple agents simultaneously.
+
+    Calls push_directive() for each target sequentially.
+    Returns dict of agent_name → push_directive result.
+    Never raises.
+
+    :param directive: Directive string.
+    :param data:      Optional data payload dict.
+    :param targets:   Agent names to target. Defaults to all in AGENT_REGISTRY.
+    :return:          Dict of agent_name → result dict.
+    """
+    target_list = targets if targets is not None else list(AGENT_REGISTRY.keys())
+    return {agent: push_directive(agent, directive, data) for agent in target_list}
+
+
+def poll_and_execute(
+    agent_name: str,
+    dispatch_fn: Callable[[Dict[str, str]], None],
+) -> int:
+    """
+    Poll the SOVEREIGN inbox for agent_name and dispatch each new instruction.
+
+    Calls dispatch_fn for each new instruction. Exceptions from dispatch_fn
+    are caught, logged, and do NOT stop processing of subsequent instructions.
+
+    Returns the count of successfully dispatched instructions (i.e. those
+    where dispatch_fn did not raise).
+
+    Uses the same watermark deduplication as get_instructions().
+    Never raises.
+
+    :param agent_name:  Agent polling its own inbox.
+    :param dispatch_fn: Callable called for each new instruction dict.
+    :return:            Count of successfully dispatched instructions.
+    """
+    instructions = get_instructions(agent_name)
+    count = 0
+    for instr in instructions:
+        try:
+            dispatch_fn(instr)
+            count += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "sovereign_comms: poll_and_execute dispatch error for '%s' instr=%s: %s",
+                agent_name, instr.get("id", "?"), exc,
+            )
+    return count

@@ -442,11 +442,16 @@ def get_regime_history(
     _verify_auth(x_ails_secret)
     backtest = get_backtest_conn()
 
-    rows = backtest.execute(
-        "SELECT date, vix_close, regime FROM regime_history "
-        "ORDER BY date DESC LIMIT ?",
-        (days,),
-    ).fetchall()
+    # BUG-FIX (RE-005): acquire _db_lock before accessing shared connection.
+    # This endpoint was the only reader bypassing the lock, risking concurrent
+    # access errors on the shared SQLite connection.
+    with _db_lock:
+        rows = backtest.execute(
+            "SELECT date, vix_close, regime FROM regime_history "
+            "ORDER BY date DESC LIMIT ?",
+            (days,),
+        ).fetchall()
+        rows = list(rows)  # materialize inside lock
 
     current = get_current_regime()
 
@@ -515,13 +520,15 @@ def get_backtest_status(
     _verify_auth(x_ails_secret)
     backtest = get_backtest_conn()
 
-    hist_count = backtest.execute(
-        "SELECT COUNT(*) as n FROM historical_win_rates"
-    ).fetchone()["n"]
+    # BUG-FIX (RE-005): acquire _db_lock before accessing shared connection.
+    with _db_lock:
+        hist_count = backtest.execute(
+            "SELECT COUNT(*) as n FROM historical_win_rates"
+        ).fetchone()["n"]
 
-    regime_count = backtest.execute(
-        "SELECT COUNT(*) as n FROM regime_history"
-    ).fetchone()["n"]
+        regime_count = backtest.execute(
+            "SELECT COUNT(*) as n FROM regime_history"
+        ).fetchone()["n"]
 
     regime_rates_count = backtest.execute(
         "SELECT COUNT(*) as n FROM regime_level_rates"

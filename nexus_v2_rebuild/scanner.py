@@ -288,24 +288,23 @@ def run_scan_cycle(
     except UniformScoreError as e:
         logger.critical("[Scanner] %s", e)
         result.uniform_score_flag = True
-        import asyncio
-        asyncio.create_task(alert_fn(
+        # alert_fn is a thread-safe sync wrapper provided by _async_scan_wrapper
+        alert_fn(
             f"🔴 <b>UNIFORM SCORE ALERT</b>\n"
             f"Window {window_id}: {len(scores_this_cycle)} scores all = "
             f"{scores_this_cycle[0] if scores_this_cycle else '?'}\n"
             f"DATA FAILURE — Oracle likely returning defaults.\n"
             f"Verdicts from this window should be discarded."
-        ))
+        )
 
     # C2 critique: alert if >50% of pool skipped
     if result.is_data_failure():
-        import asyncio
-        asyncio.create_task(alert_fn(
+        alert_fn(
             f"⚠️ <b>HIGH SKIP RATE</b> — window {window_id}\n"
             f"{result.skip_count}/{result.pool_size} tickers skipped "
             f"({result.skip_rate:.0%})\n"
             f"Likely data failure. Skip reasons: {result.skips}"
-        ))
+        )
 
     # Persist cycle to DB
     try:
@@ -356,12 +355,22 @@ def create_scheduler(
     import asyncio
 
     async def _async_scan_wrapper():
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+
+        def _sync_alert(msg: str) -> None:
+            """Thread-safe alert wrapper: schedules async alert_fn onto the event loop."""
+            try:
+                future = asyncio.run_coroutine_threadsafe(alert_fn(msg), loop)
+                future.result(timeout=10.0)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("[Scanner] _sync_alert failed: %s", exc)
+
         await loop.run_in_executor(
             None,
             run_scan_cycle,
             db_path, axiom_url, nexus_secret,
-            market_state, alert_fn, omni_dispatch_fn,
+            market_state, _sync_alert, omni_dispatch_fn,
         )
 
     scheduler.add_job(

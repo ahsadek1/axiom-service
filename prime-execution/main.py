@@ -95,11 +95,14 @@ from reconciler import run_reconciler
 
 # P0-A: Stale deploy detection
 import hashlib as _hashlib
-import hashlib as _hashlib, os as _os, glob as _glob
+import os as _os
+import glob as _glob
 
+# G7 NOTE (2026-05-03): canonical implementation lives in shared/module_hash.py.
+# Local copy retained until sys.path insert is moved above this block.
 def _compute_module_hash() -> str:
     """Hash all *.py files in this service directory (excluding __pycache__).
-    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    Returns 8-char hex digest. Canonical: shared/module_hash.compute_module_hash(__file__)
     """
     _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
     _files = sorted(
@@ -618,17 +621,20 @@ def _run_reconciler() -> None:
     if not _is_market_hours():
         return
     try:
-        # Reconciler writes directly to app_state dict.
-        # Adversarial fix #4: wrap the reconciler call with _state_lock so that
-        # any compound read-modify-write of app_state is fully atomic.
-        with _state_lock:
-            run_reconciler(
-                db_path       = settings.prime_db_path,
-                alpaca_client = _get_alpaca(),
-                bot_token     = settings.telegram_bot_token,
-                chat_id       = settings.ahmed_chat_id,
-                app_state     = app_state,
-            )
+        # G2 FIX (2026-05-03): Removed external _state_lock wrapping.
+        # reconciler.py acquires _reconciler_lock *internally* on every call
+        # (OMNI Pass 3 PROBE-I2 fix). Holding _state_lock here created a nested
+        # lock order _state_lock -> _reconciler_lock. Any future path that
+        # acquires _reconciler_lock first and then needs _state_lock would
+        # produce an ABBA deadlock. The internal lock in reconciler.py is the
+        # authoritative guard on app_state["execution_paused"] mutations.
+        run_reconciler(
+            db_path       = settings.prime_db_path,
+            alpaca_client = _get_alpaca(),
+            bot_token     = settings.telegram_bot_token,
+            chat_id       = settings.ahmed_chat_id,
+            app_state     = app_state,
+        )
     except Exception as e:
         logger.error("Prime reconciler failed: %s", e)
 
@@ -1305,17 +1311,16 @@ def resume_execution(x_nexus_prime_secret: str = Header(default="")) -> JSONResp
 def manual_reconcile(x_nexus_prime_secret: str = Header(default="")) -> JSONResponse:
     """Manually trigger a reconciliation pass.
 
-    OMNI M-NEW-2 fix: wrap with _state_lock. The scheduled reconciler also holds
-    _state_lock — without this, a manual trigger concurrent with a scheduled run
-    creates a race on app_state["execution_paused"].
+    G2 FIX (2026-05-03): Removed external _state_lock wrapping. reconciler.py
+    owns _reconciler_lock internally — concurrent scheduled + manual runs are
+    safely serialized there. The external lock created an ABBA gradient.
     """
     verify_secret(x_nexus_prime_secret)
-    with _state_lock:
-        result = run_reconciler(
-            settings.prime_db_path, _get_alpaca(),
-            settings.telegram_bot_token, settings.ahmed_chat_id,
-            app_state,
-        )
+    result = run_reconciler(
+        settings.prime_db_path, _get_alpaca(),
+        settings.telegram_bot_token, settings.ahmed_chat_id,
+        app_state,
+    )
     return JSONResponse(result)
 
 

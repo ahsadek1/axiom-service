@@ -1,0 +1,298 @@
+"""
+market_state.py — Single source of truth for market conditions
+==============================================================
+One component owns VIX. Everything else reads through get_scanning_allowed().
+C4 fix: staleness TTL — if VIX > 12min old, fail safe (pause), not fail open.
+C5 fix: suspension uses wait-and-retry with backoff, not SystemExit.
+
+Authored: 2026-05-02 | Cipher spec + OMNI adversarial review
+"""
+
+from __future__ import annotations
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+VIX_PAUSE_THRESHOLD     = 35.0
+VIX_ELEVATED_THRESHOLD  = 25.0
+MAX_MARKET_STATE_AGE    = timedelta(minutes=12)   # 2 missed 5-min cycles = stale
+POLL_INTERVAL_SECONDS   = 300                      # 5 min
+
+ORATS_TOKEN    = "4476e955-241a-4540-b114-ebbf1a3a3b87"
+POLYGON_API_KEY = "ZMEnZ_2GURw_UqbufU5npd49ZDeptMhl"
+FRED_API_KEY   = "5749ecf7ebd18e7f77e30ef2357f55b7"
+
+
+# ── MarketState ───────────────────────────────────────────────────────────────
+
+@dataclass
+class MarketState:
+    regime:                 str     = "UNKNOWN"   # NORMAL|ELEVATED_VOL|HIGH_VOL|EXTREME_FEAR
+    vix:                    Optional[float] = None
+    vix_source:             str     = "unavailable"
+    vix_updated_at:         Optional[datetime] = None
+    scanning_allowed:       bool    = False       # default CLOSED until first successful poll
+    credit_spreads_allowed: bool    = False
+    debit_spreads_allowed:  bool    = False
+    pause_reason:           Optional[str] = None
+    is_stale:               bool    = True        # starts stale until first update
+
+    # Suspension state (C5 fix — no SystemExit)
+    suspended:              bool    = False
+    suspend_reason:         Optional[str] = None
+    suspended_at:           Optional[datetime] = None
+
+
+def get_scanning_allowed(state: MarketState) -> bool:
+    """
+    C4 fix: Never read state.scanning_allowed directly.
+    Always check staleness first — fail safe, not fail open.
+    """
+    if state.suspended:
+        return False
+
+    if state.vix_updated_at is None:
+        logger.warning("MarketState: no VIX reading yet — scanning blocked")
+        return False
+
+    age = datetime.now(timezone.utc) - state.vix_updated_at
+    if age > MAX_MARKET_STATE_AGE:
+        logger.warning(
+            "MarketState STALE: VIX data is %d min old (max %d) — pausing scan",
+            int(age.total_seconds() / 60),
+            int(MAX_MARKET_STATE_AGE.total_seconds() / 60),
+        )
+        return False
+
+    return state.scanning_allowed
+
+
+def classify_regime(vix: float) -> tuple[str, bool, bool, bool]:
+    """
+    Returns (regime, scanning_allowed, credit_spreads_allowed, debit_spreads_allowed).
+    """
+    if vix >= VIX_PAUSE_THRESHOLD:
+        return "EXTREME_FEAR", False, False, False
+    elif vix >= VIX_ELEVATED_THRESHOLD:
+        return "HIGH_VOL", True, True, False   # credit OK, no debit in high vol
+    elif vix >= 18:
+        return "ELEVATED_VOL", True, True, True
+    else:
+        return "NORMAL", True, True, True
+
+
+# ── VIX Fetchers ─────────────────────────────────────────────────────────────
+
+async def _fetch_vix_polygon() -> Optional[float]:
+    """Fetch VIX from Polygon snapshot (primary)."""
+    import aiohttp
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/VIX"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params={"apiKey": POLYGON_API_KEY},
+                                   timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    last = (data.get("ticker", {}).get("lastTrade", {}).get("p") or
+                            data.get("ticker", {}).get("day", {}).get("c"))
+                    if last:
+                        return float(last)
+    except Exception as e:
+        logger.warning("Polygon VIX fetch failed: %s", e)
+    return None
+
+
+async def _fetch_vix_fred() -> Optional[float]:
+    """Fetch VIX from FRED API (fallback)."""
+    import aiohttp
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": "VIXCLS", "api_key": FRED_API_KEY,
+        "sort_order": "desc", "limit": 1, "file_type": "json"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    obs = data.get("observations", [])
+                    if obs and obs[0].get("value") != ".":
+                        return float(obs[0]["value"])
+    except Exception as e:
+        logger.warning("FRED VIX fetch failed: %s", e)
+    return None
+
+
+async def get_vix_with_fallback() -> tuple[Optional[float], str]:
+    """
+    Fetch VIX: Polygon primary, FRED fallback.
+    Returns (vix_value, source_string).
+    Returns (None, "unavailable") if both fail — caller must pause scanning.
+    NEVER returns a silent default.
+    """
+    vix = await _fetch_vix_polygon()
+    if vix is not None:
+        return vix, "polygon"
+
+    logger.warning("Polygon VIX failed — trying FRED fallback")
+    vix = await _fetch_vix_fred()
+    if vix is not None:
+        return vix, "fred_fallback"
+
+    logger.error("Both Polygon and FRED VIX sources failed")
+    return None, "unavailable"
+
+
+# ── Poller ────────────────────────────────────────────────────────────────────
+
+async def market_state_poller(
+    state: MarketState,
+    alert_fn,       # callable(msg: str) — sends Telegram alert to Ahmed
+    db_path: str,
+) -> None:
+    """
+    Single dedicated poller. Updates MarketState every 5 minutes.
+    On VIX unavailable: pause scanning, alert Ahmed once.
+    On VIX restored: resume automatically, alert Ahmed.
+
+    C4: This is the ONLY code that writes to MarketState.
+    Everyone else calls get_scanning_allowed(state) — never reads .scanning_allowed directly.
+    """
+    vix_unavailable_alerted = False
+
+    while True:
+        try:
+            vix, source = await get_vix_with_fallback()
+
+            if vix is None:
+                # Fail safe — pause scanning
+                state.scanning_allowed        = False
+                state.credit_spreads_allowed  = False
+                state.debit_spreads_allowed   = False
+                state.vix_source              = "unavailable"
+                state.pause_reason            = "VIX data unavailable — both Polygon and FRED failed"
+                state.regime                  = "UNKNOWN"
+                # Alert Ahmed only once per outage
+                if not vix_unavailable_alerted:
+                    vix_unavailable_alerted = True
+                    await alert_fn(
+                        "⚠️ <b>VIX DATA UNAVAILABLE</b>\n"
+                        "Both Polygon and FRED failed.\n"
+                        "Scanning PAUSED until data restored.\n"
+                        "No trades will execute."
+                    )
+                logger.error("VIX unavailable — scanning paused")
+            else:
+                regime, scan_ok, credit_ok, debit_ok = classify_regime(vix)
+                was_unavailable = (state.vix_source == "unavailable" or vix_unavailable_alerted)
+
+                state.vix                     = vix
+                state.vix_source              = source
+                state.vix_updated_at          = datetime.now(timezone.utc)
+                state.regime                  = regime
+                state.scanning_allowed        = scan_ok
+                state.credit_spreads_allowed  = credit_ok
+                state.debit_spreads_allowed   = debit_ok
+                state.pause_reason            = None if scan_ok else f"VIX={vix:.1f} >= {VIX_PAUSE_THRESHOLD}"
+                state.is_stale                = False
+
+                # Alert on VIX halt
+                if not scan_ok:
+                    await alert_fn(
+                        f"🚨 <b>VIX HALT: {vix:.1f}</b>\n"
+                        f"Scanning paused (threshold: {VIX_PAUSE_THRESHOLD}).\n"
+                        "All new position entries blocked."
+                    )
+
+                # Alert on recovery
+                if was_unavailable and vix is not None:
+                    vix_unavailable_alerted = False
+                    await alert_fn(
+                        f"✅ <b>VIX data restored</b>: {vix:.1f} from {source}\n"
+                        f"Regime: {regime}. Scanning resumed."
+                    )
+
+                # Persist to DB
+                try:
+                    import sqlite3
+                    with sqlite3.connect(db_path) as conn:
+                        conn.execute(
+                            "INSERT INTO market_state_log "
+                            "(vix, regime, scanning_allowed, source) VALUES (?,?,?,?)",
+                            (vix, regime, int(scan_ok), source)
+                        )
+                except Exception as db_err:
+                    logger.warning("MarketState DB log failed: %s", db_err)
+
+                logger.info(
+                    "MarketState updated: VIX=%.1f regime=%s scan=%s source=%s",
+                    vix, regime, scan_ok, source
+                )
+
+        except Exception as e:
+            logger.error("MarketState poller error: %s", e)
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+# ── Suspension (C5 fix — no SystemExit) ──────────────────────────────────────
+
+async def suspend_until_resume(
+    state: MarketState,
+    reason: str,
+    alert_fn,
+    resume_check_fn,    # callable() -> bool — checks if Ahmed sent /resume
+    retry_fn=None,      # optional callable() -> bool — retries the failing condition
+) -> None:
+    """
+    Suspends scanning with wait-and-retry. No SystemExit. No restart loop.
+    Alerts Ahmed once. Retries the failing condition every 10 minutes.
+    Auto-resumes if retry_fn passes or if Ahmed sends /resume.
+    """
+    state.suspended       = True
+    state.suspend_reason  = reason
+    state.suspended_at    = datetime.now(timezone.utc)
+
+    await alert_fn(
+        f"⏸️ <b>OMNI SUSPENDED</b>\n"
+        f"Reason: {reason}\n"
+        f"Auto-retry every 10 minutes.\n"
+        f"Or send /resume to force restart."
+    )
+    logger.critical("OMNI suspended: %s", reason)
+
+    retry_interval = 600  # 10 minutes
+    attempt = 0
+
+    while state.suspended:
+        await asyncio.sleep(60)
+        attempt += 1
+
+        # Check manual /resume from Ahmed
+        if await resume_check_fn():
+            logger.info("Resume received from Ahmed — clearing suspension")
+            state.suspended      = False
+            state.suspend_reason = None
+            await alert_fn("▶️ <b>OMNI resumed</b> (manual /resume received)")
+            return
+
+        # Retry the failing condition periodically
+        if retry_fn and attempt % (retry_interval // 60) == 0:
+            try:
+                ok = await retry_fn()
+                if ok:
+                    state.suspended      = False
+                    state.suspend_reason = None
+                    await alert_fn(f"▶️ <b>OMNI auto-resumed</b> — condition resolved: {reason}")
+                    logger.info("OMNI auto-resumed after condition resolved")
+                    return
+                else:
+                    logger.info("Suspension retry failed — still suspended: %s", reason)
+            except Exception as e:
+                logger.warning("Suspension retry error: %s", e)

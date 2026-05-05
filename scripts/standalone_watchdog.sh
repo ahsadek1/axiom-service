@@ -126,8 +126,14 @@ run_watchdog() {
   fi
 
   # 4. Alpaca reachability
-  ALPACA_KEY="${ALPACA_API_KEY:-}"
-  ALPACA_SEC="${ALPACA_SECRET_KEY:-}"
+  # Load from alpha-execution .env if env vars not set (LaunchAgent doesn't inherit shell env)
+  if [[ -z "${ALPACA_API_KEY:-}" ]] && [[ -f "/Users/ahmedsadek/nexus/alpha-execution/.env" ]]; then
+    ALPACA_KEY=$(grep '^ALPACA_API_KEY=' /Users/ahmedsadek/nexus/alpha-execution/.env | cut -d= -f2 | tr -d '[:space:]')
+    ALPACA_SEC=$(grep '^ALPACA_SECRET_KEY=' /Users/ahmedsadek/nexus/alpha-execution/.env | cut -d= -f2 | tr -d '[:space:]')
+  else
+    ALPACA_KEY="${ALPACA_API_KEY:-}"
+    ALPACA_SEC="${ALPACA_SECRET_KEY:-}"
+  fi
   if ! curl -sf --max-time 5 \
     -H "APCA-API-KEY-ID: $ALPACA_KEY" \
     -H "APCA-API-SECRET-KEY: $ALPACA_SEC" \

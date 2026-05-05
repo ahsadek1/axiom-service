@@ -55,12 +55,23 @@ def get_db(db_path: str):
 
 
 def get_et_date() -> str:
-    """Current date in ET. C6 fix: never use date.today() on a UTC server."""
+    """Current date in ET. C6 fix: never use date.today() on a UTC server.
+    BUG-FIX (Axiom 3.8 / Sage B1): fallback now uses pytz instead of date.today()
+    so UTC servers never return the wrong date during the 8PM-midnight ET window.
+    """
     try:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     except Exception:
-        return date.today().strftime("%Y-%m-%d")
+        try:
+            import pytz as _pytz
+            return datetime.now(_pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            # Last resort: UTC offset hardcode (-5h winter / -4h summer)
+            import time as _t
+            _utc_offset = -4 if _t.localtime().tm_isdst else -5
+            from datetime import timedelta
+            return (datetime.utcnow() + timedelta(hours=_utc_offset)).strftime("%Y-%m-%d")
 
 
 def make_pick_id(ticker: str, window_id: str) -> str:
@@ -135,7 +146,7 @@ def fetch_axiom_score(ticker: str, axiom_url: str, nexus_secret: str,
         logger.warning("Axiom /assess returned %s for %s", r.status_code, ticker)
         return None
     except Exception as e:
-        logger.warning("Axiom /assess failed for %s: %s", e, ticker)
+        logger.warning("Axiom /assess failed for %s: %s", ticker, e)  # BUG-FIX (Axiom 3.7): args were swapped
         return None
 
 
@@ -168,6 +179,8 @@ def run_scan_cycle(
     market_state: MarketState,
     alert_fn,        # callable(msg) — Telegram alert
     omni_dispatch_fn,  # callable(ticker, context, axiom, score) — sends to OMNI synthesis
+    *,
+    _event_loop=None,  # event loop for run_coroutine_threadsafe — passed by scheduler wrapper
 ) -> ScanResult:
     """
     1C from spec: Pure function. No instance state. No threads. No locks.
@@ -284,29 +297,39 @@ def run_scan_cycle(
             result.log_skip("omni_dispatch_failed")
 
     # Score distribution check (3B) — raises UniformScoreError if data broken
+    # G1 FIX (2026-05-03): run_scan_cycle() executes in a thread pool via
+    # loop.run_in_executor(). asyncio.create_task() requires a *running* event loop
+    # on the current thread — which thread pool threads do not have. Use
+    # run_coroutine_threadsafe(coro, loop) instead, which is safe from any thread.
+    def _fire_alert(msg: str) -> None:
+        if _event_loop is not None and not _event_loop.is_closed():
+            import asyncio as _asyncio
+            _asyncio.run_coroutine_threadsafe(alert_fn(msg), _event_loop)
+        else:
+            # Fallback: log the alert so it's never silently dropped
+            logger.warning("[Scanner] Alert (no loop): %s", msg[:200])
+
     try:
         check_score_distribution(scores_this_cycle, window_id)
     except UniformScoreError as e:
         logger.critical("[Scanner] %s", e)
         result.uniform_score_flag = True
-        import asyncio
-        asyncio.create_task(alert_fn(
+        _fire_alert(
             f"🔴 <b>UNIFORM SCORE ALERT</b>\n"
             f"Window {window_id}: {len(scores_this_cycle)} scores all = "
             f"{scores_this_cycle[0] if scores_this_cycle else '?'}\n"
             f"DATA FAILURE — Oracle likely returning defaults.\n"
             f"Verdicts from this window should be discarded."
-        ))
+        )
 
     # C2 critique: alert if >50% of pool skipped
     if result.is_data_failure():
-        import asyncio
-        asyncio.create_task(alert_fn(
+        _fire_alert(
             f"⚠️ <b>HIGH SKIP RATE</b> — window {window_id}\n"
             f"{result.skip_count}/{result.pool_size} tickers skipped "
             f"({result.skip_rate:.0%})\n"
             f"Likely data failure. Skip reasons: {result.skips}"
-        ))
+        )
 
     # Persist cycle to DB
     try:
@@ -358,11 +381,17 @@ def create_scheduler(
 
     async def _async_scan_wrapper():
         loop = asyncio.get_event_loop()
+        # G1 FIX: pass the running event loop so run_scan_cycle() can fire
+        # coroutine alerts via run_coroutine_threadsafe() from the thread pool.
+        import functools
         await loop.run_in_executor(
             None,
-            run_scan_cycle,
-            db_path, axiom_url, nexus_secret,
-            market_state, alert_fn, omni_dispatch_fn,
+            functools.partial(
+                run_scan_cycle,
+                db_path, axiom_url, nexus_secret,
+                market_state, alert_fn, omni_dispatch_fn,
+                _event_loop=loop,
+            ),
         )
 
     scheduler.add_job(

@@ -19,6 +19,61 @@ logger = logging.getLogger("omni.execution_router")
 ROUTE_TIMEOUT_SECONDS = 10
 
 
+def route_execution(payload: dict) -> tuple[bool, Optional[str]]:
+    """
+    DLQ-compatible wrapper: routes a pre-built execution payload to the
+    correct execution engine using environment-configured URLs and secrets.
+
+    The payload must contain 'system' ('alpha' or 'prime') and the full
+    execution fields stored by execution_dlq.
+
+    Returns:
+        Tuple of (success: bool, response_summary: str or None).
+    """
+    import os
+    system       = payload.get("system", "alpha")
+    exec_url     = (
+        os.environ.get("ALPHA_EXECUTION_URL", "http://localhost:8005")
+        if system == "alpha"
+        else os.environ.get("PRIME_EXECUTION_URL", "http://localhost:8006")
+    )
+    nexus_secret = os.environ.get("NEXUS_SECRET", "")
+    prime_secret = os.environ.get("NEXUS_PRIME_SECRET", nexus_secret)
+    auth_header  = "X-Nexus-Secret" if system == "alpha" else "X-Nexus-Prime-Secret"
+    auth_value   = nexus_secret if system == "alpha" else prime_secret
+
+    try:
+        resp = requests.post(
+            f"{exec_url}/execute",
+            json    = payload,
+            headers = {auth_header: auth_value, "Content-Type": "application/json"},
+            timeout = ROUTE_TIMEOUT_SECONDS,
+        )
+        if resp.status_code in (200, 201, 202):
+            logger.info(
+                "DLQ route_execution: %s/%s routed to %s | HTTP %d",
+                payload.get("ticker"), payload.get("direction"),
+                system.upper(), resp.status_code,
+            )
+            try:
+                return True, resp.json().get("status", f"HTTP {resp.status_code}")
+            except Exception:
+                return True, f"HTTP {resp.status_code}"
+        logger.warning(
+            "DLQ route_execution: engine returned %d for %s/%s (%s)",
+            resp.status_code, payload.get("ticker"), payload.get("direction"), system,
+        )
+        return False, f"HTTP {resp.status_code}"
+    except requests.exceptions.Timeout:
+        logger.warning("DLQ route_execution: timeout for %s/%s (%s)",
+                       payload.get("ticker"), payload.get("direction"), system)
+        return False, "timeout"
+    except Exception as exc:
+        logger.error("DLQ route_execution: error for %s/%s (%s): %s",
+                     payload.get("ticker"), payload.get("direction"), system, exc)
+        return False, str(exc)
+
+
 def route_to_execution(
     system:           str,
     alpha_exec_url:   str,

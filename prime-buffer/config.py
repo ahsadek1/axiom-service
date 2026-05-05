@@ -19,7 +19,13 @@ VALID_AGENTS = frozenset(AGENT_WEIGHTS.keys())
 
 MIN_SUBMISSION_SCORE = 63.0    # higher bar than Alpha (58) — swing needs more conviction
 GO_THRESHOLD_P1      = 70.0    # higher bar than Alpha (65)
-MIN_SCORE_P2         = 78.0    # same as Alpha
+# G5 NOTE (2026-05-03 — confirmed intentional by GENESIS review):
+# MIN_SCORE_P2 (78) > GO_THRESHOLD_P1 (70) is by design, NOT a bug.
+# P1 requires ALL 3 agents ≥ 70. P2 only needs 2 agents, so each individual
+# agent must clear a HIGHER bar (78) to compensate for the missing third voice.
+# Lowering MIN_SCORE_P2 below GO_THRESHOLD_P1 would make P2 EASIER to trigger
+# than P1 on a per-agent basis, which would invert the conviction hierarchy.
+MIN_SCORE_P2         = 78.0    # individual per-agent bar for 2-agent P2 concordance
 MIN_SCORE_SOLO_P3    = 90.0    # same as Alpha
 STRONG_GO_THRESHOLD  = 80.0    # same as Alpha
 
@@ -102,3 +108,26 @@ def load_settings() -> Settings:
         solo_entries_enabled = os.getenv("SOLO_ENTRIES_ENABLED", "false").lower() == "true",
         port                 = int(os.getenv("PORT", "8003")),
     )
+
+
+def assert_thresholds() -> None:
+    """
+    BUG-FIX (Sage B3): assert_thresholds() was missing from prime-buffer/config.py.
+    Alpha buffer had it; prime buffer did not — miscalibrated thresholds would
+    silently pass startup and corrupt concordance decisions.
+    Validates threshold ordering at import time. Crashes fast on misconfiguration.
+    """
+    assert 0 < MIN_SUBMISSION_SCORE < 100, f"MIN_SUBMISSION_SCORE out of range: {MIN_SUBMISSION_SCORE}"
+    assert 0 < GO_THRESHOLD_P1 < 100, f"GO_THRESHOLD_P1 out of range: {GO_THRESHOLD_P1}"
+    assert MIN_SCORE_P2 >= GO_THRESHOLD_P1, (
+        f"MIN_SCORE_P2 ({MIN_SCORE_P2}) should be >= GO_THRESHOLD_P1 ({GO_THRESHOLD_P1})"
+    )
+    assert MIN_SCORE_SOLO_P3 > MIN_SCORE_P2, (
+        f"MIN_SCORE_SOLO_P3 ({MIN_SCORE_SOLO_P3}) should be > MIN_SCORE_P2 ({MIN_SCORE_P2})"
+    )
+    assert STRONG_GO_THRESHOLD >= GO_THRESHOLD_P1, (
+        f"STRONG_GO_THRESHOLD ({STRONG_GO_THRESHOLD}) should be >= GO_THRESHOLD_P1 ({GO_THRESHOLD_P1})"
+    )
+
+
+assert_thresholds()  # Run at import time — crashes process before any concordance logic loads

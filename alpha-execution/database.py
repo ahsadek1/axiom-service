@@ -461,10 +461,15 @@ def update_trailing_stop(
 
 def reduce_contracts(db_path: str, position_id: int, qty_closed: int) -> int:
     """
-    Reduce the contract count after a partial close.
+    Reduce the contract count AND position_size_usd proportionally after a partial close.
 
-    Fix for adversarial finding #3: contracts field was never decremented after
-    partial close, causing exit monitor to over-close on subsequent ticks.
+    BUG-FIX (Axiom 3.10 / 3.11): Previously only contracts was decremented.
+    position_size_usd stayed at original notional, causing all subsequent P&L
+    calculations (_get_current_pnl divides net_pnl by size_usd) to return
+    ~50% of actual P&L after a 50% partial close. Trailing stop and full-close
+    thresholds fired at wrong levels.
+
+    Fix: reduce position_size_usd proportionally to the fraction of contracts closed.
 
     Args:
         db_path:     Database path.
@@ -475,14 +480,38 @@ def reduce_contracts(db_path: str, position_id: int, qty_closed: int) -> int:
         Remaining contract count after reduction (minimum 0).
     """
     with get_conn(db_path) as conn:
-        conn.execute(
-            """
-            UPDATE positions
-            SET contracts = MAX(0, contracts - ?)
-            WHERE id=?
-            """,
-            (qty_closed, position_id),
-        )
+        # Fetch current state before update
+        cur = conn.execute(
+            "SELECT contracts, position_size_usd FROM positions WHERE id=?",
+            (position_id,)
+        ).fetchone()
+        if cur and cur["contracts"] and cur["contracts"] > 0:
+            original_contracts = cur["contracts"]
+            original_size_usd  = cur["position_size_usd"] or 0.0
+            remaining          = max(0, original_contracts - qty_closed)
+            # Proportional size reduction: remaining / original * original_size
+            fraction_remaining = remaining / original_contracts if original_contracts else 0.0
+            new_size_usd       = round(original_size_usd * fraction_remaining, 2)
+            conn.execute(
+                """
+                UPDATE positions
+                SET contracts = ?,
+                    position_size_usd = ?
+                WHERE id=?
+                """,
+                (remaining, new_size_usd, position_id),
+            )
+            logger.debug(
+                "reduce_contracts: pos=%d closed=%d remaining=%d "
+                "size_usd %.2f → %.2f",
+                position_id, qty_closed, remaining, original_size_usd, new_size_usd,
+            )
+        else:
+            # Fallback: just decrement contracts if no size data
+            conn.execute(
+                "UPDATE positions SET contracts = MAX(0, contracts - ?) WHERE id=?",
+                (qty_closed, position_id),
+            )
         row = conn.execute(
             "SELECT contracts FROM positions WHERE id=?", (position_id,)
         ).fetchone()

@@ -13,9 +13,10 @@ Exit rules (approved Apr 10, 2026):
 """
 
 import logging
+import threading
 
 from ails_reporter import post_outcome as _post_ails_outcome
-from typing import Optional
+from typing import Callable, Optional
 
 from config import (
     EXIT_HARD_BACKSTOP_PCT,
@@ -41,16 +42,20 @@ def evaluate_exits(
     buffer_reporter,
     bot_token: str,
     chat_id:   str,
+    ticker_lock_getter: Optional[Callable[[str], threading.Lock]] = None,
 ) -> list[dict]:
     """
     Evaluate all open Prime positions against exit rules.
 
     Args:
-        db_path:         Prime Execution database path.
-        alpaca_client:   AlpacaClient instance.
-        buffer_reporter: BufferReporter for outcome reporting.
-        bot_token:       Telegram bot token.
-        chat_id:         Ahmed's chat ID.
+        db_path:             Prime Execution database path.
+        alpaca_client:       AlpacaClient instance.
+        buffer_reporter:     BufferReporter for outcome reporting.
+        bot_token:           Telegram bot token.
+        chat_id:             Ahmed's chat ID.
+        ticker_lock_getter:  Optional callable(ticker) -> Lock for per-ticker
+                             execute/exit race prevention (P1 fix). When None,
+                             evaluation proceeds without per-ticker locking.
 
     Returns:
         List of exit events that occurred this evaluation.
@@ -62,7 +67,10 @@ def evaluate_exits(
     exits: list[dict] = []
     for pos in positions:
         try:
-            event = _evaluate_position(pos, db_path, alpaca_client, buffer_reporter, bot_token, chat_id)
+            event = _evaluate_position(
+                pos, db_path, alpaca_client, buffer_reporter,
+                bot_token, chat_id, ticker_lock_getter,
+            )
             if event:
                 exits.append(event)
         except Exception as e:
@@ -72,17 +80,53 @@ def evaluate_exits(
 
 
 def _evaluate_position(
-    pos: dict, db_path: str,
-    alpaca_client, buffer_reporter,
-    bot_token: str, chat_id: str,
+    pos: dict,
+    db_path: str,
+    alpaca_client,
+    buffer_reporter,
+    bot_token: str,
+    chat_id: str,
+    ticker_lock_getter: Optional[Callable[[str], threading.Lock]] = None,
 ) -> Optional[dict]:
-    """Evaluate a single Prime position's exit conditions."""
+    """Evaluate a single Prime position's exit conditions.
+
+    Acquires per-ticker lock (if ticker_lock_getter provided) before any
+    Alpaca read/write — prevents execute/exit race on the same ticker.
+    """
     pos_id    = pos["id"]
     ticker    = pos["ticker"]
     partial   = bool(pos["partial_closed"])
     trail_pct = pos["trailing_stop_pct"]
     trail_high = pos["trailing_stop_high"]
 
+    # Acquire per-ticker lock when available — prevents execute/exit race (P1 fix)
+    lock: Optional[threading.Lock] = ticker_lock_getter(ticker) if ticker_lock_getter else None
+    if lock is not None:
+        lock.acquire()
+    try:
+        return _evaluate_position_locked(
+            pos, pos_id, ticker, partial, trail_pct, trail_high,
+            db_path, alpaca_client, buffer_reporter, bot_token, chat_id,
+        )
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _evaluate_position_locked(
+    pos: dict,
+    pos_id: int,
+    ticker: str,
+    partial: bool,
+    trail_pct,
+    trail_high,
+    db_path: str,
+    alpaca_client,
+    buffer_reporter,
+    bot_token: str,
+    chat_id: str,
+) -> Optional[dict]:
+    """Inner evaluation — called with per-ticker lock held (or directly if no lock)."""
     current_pnl = _get_current_pnl(pos, alpaca_client)
     if current_pnl is None:
         return None
@@ -120,7 +164,11 @@ def _evaluate_position(
 
     # ── +35% Partial Close ────────────────────────────────────────────────────
     if not partial and current_pnl >= EXIT_PARTIAL_TRIGGER_PCT:
-        _do_partial_close(pos, db_path, alpaca_client)
+        # BUG-FIX (Axiom 3.3/3.4): pass current_pnl as the trailing_stop_high seed.
+        # Previously _do_partial_close read stale pos["trailing_stop_high"] which is
+        # None on first partial — the `or EXIT_PARTIAL_TRIGGER_PCT` fallback was
+        # correct by coincidence but fragile. Now passes live P&L explicitly.
+        _do_partial_close(pos, db_path, alpaca_client, current_high=current_pnl)
         logger.info("PARTIAL CLOSE: position %d (%s) pnl=%.1f%%", pos_id, ticker, current_pnl * 100)
         return {"event": "PARTIAL_CLOSE", "position_id": pos_id, "ticker": ticker, "pnl_pct": current_pnl}
 
@@ -191,7 +239,7 @@ def _do_close(pos, db_path, alpaca_client, buffer_reporter, bot_token, chat_id, 
     return {"event": "FULL_CLOSE", "position_id": pos_id, "ticker": ticker, "reason": reason, "pnl_pct": pnl_pct}
 
 
-def _do_partial_close(pos, db_path, alpaca_client):
+def _do_partial_close(pos, db_path, alpaca_client, current_high: float = 0.0):
     """
     Sell 50% of remaining shares and activate trailing stop.
 
@@ -210,8 +258,13 @@ def _do_partial_close(pos, db_path, alpaca_client):
     remaining        = shares_remaining - close_shares
 
     # Always set trailing stop FIRST — active even if Alpaca call below fails
+    # BUG-FIX (Axiom 3.4): use current_high (live P&L) as trailing stop seed.
+    # pos.get("trailing_stop_high") or EXIT_PARTIAL_TRIGGER_PCT was fragile:
+    # if trailing_stop_high was 0.0 (never went above breakeven), `or` would
+    # incorrectly inflate it to 0.35. Now uses the live value passed by caller.
+    _trail_high_seed = current_high if current_high > 0.0 else EXIT_PARTIAL_TRIGGER_PCT
     update_trailing_stop(db_path, pos_id, EXIT_TRAILING_STOP_PCT,
-                         pos.get("trailing_stop_high") or EXIT_PARTIAL_TRIGGER_PCT,
+                         _trail_high_seed,
                          partial_closed=True, shares_remaining=max(0.0, remaining))
 
     try:

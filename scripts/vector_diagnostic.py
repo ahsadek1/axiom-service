@@ -39,6 +39,27 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 ET = ZoneInfo("America/New_York")
+
+# Auto-load env vars from known .env files when running via OpenClaw cron
+# (LaunchAgent / exec context may not have deploy-secrets sourced)
+_ENV_SOURCES = [
+    "/Users/ahmedsadek/nexus/axiom/.env",
+    "/Users/ahmedsadek/nexus/alpha-buffer/.env",
+    "/Users/ahmedsadek/nexus/omni/.env",
+]
+for _env_path in _ENV_SOURCES:
+    try:
+        with open(_env_path) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _, _v = _line.partition("=")
+                    if _k.strip() and not os.environ.get(_k.strip()):
+                        os.environ[_k.strip()] = _v.strip()
+    except Exception:
+        pass
+
+
 def _require(var: str) -> str:
     """Return env var value or raise at startup — never silently use a stale fallback."""
     val = os.environ.get(var)
@@ -252,6 +273,45 @@ def check_bus_reachable() -> Optional[str]:
     return None
 
 
+def check_chronicle_reachable() -> Optional[str]:
+    """Check if CHRONICLE HTTP service on SOVEREIGN's machine is reachable.
+    CHRONICLE is on 192.168.1.42:8020 — not a local Nexus service, so not
+    covered by check_all_services(). Checked separately and escalated to
+    SOVEREIGN on failure (VECTOR has no restart authority on that machine).
+    """
+    chronicle_url = "http://192.168.1.42:8020"
+    try:
+        r = requests.get(f"{chronicle_url}/health", timeout=5)
+        if r.status_code == 200:
+            return None
+        return f"CHRONICLE_DEGRADED: HTTP {r.status_code}"
+    except Exception as exc:
+        return f"CHRONICLE_DOWN: connection refused or unreachable ({exc})"
+
+
+def check_vector_heartbeat_failures() -> Optional[str]:
+    """Read vector.log and return alert if consecutive heartbeat failures >= 5.
+    Catches CHRONICLE-down storms before they spam the group for hours.
+    """
+    vector_log = "/Users/ahmedsadek/vector/vector.log"
+    try:
+        with open(vector_log, "r") as f:
+            lines = f.readlines()
+        # Find the most recent consecutive count
+        for line in reversed(lines):
+            if "consecutive=" in line:
+                import re
+                m = re.search(r"consecutive=(\d+)", line)
+                if m:
+                    count = int(m.group(1))
+                    if count >= 5:
+                        return f"VECTOR_HEARTBEAT_FAILURES: {count} consecutive failures — CHRONICLE likely down"
+                break
+    except Exception:
+        pass
+    return None
+
+
 def check_bus_inbox() -> List[str]:
     """Check VECTOR's inbox on the message bus for pending directives."""
     try:
@@ -372,9 +432,15 @@ def main() -> None:
     resource_issues = check_system_resources()
     bus_issue = check_bus_reachable()
     bus_directives = check_bus_inbox()
+    chronicle_issue = check_chronicle_reachable()
+    heartbeat_issue = check_vector_heartbeat_failures()
 
     total_issues = len(down_services) + len(criticals) + len(resource_issues)
     if bus_issue:
+        total_issues += 1
+    if chronicle_issue:
+        total_issues += 1
+    if heartbeat_issue:
         total_issues += 1
 
     if total_issues == 0 and not bus_directives:
@@ -399,6 +465,17 @@ def main() -> None:
     if bus_issue:
         log.error("Message bus: %s", bus_issue)
         post_bus("sovereign", f"🚨 VECTOR: {bus_issue}")
+
+    if chronicle_issue:
+        log.error("CHRONICLE: %s", chronicle_issue)
+        post_bus("sovereign", f"🚨 VECTOR DIAGNOSTIC: {chronicle_issue} — SOVEREIGN must restart CHRONICLE on 192.168.1.42. VECTOR has no restart authority on that machine.")
+        log_to_chronicle(chronicle_issue, "Escalated to SOVEREIGN — outside VECTOR jurisdiction", "in_progress")
+
+    if heartbeat_issue:
+        log.warning("Heartbeat monitor: %s", heartbeat_issue)
+        # Only alert if chronicle_issue not already caught (avoid duplicate)
+        if not chronicle_issue:
+            post_bus("sovereign", f"🚨 VECTOR: {heartbeat_issue}")
 
     if bus_directives:
         act_on_bus_directives(bus_directives)

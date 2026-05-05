@@ -59,6 +59,7 @@ def compute_verdict(
     pathway:               str,
     concordance_sizing:    float,
     axiom_result:          Optional[dict],
+    thesis_ctx:            Optional[dict] = None,
 ) -> SynthesisVerdict:
     """
     Compute the final OMNI verdict from brain votes, pathway rules, and Axiom.
@@ -119,6 +120,24 @@ def compute_verdict(
 
     # Final sizing = concordance pathway sizing × Axiom sizing adjustment
     final_sizing = round(concordance_sizing * axiom_sizing, 2)
+
+    # ── THESIS Strategic Gate ─────────────────────────────────────────────────
+    # THESIS macro posture caps sizing. DEFENSIVE (0.0) = no execution.
+    # Applied after Axiom so both hard stops and strategic gates are respected.
+    thesis_sizing_cap = 1.0
+    thesis_posture    = None
+    if thesis_ctx and not thesis_ctx.get("is_fallback", True):
+        thesis_sizing_cap = float(thesis_ctx.get("sizing_multiplier", 1.0))
+        thesis_posture    = thesis_ctx.get("trading_posture", "UNKNOWN")
+        if thesis_sizing_cap < final_sizing:
+            notes.append(
+                f"THESIS {thesis_posture} cap applied: {final_sizing:.2f} → {thesis_sizing_cap:.2f}"
+            )
+            logger.info(
+                "THESIS %s cap: sizing %.2f → %.2f",
+                thesis_posture, final_sizing, thesis_sizing_cap,
+            )
+            final_sizing = thesis_sizing_cap
 
     # ── Insufficient Brain Responses → CONDITIONAL ───────────────────────────
     # CONDITIONAL = no execution, but a named signal (not silent like NO_GO).

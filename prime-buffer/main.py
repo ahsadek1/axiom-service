@@ -57,9 +57,10 @@ ET = pytz.timezone("America/New_York")
 
 import hashlib as _hashlib, os as _os, glob as _glob
 
+# G7 NOTE (2026-05-03): canonical implementation lives in shared/module_hash.py.
 def _compute_module_hash() -> str:
     """Hash all *.py files in this service directory (excluding __pycache__).
-    Returns 8-char hex digest. FLAW 1 fix: full module fingerprint, not just main.py.
+    Returns 8-char hex digest. Canonical: shared/module_hash.compute_module_hash(__file__)
     """
     _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
     _files = sorted(

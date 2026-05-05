@@ -177,7 +177,8 @@ def alert_ahmed(
             json={
                 "chat_id": AHMED_CHAT_ID,
                 "text": text,
-                "parse_mode": "Markdown",
+                # No parse_mode — plain text avoids Markdown parse failures
+                # from special chars like (), [], * in dynamic alert content
             },
             timeout=5,
         )

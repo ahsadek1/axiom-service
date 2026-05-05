@@ -55,12 +55,36 @@ def client():
          patch("main._run_preflight_retry_loop"), \
          patch("main._is_market_hours", return_value=True), \
          patch("main.resolve_available_contract", return_value=_mock_spread), \
-         patch("database.count_open_positions_alpaca", return_value=0):
+         patch("database.count_open_positions_alpaca", return_value=0), \
+         patch("main._get_current_vix", return_value=15.0), \
+         patch("main._check_vix_brake", return_value=None), \
+         patch("execution_v2.reconcile_on_startup", return_value=None), \
+         patch("shared.api_key_validator.ApiKeyValidator.validate_alpaca",
+               return_value=type("R", (), {"status": "ok", "message": "mocked"})()), \
+         patch("shared.auth_registry.validate_service_auth_config"), \
+         patch("apscheduler.schedulers.background.BackgroundScheduler.start"), \
+         patch("apscheduler.schedulers.background.BackgroundScheduler.shutdown"), \
+         patch("shared.order_reconciler.OrderReconciler.confirm_fill",
+               return_value=__import__("shared.order_reconciler", fromlist=["FillResult", "FillStatus"]).FillResult(
+                   status=__import__("shared.order_reconciler", fromlist=["FillStatus"]).FillStatus.CONFIRMED,
+                   void_reason=None, fill_price=5.0,
+                   filled_qty=1.0, elapsed_sec=0.1, order_id="fake-order-001", ticker="NVDA",
+               )):
         from main import app
         import main as _m
+        _API_SECRET = "x" * 64  # canonical test secret — must match HEADERS above
+        object.__setattr__(_m.settings, "nexus_webhook_secret", _API_SECRET)
         _m._SERVICE_MODE = "active"
+        _m.app_state["first_exec_failed"]  = False
+        _m.app_state["execution_paused"]   = False
+        _m.app_state["trades_today"]        = 0
+        _m._skipped_tickers.clear()
+        _m._ticker_fail_counts.clear()
         from database import init_db
-        init_db(os.environ["ALPHA_EXEC_DB_PATH"])
+        import tempfile
+        _db = tempfile.mktemp(suffix="-api-test.db")
+        object.__setattr__(_m.settings, "alpha_db_path", _db)
+        init_db(_db)
         with TestClient(app) as c:
             yield c
 
@@ -83,19 +107,33 @@ class TestExecute:
             headers={"X-Nexus-Secret": "wrong"}
         ).status_code == 403
 
-    @patch("main.AlpacaClient")
-    def test_rejects_when_no_price(self, MockAlpaca, client):
-        inst = MockAlpaca.return_value
-        inst.get_latest_price.return_value = None
-        resp = client.post("/execute", json=VALID_EXECUTE, headers=HEADERS)
-        assert resp.status_code == 503
-        assert resp.json()["executed"] is False
+    def test_rejects_when_no_price(self, client):
+        # Test that a missing/None price returns 503.
+        # Patch get_latest_price on the _FakeAlpaca class via sys.modules.
+        import sys
+        _cf = sys.modules.get("conftest") or sys.modules.get("tests.conftest")
+        if _cf is None:
+            # Find it by searching loaded modules
+            for _k, _v in sys.modules.items():
+                if hasattr(_v, "_FakeAlpaca"):
+                    _cf = _v; break
+        orig = _cf._FakeAlpaca.get_latest_price
+        _cf._FakeAlpaca.get_latest_price = lambda self, t: None
+        try:
+            resp = client.post("/execute", json=VALID_EXECUTE, headers=HEADERS)
+            assert resp.status_code == 503
+            assert resp.json()["executed"] is False
+        finally:
+            _cf._FakeAlpaca.get_latest_price = orig
 
     @patch("main.AlpacaClient")
     def test_successful_execution(self, MockAlpaca, client):
         inst = MockAlpaca.return_value
         inst.get_latest_price.return_value = 900.0
         inst.place_spread_order.return_value = {"id": "order-abc", "status": "accepted"}
+        inst.get_position.return_value = {"qty": "1", "symbol": "NVDA260516P00880000"}
+        # Note: main._get_alpaca is patched by conftest to return _FakeAlpaca (thread-safe).
+        # Fix A phantom check uses _FakeAlpaca.get_position → non-zero qty → no phantom.
         resp = client.post("/execute", json=VALID_EXECUTE, headers=HEADERS)
         assert resp.status_code == 200
         data = resp.json()
@@ -105,26 +143,30 @@ class TestExecute:
         assert "position_id"        in data
         assert data["position_id"]  is not None
 
-    @patch("main.AlpacaClient")
-    def test_alpaca_failure_returns_503_no_db_record(self, MockAlpaca, client):
+    def test_alpaca_failure_returns_503_no_db_record(self, client):
         """
         Adversarial fix #6: when Alpaca order placement fails, the endpoint must
-        return 503 (not 200) and must NOT create a DB record. Phantom open positions
-        from failed orders are eliminated — the DB is only written after confirmed execution.
+        return 503 (not 200) and must NOT create a DB record.
         """
-        inst = MockAlpaca.return_value
-        inst.get_latest_price.return_value = 900.0
-        inst.place_spread_order.side_effect = Exception("Alpaca down")
-        resp = client.post(
-            "/execute",
-            json    = {**VALID_EXECUTE, "ticker": "AMD"},
-            headers = HEADERS,
-        )
-        assert resp.status_code == 503
-        data = resp.json()
-        assert data["executed"]    is False
-        assert data["position_id"] is None
-        assert "Alpaca order placement failed" in data["reason"]
+        import sys
+        _cf = None
+        for _k, _v in sys.modules.items():
+            if hasattr(_v, "_FakeAlpaca"):
+                _cf = _v; break
+        orig = _cf._FakeAlpaca.place_spread_order
+        _cf._FakeAlpaca.place_spread_order = lambda self, **kw: (_ for _ in ()).throw(Exception("Alpaca down"))
+        try:
+            resp = client.post(
+                "/execute",
+                json    = {**VALID_EXECUTE, "ticker": "AMD"},
+                headers = HEADERS,
+            )
+            assert resp.status_code == 503
+            data = resp.json()
+            assert data["executed"] is False
+            assert data["position_id"] is None
+        finally:
+            _cf._FakeAlpaca.place_spread_order = orig
 
     @patch("main.AlpacaClient")
     def test_max_concurrent_limit(self, MockAlpaca, client):

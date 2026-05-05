@@ -296,7 +296,7 @@ class TestLiveAgentPush:
             pool_payload=PRODUCTION_STYLE_PAYLOAD,
             agent_webhooks={"Cipher": CIPHER_URL, "Atlas": ATLAS_URL, "Sage": SAGE_URL},
             db_path="/Users/ahmedsadek/nexus/data/axiom.db",
-            bot_token="7973500599:AAHJuh_c-RN2xv-_WYVl7ev1mwF-IvqislE",
+            bot_token="7973500599:AAGZYc2UtQ0sa9k_CrIUuXuvisikwt1Eq4c",
             chat_id="8573754783",
             window_id="INTEGRATION-TEST",
             nexus_secret=NEXUS_SECRET,

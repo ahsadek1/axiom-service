@@ -15,13 +15,14 @@ logger = logging.getLogger("omni.telegram")
 
 
 def send_synthesis_card(
-    bot_token:      str,
-    chat_id:        str,
-    concordance:    dict,
-    verdict:        "SynthesisVerdict",  # type: ignore
-    brain_results:  dict[str, dict],
-    position_size:  float,
-    execution_ok:   Optional[bool],
+    bot_token:          str,
+    chat_id:            str,
+    concordance:        dict,
+    verdict:            "SynthesisVerdict",  # type: ignore
+    brain_results:      dict[str, dict],
+    position_size:      float,
+    execution_ok:       Optional[bool],
+    psychology_overlay: Optional[dict] = None,
 ) -> bool:
     """
     Send the full synthesis card to Ahmed via Telegram.
@@ -96,6 +97,15 @@ def send_synthesis_card(
 
     brain_block = "\n".join(brain_lines)
 
+    # Psychology overlay line (optional)
+    psych_line = ""
+    if psychology_overlay and isinstance(psychology_overlay, dict):
+        adj = psychology_overlay.get("total_adjustment", 0)
+        summary = psychology_overlay.get("psychology_summary", "")
+        adj_str = f"+{adj}" if adj > 0 else str(adj)
+        if summary or adj != 0:
+            psych_line = f"\n🧠 Psychology: {adj_str} | {summary[:80]}\n"
+
     message = (
         f"{verdict_emoji} <b>OMNI SYNTHESIS — {ticker} {direction}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -113,6 +123,7 @@ def send_synthesis_card(
         f"\n"
         f"💰 Position: ${position_size:,.0f} "
         f"(×{verdict.sizing_mult:.2f} sizing)\n"
+        f"{psych_line}"
         f"{exec_line}"
     )
 

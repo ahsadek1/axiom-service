@@ -78,6 +78,7 @@ class Settings:
     solo_entries_enabled:    bool
     port:                    int
     earnings_blocked_tickers: frozenset  # tickers blocked from concordance (e.g. earnings)
+    axiom_secret:            str  = ""  # X-Axiom-Secret for /universe auth
 
     @property
     def omni_auth_header(self) -> dict[str, str]:
@@ -123,6 +124,7 @@ def load_settings() -> Settings:
         solo_entries_enabled     = os.getenv("SOLO_ENTRIES_ENABLED", "false").lower() == "true",
         port                     = int(os.getenv("PORT", "8002")),
         earnings_blocked_tickers = _blocked,
+        axiom_secret             = os.getenv("AXIOM_SECRET", ""),
     )
 
 

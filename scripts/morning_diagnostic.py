@@ -16,6 +16,7 @@ Usage:
 import os
 import sys
 import json
+import ast
 import subprocess
 import time
 from datetime import datetime
@@ -94,6 +95,92 @@ def check_alpaca() -> tuple[bool, str]:
         return False, str(e)[:80]
 
 
+def check_mock_session_mode() -> tuple[bool, str]:
+    """CRITICAL: Verify MOCK_SESSION_MODE is not active before market hours.
+
+    If MOCK_SESSION_MODE=true is set, pre-market options orders will bypass the
+    market hours gate and fire at 7AM — Alpaca paper cannot fill options pre-market,
+    causing confirmation_timeout VOIDs. This is a hard TIER 1 failure.
+    """
+    mock_val = os.environ.get("MOCK_SESSION_MODE", "").lower()
+    if mock_val == "true":
+        return False, (
+            "MOCK_SESSION_MODE=true — TIER 1 BLOCK. "
+            "Pre-market options orders WILL be submitted and WILL void. "
+            "Unset this before 9:31 AM or today's pipeline will lose every trade."
+        )
+    return True, f"MOCK_SESSION_MODE not set ({'clear' if not mock_val else repr(mock_val)})"
+
+
+def check_exit_monitor_signature() -> tuple[bool, str]:
+    """Verify exit_monitor.py's evaluate_exits() accepts ticker_lock_getter kwarg.
+
+    Uses AST parsing (no import/side-effects) to check the function signature.
+    A deployment mismatch caused the Prime exit monitor to crash every cycle
+    for 47 minutes at open on 2026-05-04. This catches that class of bug early.
+    """
+    exit_monitor_path = "/Users/ahmedsadek/nexus/prime-execution/exit_monitor.py"
+    try:
+        with open(exit_monitor_path) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=exit_monitor_path)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "evaluate_exits":
+                all_args = (
+                    [a.arg for a in node.args.args]
+                    + [a.arg for a in node.args.posonlyargs]
+                    + [a.arg for a in node.args.kwonlyargs]
+                    + ([node.args.vararg.arg] if node.args.vararg else [])
+                    + ([node.args.kwarg.arg] if node.args.kwarg else [])
+                )
+                if "ticker_lock_getter" in all_args:
+                    return True, "evaluate_exits() signature OK (ticker_lock_getter present)"
+                return False, (
+                    "evaluate_exits() missing 'ticker_lock_getter' param — "
+                    "deployment mismatch detected: main.py will crash on every exit cycle"
+                )
+        return False, "evaluate_exits() function not found in exit_monitor.py"
+    except FileNotFoundError:
+        return False, f"exit_monitor.py not found at {exit_monitor_path}"
+    except SyntaxError as e:
+        return False, f"exit_monitor.py has syntax error: {e}"
+    except Exception as e:
+        return False, f"signature check error: {str(e)[:120]}"
+
+
+def check_thesis_posture() -> tuple[bool, str]:
+    """Report THESIS DEFENSIVE sizing posture. Warn (not fail) if sizing=0.
+
+    A sizing_multiplier of 0.0 means THESIS has zeroed all position sizes —
+    no trade will execute regardless of pipeline quality. Flag this at 7AM
+    so Ahmed can assess whether the gate is appropriate before market open.
+    """
+    try:
+        import sqlite3
+        db_path = "/Users/ahmedsadek/nexus/data/chronicle.db"
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT sizing_multiplier, risk_reward_gate, thesis_sentence "
+            "FROM thesis_context ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return True, "No THESIS context in CHRONICLE — will use fallback"
+        mult = float(row["sizing_multiplier"])
+        gate = row["risk_reward_gate"]
+        sentence = (row["thesis_sentence"] or "")[:80]
+        if mult == 0.0:
+            return False, (
+                f"⚠️ sizing_multiplier=0.0 (gate={gate}) — THESIS DEFENSIVE is zeroing all "
+                f"positions. No trade will execute today unless posture updates. "
+                f"Context: {sentence}"
+            )
+        return True, f"sizing_multiplier={mult:.2f} gate={gate} — OK"
+    except Exception as e:
+        return True, f"THESIS check skipped: {str(e)[:80]}"  # non-fatal
+
+
 def run_integration_tests() -> tuple[bool, str]:
     """Run Axiom→agent integration tests."""
     try:
@@ -119,7 +206,23 @@ def main() -> int:
 
     results = {}
 
-    # Core services
+    # --- SAFETY CHECKS (run before anything else) ---
+    mock_ok, mock_detail = check_mock_session_mode()
+    results["MOCK_SESSION_MODE"] = (mock_ok, mock_detail)
+    icon = "✅" if mock_ok else "🚨"
+    print(f"{icon} MOCK_SESSION_MODE: {mock_detail}")
+
+    sig_ok, sig_detail = check_exit_monitor_signature()
+    results["ExitMonitor Signature"] = (sig_ok, sig_detail)
+    icon = "✅" if sig_ok else "🚨"
+    print(f"{icon} ExitMonitor Signature: {sig_detail}")
+
+    thesis_ok, thesis_detail = check_thesis_posture()
+    results["THESIS Posture"] = (thesis_ok, thesis_detail)
+    icon = "✅" if thesis_ok else "⚠️"
+    print(f"{icon} THESIS Posture: {thesis_detail}")
+
+    # --- Core services ---
     services = [
         ("Axiom",           8001, "/health",  {}),
         ("Alpha Buffer",    8002, "/health",  {}),
@@ -155,7 +258,8 @@ def main() -> int:
 
     critical = [f for f in failures if f[0] in (
         "Alpha Execution", "Prime Execution", "OMNI", "Alpaca V2",
-        "Cipher", "Atlas", "Sage", "Integration Tests"
+        "Cipher", "Atlas", "Sage", "Integration Tests",
+        "MOCK_SESSION_MODE", "ExitMonitor Signature",
     )]
     tier1_fail = len(critical) > 0
 

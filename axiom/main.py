@@ -395,6 +395,28 @@ def get_pool(request: Request) -> JSONResponse:
     })
 
 
+@app.get("/universe")
+def get_universe(request: Request) -> JSONResponse:
+    """
+    Return the current Axiom universe as a tickers list.
+
+    Alias for /pool — provides the tickers key expected by Alpha Buffer C-01
+    universe validation check.
+
+    Returns:
+        Dict with tickers list and count.
+    """
+    verify_secret(request)
+
+    with _state_lock:
+        pool = list(app_state.get("pool", []))
+
+    return JSONResponse({
+        "tickers": pool,
+        "count":   len(pool),
+    })
+
+
 @app.get("/regime")
 def get_regime(request: Request) -> JSONResponse:
     """

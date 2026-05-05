@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.nexus.nexus-integrity-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ahmedsadek/nexus/nexus-integrity/.venv/bin/python</string>
+        <string>/Users/ahmedsadek/nexus/nexus-integrity/dead_mans_switch.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>INTEGRITY_URL</key>
+        <string>http://localhost:8011</string>
+        <key>BUS_URL</key>
+        <string>http://192.168.1.141:9999</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ahmedsadek/nexus/nexus-integrity</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/ahmedsadek/nexus/logs/nexus-integrity-watchdog/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ahmedsadek/nexus/logs/nexus-integrity-watchdog/stderr.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

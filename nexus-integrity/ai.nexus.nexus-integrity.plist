@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.nexus.nexus-integrity</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ahmedsadek/nexus/nexus-integrity/.venv/bin/python</string>
+        <string>/Users/ahmedsadek/nexus/nexus-integrity/main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ahmedsadek/nexus/nexus-integrity</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NEXUS_SECRET</key>
+        <string>62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2</string>
+        <key>PROBE_SECRET</key>
+        <string>62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2</string>
+        <key>CHRONICLE_URL</key>
+        <string>http://192.168.1.42:8020</string>
+        <key>REQUIRED_CHRONICLE_SCHEMA</key>
+        <string>2.1</string>
+        <key>TELEGRAM_BOT_TOKEN</key>
+        <string>7973500599:AAGZYc2UtQ0sa9k_CrIUuXuvisikwt1Eq4c</string>
+        <key>TELEGRAM_SOVEREIGN_CHAT_ID</key>
+        <string>-1003579956463</string>
+        <key>TELEGRAM_AHMED_CHAT_ID</key>
+        <string>8573754783</string>
+        <key>TELEGRAM_HEALTH_GROUP_CHAT_ID</key>
+        <string>-5241272802</string>
+        <key>PORT</key>
+        <string>8012</string>
+        <key>LOG_LEVEL</key>
+        <string>INFO</string>
+        <key>DATA_DIR</key>
+        <string>/Users/ahmedsadek/nexus/data</string>
+        <key>TRS_DB_PATH</key>
+        <string>/Users/ahmedsadek/nexus/data/trs.db</string>
+        <key>INTEGRITY_DB_PATH</key>
+        <string>/Users/ahmedsadek/nexus/data/nexus_integrity.db</string>
+        <key>ALPACA_BASE_URL</key>
+        <string>https://paper-api.alpaca.markets</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/ahmedsadek/nexus/logs/nexus-integrity/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/ahmedsadek/nexus/logs/nexus-integrity/stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
