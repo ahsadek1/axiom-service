@@ -247,16 +247,42 @@ def run_scan_cycle(
             if "orats" not in result.degraded_sources:
                 result.degraded_sources.append("orats")
 
+        # FIX-STALE-IVR (2026-05-04): Guard against after-hours stale IVR data.
+        # ORATS returns 0 or None after market close. Passing IVR=0 to Axiom
+        # triggers the IVR < 30 hard block for all credit spreads, generating
+        # a 100% skip rate with 'axiom_hard_stop' — a false alarm, not a real signal.
+        # Skip the ticker with 'stale_ivr' reason instead of letting Axiom block it.
+        _ivr = ctx.vol.iv_rank
+        if _ivr is None or _ivr <= 0:
+            logger.warning(
+                "[Scanner] %s: IVR is %s — likely stale after-hours data. Skipping.",
+                ticker, _ivr,
+            )
+            result.log_skip("stale_ivr")
+            continue
+
         # Fetch Axiom risk assessment
         axiom = fetch_axiom_score(ticker, axiom_url, nexus_secret,
-                                  ivr=ctx.vol.iv_rank)
+                                  ivr=_ivr)
         if axiom is None:
             result.log_skip("axiom_unavailable")
             continue
 
         # Axiom hard stops — skip immediately
+        # FIX-STALE-IVR: If ALL hard stops are IVR-related and market is closed,
+        # this is almost certainly stale data — log as stale_ivr, not axiom_hard_stop.
         if axiom.get("hard_stops"):
             stops = axiom["hard_stops"]
+            _is_ivr_stop = all("IVR" in s or "ivr" in s.lower() for s in stops)
+            _market_closed = not market_state.scanning_allowed
+            if _is_ivr_stop and _market_closed:
+                logger.warning(
+                    "[Scanner] %s: Axiom IVR hard stop during market-closed window — "
+                    "treating as stale data, not a trading signal: %s",
+                    ticker, stops[0][:80],
+                )
+                result.log_skip("stale_ivr_axiom")
+                continue
             logger.info("[Scanner] %s blocked by Axiom: %s", ticker, stops[0][:60])
             result.log_skip("axiom_hard_stop")
             record_pick(db_path, pick_id, ticker, direction, window_id,
