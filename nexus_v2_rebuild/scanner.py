@@ -15,7 +15,8 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, time as dt_time
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -336,12 +337,26 @@ def run_scan_cycle(
         )
 
     # C2 critique: alert if >50% of pool skipped
-    if result.is_data_failure():
+    # FIX-AFTER-HOURS-ALERT (2026-05-05): Scanning runs 24/7 (VIX-gated, not time-gated).
+    # After market close, Axiom correctly blocks all tickers for low IVR — 100% skip rate
+    # is expected behaviour, not a data failure. Only fire the alert during market hours
+    # (9:30 AM – 4:00 PM ET) when a high skip rate is actually actionable.
+    _ET = ZoneInfo("America/New_York")
+    _now_et = datetime.now(_ET).time()
+    _market_open  = dt_time(9, 30)
+    _market_close = dt_time(16, 0)
+    _is_market_hours = _market_open <= _now_et <= _market_close
+    if result.is_data_failure() and _is_market_hours:
         alert_fn(
             f"⚠️ <b>HIGH SKIP RATE</b> — window {window_id}\n"
             f"{result.skip_count}/{result.pool_size} tickers skipped "
             f"({result.skip_rate:.0%})\n"
             f"Likely data failure. Skip reasons: {result.skips}"
+        )
+    elif result.is_data_failure():
+        logger.debug(
+            "[Scanner] High skip rate outside market hours — suppressed alert: %s",
+            result.skips,
         )
 
     # Persist cycle to DB

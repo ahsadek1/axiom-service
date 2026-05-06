@@ -16,7 +16,8 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, time as dt_time
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -269,10 +270,24 @@ def run_scan_cycle(
             continue
 
         # Axiom hard stops — skip immediately
-        # FIX-STALE-IVR: If ALL hard stops are IVR-related and market is closed,
-        # this is almost certainly stale data — log as stale_ivr, not axiom_hard_stop.
         if axiom.get("hard_stops"):
             stops = axiom["hard_stops"]
+
+            # FIX-AXIOM-STANDBY (2026-05-05): AXIOM_STANDBY is Axiom's market-closed
+            # gate (submissions_open=False after 3:30 PM ET). It is NOT a data failure.
+            # Logging it as axiom_hard_stop caused 100% skip rate → false HIGH SKIP RATE
+            # alerts post-market. Skip silently with dedicated reason so is_data_failure()
+            # can exclude it correctly.
+            if "AXIOM_STANDBY" in stops:
+                logger.debug(
+                    "[Scanner] %s: Axiom in standby (market closed) — skipping silently",
+                    ticker,
+                )
+                result.log_skip("axiom_standby")
+                continue
+
+            # FIX-STALE-IVR: If ALL hard stops are IVR-related and market is closed,
+            # this is almost certainly stale data — log as stale_ivr, not axiom_hard_stop.
             _is_ivr_stop = all("IVR" in s or "ivr" in s.lower() for s in stops)
             _market_closed = not market_state.scanning_allowed
             if _is_ivr_stop and _market_closed:
@@ -349,12 +364,26 @@ def run_scan_cycle(
         )
 
     # C2 critique: alert if >50% of pool skipped
-    if result.is_data_failure():
+    # FIX-AFTER-HOURS-ALERT (2026-05-05): Scanning runs 24/7 (VIX-gated, not time-gated).
+    # After market close, Axiom correctly blocks all tickers for low IVR — 100% skip rate
+    # is expected behaviour, not a data failure. Only fire the alert during market hours
+    # (9:30 AM – 4:00 PM ET) when a high skip rate is actually actionable.
+    _ET = ZoneInfo("America/New_York")
+    _now_et = datetime.now(_ET).time()
+    _market_open  = dt_time(9, 30)
+    _market_close = dt_time(16, 0)
+    _is_market_hours = _market_open <= _now_et <= _market_close
+    if result.is_data_failure() and _is_market_hours:
         _fire_alert(
             f"⚠️ <b>HIGH SKIP RATE</b> — window {window_id}\n"
             f"{result.skip_count}/{result.pool_size} tickers skipped "
             f"({result.skip_rate:.0%})\n"
             f"Likely data failure. Skip reasons: {result.skips}"
+        )
+    elif result.is_data_failure():
+        logger.debug(
+            "[Scanner] High skip rate outside market hours — suppressed alert: %s",
+            result.skips,
         )
 
     # Persist cycle to DB
