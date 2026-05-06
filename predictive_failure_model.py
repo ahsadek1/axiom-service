@@ -55,7 +55,7 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(level
 ALPHA_URL       = os.getenv("ALPHA_SERVICE_URL", "https://worker-production-2060.up.railway.app")
 PRIME_URL       = os.getenv("PRIME_SERVICE_URL", "https://nexus-prime-bot-production.up.railway.app")
 AXIOM_URL       = os.getenv("AXIOM_URL", "https://axiom-production-334c.up.railway.app")
-ORATS_KEY       = os.getenv("ORATS_API_KEY", "4476e955-241a-4540-b114-ebbf1a3a3b87")
+ORATS_KEY       = os.getenv("ORATS_API_KEY") or os.getenv("ORATS_TOKEN")
 POLYGON_KEY     = os.getenv("POLYGON_API_KEY", "OaxOzJMu_JZpl7uF64L7FyhowSZtwcvI")
 TG_BOT_TOKEN    = os.getenv("TG_BOT_TOKEN", "")
 TG_AHMED_DM     = "8573754783"

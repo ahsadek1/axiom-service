@@ -76,7 +76,7 @@ def polygon_get_iv_rank(ticker: str, api_key: str) -> Optional[float]:
         IV rank percentile as float 0-100, or None if unavailable.
     """
     try:
-        ORATS_TOKEN = "4476e955-241a-4540-b114-ebbf1a3a3b87"
+        ORATS_TOKEN = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY")
         resp = requests.get(
             "https://api.orats.io/datav2/summaries",
             params={"token": ORATS_TOKEN, "ticker": ticker},

@@ -123,7 +123,7 @@ def _get_earnings_history(ticker: str) -> list:
     # Try ORATS hist/earnings first
     try:
         import requests as _req
-        ORATS_TOKEN = "4476e955-241a-4540-b114-ebbf1a3a3b87"
+        ORATS_TOKEN = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY")
         resp = _req.get(
             "https://api.orats.io/datav2/hist/earnings",
             params={"token": ORATS_TOKEN, "ticker": ticker, "limit": 12},

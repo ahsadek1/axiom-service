@@ -39,7 +39,7 @@ logger = logging.getLogger("omni.degradation")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(levelname)s — %(message)s")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ORATS_API_KEY   = os.getenv("ORATS_API_KEY", "4476e955-241a-4540-b114-ebbf1a3a3b87")
+ORATS_API_KEY   = os.getenv("ORATS_API_KEY") or os.getenv("ORATS_TOKEN")
 POLYGON_KEY     = os.getenv("POLYGON_API_KEY", "OaxOzJMu_JZpl7uF64L7FyhowSZtwcvI")
 TG_BOT_TOKEN    = os.getenv("TG_BOT_TOKEN", "")
 TG_HEALTH_GROUP = os.getenv("TG_HEALTH_GROUP", "-5184172590")

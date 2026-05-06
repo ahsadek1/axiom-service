@@ -23,7 +23,7 @@ VIX_ELEVATED_THRESHOLD  = 25.0
 MAX_MARKET_STATE_AGE    = timedelta(minutes=12)   # 2 missed 5-min cycles = stale
 POLL_INTERVAL_SECONDS   = 300                      # 5 min
 
-ORATS_TOKEN    = "4476e955-241a-4540-b114-ebbf1a3a3b87"
+ORATS_TOKEN    = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY")
 POLYGON_API_KEY = "ZMEnZ_2GURw_UqbufU5npd49ZDeptMhl"
 FRED_API_KEY   = "5749ecf7ebd18e7f77e30ef2357f55b7"
 

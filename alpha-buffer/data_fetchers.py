@@ -34,7 +34,7 @@ from data_contracts import (
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ORATS_TOKEN     = "4476e955-241a-4540-b114-ebbf1a3a3b87"
+ORATS_TOKEN     = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY")
 POLYGON_KEY     = "ZMEnZ_2GURw_UqbufU5npd49ZDeptMhl"
 TIMEOUT         = 10
 

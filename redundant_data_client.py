@@ -43,7 +43,7 @@ logger = logging.getLogger("omni.data_client")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(levelname)s — %(message)s")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ORATS_KEY    = os.getenv("ORATS_API_KEY", "4476e955-241a-4540-b114-ebbf1a3a3b87")
+ORATS_KEY    = os.getenv("ORATS_API_KEY") or os.getenv("ORATS_TOKEN")
 POLYGON_KEY  = os.getenv("POLYGON_API_KEY", "OaxOzJMu_JZpl7uF64L7FyhowSZtwcvI")
 ALPACA_KEY   = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SEC   = os.getenv("ALPACA_SECRET_KEY", "")
