@@ -253,10 +253,24 @@ def run_scan_cycle(
             continue
 
         # Axiom hard stops — skip immediately
-        # FIX-STALE-IVR: If all hard stops are IVR-related and market is closed,
-        # treat as stale data, not a trading signal.
         if axiom.get("hard_stops"):
             stops = axiom["hard_stops"]
+
+            # FIX-AXIOM-STANDBY (2026-05-05): AXIOM_STANDBY is Axiom's market-closed
+            # gate (submissions_open=False after 3:30 PM ET). It is NOT a data failure.
+            # Logging it as axiom_hard_stop caused 100% skip rate → false HIGH SKIP RATE
+            # alerts post-market. Skip silently with dedicated reason so is_data_failure()
+            # can exclude it correctly.
+            if "AXIOM_STANDBY" in stops:
+                logger.debug(
+                    "[Scanner] %s: Axiom in standby (market closed) — skipping silently",
+                    ticker,
+                )
+                result.log_skip("axiom_standby")
+                continue
+
+            # FIX-STALE-IVR: If ALL hard stops are IVR-related and market is closed,
+            # this is almost certainly stale data — log as stale_ivr, not axiom_hard_stop.
             _is_ivr_stop = all("IVR" in s or "ivr" in s.lower() for s in stops)
             _market_closed = not get_scanning_allowed(market_state)
             if _is_ivr_stop and _market_closed:
