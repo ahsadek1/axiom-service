@@ -88,20 +88,41 @@ def classify_regime(vix: float) -> tuple[str, bool, bool, bool]:
 
 # ── VIX Fetchers ─────────────────────────────────────────────────────────────
 
-async def _fetch_vix_polygon() -> Optional[float]:
-    """Fetch VIX from Polygon snapshot (primary)."""
+async def _fetch_vix_yahoo() -> Optional[float]:
+    """Fetch VIX from Yahoo Finance (primary — no API key required)."""
     import aiohttp
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/VIX"
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={"apiKey": POLYGON_API_KEY},
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
                     data = await r.json()
-                    last = (data.get("ticker", {}).get("lastTrade", {}).get("p") or
-                            data.get("ticker", {}).get("day", {}).get("c"))
-                    if last:
-                        return float(last)
+                    price = (data.get("chart", {}).get("result", [{}])[0]
+                             .get("meta", {}).get("regularMarketPrice"))
+                    if price:
+                        return float(price)
+    except Exception as e:
+        logger.warning("Yahoo Finance VIX fetch failed: %s", e)
+    return None
+
+
+async def _fetch_vix_polygon() -> Optional[float]:
+    """Fetch VIX from Polygon (secondary — requires index-entitled plan)."""
+    import aiohttp
+    # NOTE: VIX is I:VIX (index), not a stock. Requires Polygon index data plan.
+    url = "https://api.polygon.io/v3/snapshot"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params={"ticker.any_of": "I:VIX", "apiKey": POLYGON_API_KEY},
+                                   timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    results = data.get("results", [])
+                    if results and not results[0].get("error"):
+                        last = results[0].get("session", {}).get("close") or results[0].get("value")
+                        if last:
+                            return float(last)
     except Exception as e:
         logger.warning("Polygon VIX fetch failed: %s", e)
     return None
@@ -131,21 +152,26 @@ async def _fetch_vix_fred() -> Optional[float]:
 
 async def get_vix_with_fallback() -> tuple[Optional[float], str]:
     """
-    Fetch VIX: Polygon primary, FRED fallback.
+    Fetch VIX: Yahoo Finance primary (no API key), Polygon secondary, FRED tertiary.
     Returns (vix_value, source_string).
-    Returns (None, "unavailable") if both fail — caller must pause scanning.
+    Returns (None, "unavailable") if all three fail — caller must pause scanning.
     NEVER returns a silent default.
     """
+    vix = await _fetch_vix_yahoo()
+    if vix is not None:
+        return vix, "yahoo"
+
+    logger.warning("Yahoo Finance VIX failed — trying Polygon fallback")
     vix = await _fetch_vix_polygon()
     if vix is not None:
-        return vix, "polygon"
+        return vix, "polygon_fallback"
 
     logger.warning("Polygon VIX failed — trying FRED fallback")
     vix = await _fetch_vix_fred()
     if vix is not None:
         return vix, "fred_fallback"
 
-    logger.error("Both Polygon and FRED VIX sources failed")
+    logger.error("All three VIX sources failed (Yahoo, Polygon, FRED)")
     return None, "unavailable"
 
 
