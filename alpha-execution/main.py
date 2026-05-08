@@ -66,6 +66,7 @@ def _get_cached_module_hash() -> str:
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
+from shared.watchdog import Watchdog
 from shared.service_state import ServiceStateWriter as _StateWriter
 from shared.resilience.state import FreshValue as _FreshValue
 from datetime import timedelta as _timedelta
@@ -242,6 +243,7 @@ def _is_ticker_skipped(ticker: str) -> bool:
 _SERVICE_MODE: str = "active"
 _standby_reason: str = ""
 _standby_alerted: bool = False     # rate-limit: alert Ahmed only once on entry
+_greeks_tracker = None             # GreeksTracker instance (Institutional Gap 2)
 
 # GAP-002: Restore durable state from prior session
 _prior_state = _svc_state.restore()
@@ -659,6 +661,8 @@ def _run_preflight_retry_loop() -> None:
             return
 
 
+_nns_watchdog = Watchdog("alpha-execution")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB and start exit monitor scheduler."""
@@ -837,8 +841,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Alpha Execution: %d instruction(s) from SOVEREIGN on startup", len(_instr))
         for _i in _instr:
             _dispatch_sovereign_instruction(_i)
+
+    # ── TCA Tracker schema init (Institutional Gap 3) ────────────────────────
+    try:
+        from tca_tracker import init_tca_schema
+        init_tca_schema(settings.alpha_db_path)
+        logger.info("[TCA] Schema ready")
+    except Exception as _tca_err:
+        logger.warning("[TCA] Schema init failed (non-fatal): %s", _tca_err)
+
+    # ── Greeks Tracker (Institutional Gap 2) ──────────────────────────────────
+    global _greeks_tracker
+    try:
+        from greeks_tracker import GreeksTracker
+        _greeks_tracker = GreeksTracker(db_path=settings.alpha_db_path)
+        _greeks_tracker.start()
+        logger.info("[GREEKS] Portfolio Greeks Tracker started")
+    except Exception as _gt_err:
+        logger.warning("[GREEKS] Tracker failed to start (non-fatal): %s", _gt_err)
+        _greeks_tracker = None
+    _nns_watchdog.start()
+
     yield
     scheduler.shutdown(wait=False)
+    if _greeks_tracker is not None:
+        _greeks_tracker.stop()
     logger.info("Alpha Execution stopped")
 
 
@@ -1406,6 +1433,32 @@ def execute(
             content     = {"executed": False, "reason": f"Cannot fetch price for {body.ticker}"},
         )
 
+    # ── Direction Validation (P0 FIX 2026-05-08: ROP Direction Mismatch) ────────
+    # Assert direction is valid before attempting contract resolution.
+    # This catches the bearish↔bullish inversion bug at the earliest point.
+    if not body.direction or body.direction not in ("bullish", "bearish"):
+        logger.critical(
+            "DIRECTION VALIDATION FAILED for %s: received direction=%r (expected 'bullish'|'bearish')",
+            body.ticker, body.direction
+        )
+        try:
+            from shared.notification_router import notify_critical as _nc
+            _nc(
+                "alpha-execution",
+                "CRITICAL: DIRECTION VALIDATION FAILED",
+                f"Trade execution blocked: {body.ticker} received invalid direction={body.direction!r}\n"
+                f"Expected: 'bullish' or 'bearish'\n"
+                f"Synthesis verdict: {body.verdict}\n"
+                f"Please check OMNI→Alpha-Execution routing logic.",
+                ticker=body.ticker,
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=400,
+            content={"executed": False, "reason": f"Invalid direction: {body.direction}"},
+        )
+
     # ── Resolve Spread Parameters ─────────────────────────────────────────────
     try:
         spread = resolve_available_contract(
@@ -1467,6 +1520,56 @@ def execute(
             content={"executed": False, "reason": f"degenerate sizing: position_size_usd={_position_size_usd} current_price={current_price}"},
         )
     contracts = max(1, int(_position_size_usd / (current_price * 100)))
+
+    # ── Correlation Gate (GENESIS 2026-05-07) ────────────────────────────────────
+    # Check incoming ticker against all open positions. Adjust size or block.
+    try:
+        from correlation_tracker import evaluate_correlation_gate, init_correlation_schema
+        init_correlation_schema(settings.alpha_db_path)
+        _open_tickers = [p["ticker"] for p in get_open_positions(settings.alpha_db_path)]
+        _corr_result = evaluate_correlation_gate(
+            new_ticker            = body.ticker,
+            direction             = body.direction,
+            open_position_tickers = _open_tickers,
+            db_path               = settings.alpha_db_path,
+            polygon_api_key       = settings.polygon_api_key,
+            telegram_bot_token    = settings.telegram_bot_token,
+            telegram_chat_id      = settings.ahmed_chat_id,
+        )
+        if _corr_result.gate_decision == "BLOCK":
+            logger.warning(
+                "CORRELATION GATE BLOCK: %s max_corr=%.3f — order rejected",
+                body.ticker, _corr_result.max_correlation,
+            )
+            _report_exec_event(
+                "execution_rejected", body.ticker, body.direction,
+                reason=f"Correlation BLOCK: max_corr={_corr_result.max_correlation:.3f}",
+                pathway=body.pathway or "",
+                extra={"gate": "correlation", "max_correlation": _corr_result.max_correlation},
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "executed":        False,
+                    "reason":          f"Correlation BLOCK: {body.ticker} has max_corr={_corr_result.max_correlation:.3f} with open positions",
+                    "gate":            "correlation",
+                    "max_correlation": _corr_result.max_correlation,
+                    "existing_tickers": _corr_result.existing_tickers,
+                },
+            )
+        if _corr_result.size_adjustment < 1.0:
+            _old_contracts = contracts
+            contracts = max(1, int(contracts * _corr_result.size_adjustment))
+            _position_size_usd = _position_size_usd * _corr_result.size_adjustment
+            logger.info(
+                "CORRELATION GATE REDUCE: %s max_corr=%.3f → contracts %d→%d size_adj=%.2fx",
+                body.ticker, _corr_result.max_correlation, _old_contracts, contracts,
+                _corr_result.size_adjustment,
+            )
+    except Exception as _corr_exc:
+        logger.warning(
+            "Correlation gate failed (non-fatal, execution continues): %s", _corr_exc
+        )
 
     # ── Atomic limit check + PENDING slot reservation (Cipher Finding 1+2 fix) ─
     # Lock guards check + reservation as a single atomic unit.
@@ -2468,5 +2571,34 @@ def _send_entry_notification(
         )
     except Exception:
         pass
+
+@_protected.get("/tca")
+def tca_endpoint():
+    """
+    Transaction Cost Analysis: recent records + today's summary.
+    Returns last 50 TCA records and daily slippage summary.
+    """
+    try:
+        from tca_tracker import get_recent_records, get_daily_summary
+        return {
+            "summary": get_daily_summary(settings.alpha_db_path),
+            "records": get_recent_records(settings.alpha_db_path, limit=50),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@_protected.get("/greeks")
+def greeks_endpoint():
+    """
+    Portfolio-level Greeks: aggregate delta/gamma/vega/theta across all open positions.
+    Data refreshes every 15 minutes from ORATS. Returns last cached packet between refreshes.
+    stale=True means ORATS was unreachable and last known data is served.
+    """
+    global _greeks_tracker
+    if _greeks_tracker is None:
+        return {"error": "Greeks tracker not initialized", "stale": True}
+    return _greeks_tracker.get()
+
 
 app.include_router(_protected)

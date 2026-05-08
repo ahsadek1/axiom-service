@@ -125,6 +125,21 @@ def route_to_execution(
         "auto_execute":      True,
     }
 
+    # ── P0 FIX 2026-05-08: Direction validation before routing ────────────────────
+    # Log the exact direction being sent to catch bearish↔bullish inversion.
+    _payload_direction = payload.get("direction")
+    if _payload_direction not in ("bullish", "bearish"):
+        logger.critical(
+            "ROUTE_TO_EXECUTION: INVALID DIRECTION in payload for %s. Direction=%r (expected 'bullish'|'bearish')",
+            payload.get("ticker"), _payload_direction
+        )
+    else:
+        logger.debug(
+            "ROUTE_TO_EXECUTION: %s %s | direction=%s | verdict=%s | size=$%.0f",
+            payload.get("ticker"), system.upper(), _payload_direction,
+            payload.get("verdict"), position_size
+        )
+
     try:
         resp = requests.post(
             f"{execution_url}/execute",
