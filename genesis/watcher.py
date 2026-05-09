@@ -39,6 +39,10 @@ POLL_INTERVAL_S = 30    # 30 seconds — fix mandate requires immediate response
 STALL_ALERT_THRESHOLD = 100  # Act at 100 stalled picks — below this is normal low-score accumulation
 _last_stall_fix_attempt: float = 0.0  # Rate limit: don't retry fix more than once per 30min
 _stall_fix_cooldown_s: float = 1800  # 30 minutes between stall fix attempts
+_unknown_issue_cooldown: dict = {}   # code → expiry timestamp (prevent unknown-issue spam)
+_last_omni_silence_alert: float = 0.0  # Cooldown: suppress OMNI_SILENCE re-fires within 30 min
+_OMNI_SILENCE_COOLDOWN_S: float = 1800  # 30 min between OMNI_SILENCE alerts
+_OMNI_SILENCE_THRESHOLD_MIN: int = 45   # Minutes of silence before flagging (was 20 — too aggressive)
 ACTIVE_START_H  = 6     # 06:00 ET
 ACTIVE_END_H    = 24    # 00:00 ET (midnight)
 
@@ -133,7 +137,7 @@ def run_diagnostic() -> list:
 
     # TRS
     try:
-        r = requests.get("http://localhost:8012/trs",
+        r = requests.get("http://localhost:8012/trs",  # GENESIS-FIX-TRS-PORT-001 2026-05-07: was 8011 (wrong)
                          headers={"X-Nexus-Secret": SECRET}, timeout=5)
         d = r.json()
         if d.get("color") not in ("GREEN",):
@@ -152,13 +156,27 @@ def run_diagnostic() -> list:
         issues.append(("ALPHA_EXEC_UNREACHABLE", str(e), {}))
 
     # OMNI (market hours only)
+    # GENESIS-FIX-SILENCE-002 2026-05-07: Threshold raised 20→45min + 30-min cooldown added.
+    # Prior 20-min threshold + no cooldown caused 200+ OMNI_SILENCE fire/resolve cycles per day
+    # on normal low-signal afternoons where OMNI is healthy but not synthesizing (no dispatched
+    # concordances). fix_omni_silence correctly detects starvation and returns True immediately,
+    # but without a cooldown the watcher re-fires the alert every 30 seconds indefinitely.
     if _market_hours():
+        global _last_omni_silence_alert
         try:
             r = requests.get("http://localhost:8004/health", timeout=5)
             d = r.json()
             lag = d.get("last_synthesis_min_ago")
-            if lag and lag > 20:
-                issues.append(("OMNI_SILENCE", f"No synthesis in {lag:.0f}min", d))
+            if lag and lag > _OMNI_SILENCE_THRESHOLD_MIN:
+                if time.time() - _last_omni_silence_alert >= _OMNI_SILENCE_COOLDOWN_S:
+                    _last_omni_silence_alert = time.time()
+                    issues.append(("OMNI_SILENCE", f"No synthesis in {lag:.0f}min", d))
+                else:
+                    # Suppress repeat — log at DEBUG only
+                    logger.debug(
+                        "OMNI_SILENCE suppressed (cooldown): lag=%.0fmin, next alert in %.0fs",
+                        lag, _OMNI_SILENCE_COOLDOWN_S - (time.time() - _last_omni_silence_alert),
+                    )
         except Exception as e:
             issues.append(("OMNI_UNREACHABLE", str(e), {}))
 
@@ -189,30 +207,34 @@ def run_diagnostic() -> list:
     # Below-threshold picks always sit at agent_received — that is correct behavior.
     # A real stall = picks at agent_received that HAVE scored >=58 but buffer never received them.
     # We detect this by checking if buffer entries_today = 0 AND stalls > threshold
-    try:
-        r = requests.get("http://localhost:8010/system-health",
-                         headers={"X-Nexus-Secret": SECRET}, timeout=5)
-        d = r.json()
-        stalls = d.get("score_components", {}).get("stalled_picks_count", 0)
-        if stalls >= STALL_ALERT_THRESHOLD:
-            # Check if buffer has accepted ANY picks today (if yes, pipeline flows, stalls are just low-score)
-            try:
-                rb = requests.get("http://localhost:8002/status",
-                                  headers={"X-Nexus-Secret": SECRET}, timeout=5)
-                cb = rb.json().get("circuit_breaker", {})
-                # If buffer accepted picks today OR stalls are all agent_received (low score), skip
-                # Real stall = buffer accepted 0 AND there are picks that should have cleared
-                # Use cooldown to prevent spam
-                global _last_stall_fix_attempt
-                if time.time() - _last_stall_fix_attempt < _stall_fix_cooldown_s:
-                    pass  # Cooldown active — do not re-alert
-                else:
-                    issues.append(("PIPELINE_STALL_EARLY",
-                                   f"{stalls} picks stalled (threshold={STALL_ALERT_THRESHOLD})", d))
-            except Exception:
-                pass
-    except Exception as e:
-        pass  # Sentinel unreachable — don't add noise, TRS check covers service health
+    # MARKET HOURS GATE: after-hours stalls are normal (market closed, picks accumulate) — skip
+    # Fix: 2026-05-05 — genesis watcher was triggering /trigger-tier2 after hours causing
+    # continuous after-hours analysis cycles (MSFT scoring loop + Alpha rejections til midnight)
+    if _market_hours():
+        try:
+            r = requests.get("http://localhost:8010/system-health",
+                             headers={"X-Nexus-Secret": SECRET}, timeout=5)
+            d = r.json()
+            stalls = d.get("score_components", {}).get("stalled_picks_count", 0)
+            if stalls >= STALL_ALERT_THRESHOLD:
+                # Check if buffer has accepted ANY picks today (if yes, pipeline flows, stalls are just low-score)
+                try:
+                    rb = requests.get("http://localhost:8002/status",
+                                      headers={"X-Nexus-Secret": SECRET}, timeout=5)
+                    cb = rb.json().get("circuit_breaker", {})
+                    # If buffer accepted picks today OR stalls are all agent_received (low score), skip
+                    # Real stall = buffer accepted 0 AND there are picks that should have cleared
+                    # Use cooldown to prevent spam
+                    global _last_stall_fix_attempt
+                    if time.time() - _last_stall_fix_attempt < _stall_fix_cooldown_s:
+                        pass  # Cooldown active — do not re-alert
+                    else:
+                        issues.append(("PIPELINE_STALL_EARLY",
+                                       f"{stalls} picks stalled (threshold={STALL_ALERT_THRESHOLD})", d))
+                except Exception:
+                    pass
+        except Exception as e:
+            pass  # Sentinel unreachable — don't add noise, TRS check covers service health
 
     return issues
 
@@ -256,18 +278,39 @@ def fix_axiom_pool_low() -> bool:
 def fix_omni_silence(context: dict) -> bool:
     """
     OMNI silence: check if it's a real stall or a low-signal market day.
-    Real stall = buffer has concordances but OMNI isn't processing.
-    Low-signal = buffer has 0 concordances (market condition, no fix needed).
+
+    Real stall = buffer has dispatched concordances (omni_dispatched=True) but
+    OMNI isn't processing. Restart warranted.
+
+    Starvation = buffer has submissions but none reached OMNI (below-threshold,
+    deduped, or universe-rejected). Restarting OMNI fixes nothing here — the
+    problem is upstream. Alert only, no restart.
+
+    GENESIS-FIX-SILENCE-001 2026-05-05: Prior logic used len(current_window)
+    which counted any submission including concordance=null entries, causing
+    127 false-positive OMNI restarts on low-signal market days.
     """
     try:
         r = requests.get("http://localhost:8002/status",
                          headers={"X-Nexus-Secret": SECRET}, timeout=5)
         d = r.json()
-        concordances = len(d.get("current_window", {}))
-        if concordances == 0:
-            logger.info("OMNI silence: 0 concordances in buffer — market condition, not a stall")
-            return True  # Not a real failure — low signal day
-        # Real stall — restart OMNI
+        window = d.get("current_window", {})
+        # Count only entries that were actually dispatched to OMNI
+        dispatched = sum(1 for v in window.values() if v.get("omni_dispatched") is True)
+        if dispatched == 0:
+            logger.info(
+                "OMNI silence: 0 dispatched concordances in buffer window "
+                "(%d total entries, none dispatched) — upstream starvation, "
+                "not an OMNI stall. No restart. Market condition or below-threshold scoring.",
+                len(window),
+            )
+            return True  # Not a real OMNI failure — starvation from upstream
+        # Real stall: OMNI has valid input (dispatched concordances) but isn't synthesizing
+        logger.warning(
+            "OMNI silence: %d dispatched concordance(s) in buffer but no synthesis — "
+            "real stall detected. Restarting OMNI.",
+            dispatched,
+        )
         import subprocess
         subprocess.run(["launchctl", "stop", "ai.nexus.omni"], timeout=5)
         time.sleep(3)
@@ -297,13 +340,48 @@ def fix_pipeline_stall_early(context: dict) -> bool:
 
     fixed = False
 
-    # 1. Purge alpha-buffer concordances
+    # 1. Purge alpha-buffer concordances — SELECTIVE PURGE ONLY
+    # FIX: Genesis-Watcher C2-015 (May 9, 2026)
+    # Old: purged ALL concordances → starved OMNI synthesis buffer
+    # New: purge only stalled tickers → preserves healthy concordances
     try:
-        requests.post("http://localhost:8002/concordance/purge",
-                      headers={"X-Nexus-Secret": SECRET}, timeout=10)
-        fixed = True
+        import sqlite3
+        stalled_tickers = []
+        try:
+            conn = sqlite3.connect("/Users/ahmedsadek/nexus/alpha-buffer/buffer.db")
+            cur = conn.cursor()
+            # Get tickers with submissions stuck in agent_received for >30min (genuinely stalled)
+            cur.execute("""
+                SELECT DISTINCT ticker FROM submissions 
+                WHERE status = 'agent_received' 
+                AND created_at < datetime('now', '-30 minutes')
+                LIMIT 10
+            """)
+            stalled_tickers = [row[0] for row in cur.fetchall()]
+            conn.close()
+        except Exception as db_err:
+            logger.warning("Could not query stalled tickers: %s — falling back to all-purge", db_err)
+        
+        if stalled_tickers:
+            # Selective purge: only remove the problematic tickers
+            resp = requests.post("http://localhost:8002/concordance/purge",
+                          json={"tickers": stalled_tickers},
+                          headers={"X-Nexus-Secret": SECRET}, timeout=10)
+            logger.info("Selective concordance purge: tickers=%s status=%d", stalled_tickers, resp.status_code)
+            fixed = True
+        else:
+            # No genuinely stalled tickers found — do NOT purge all
+            logger.info("No stalled tickers (>30min) found — skipping purge to preserve OMNI buffer")
+            # Don't set fixed=True since we didn't actually fix the stall this way
     except Exception as e:
-        logger.warning("Concordance purge failed: %s", e)
+        logger.warning("Concordance purge failed: %s — attempting fallback", e)
+        try:
+            # Fallback: if selective fails, do a conservative full purge
+            requests.post("http://localhost:8002/concordance/purge",
+                          headers={"X-Nexus-Secret": SECRET}, timeout=10)
+            fixed = True
+        except Exception as e2:
+            logger.error("Fallback purge also failed: %s", e2)
 
     # 2. Clear agent-side dedup (Cipher, Atlas, Sage picks table)
     for agent in ["cipher", "atlas", "sage"]:
@@ -344,6 +422,23 @@ def fix_pipeline_stall_early(context: dict) -> bool:
     return fixed
 
 
+def fix_trs_degraded(context: dict) -> bool:
+    """TRS degraded handler — logs the issue and notifies SOVEREIGN; no auto-fix.
+
+    TRS degradation caused by unimplemented probes or transient component dips
+    is not actionable by the watcher. Log it once per cooldown window and
+    let SOVEREIGN + GENESIS handle root-cause investigation.
+
+    Args:
+        context: Issue context dict (unused).
+
+    Returns:
+        False — no auto-fix applied, let caller escalate to SOVEREIGN only.
+    """
+    logger.info("TRS_DEGRADED acknowledged — SOVEREIGN notified, no auto-fix registered")
+    return False
+
+
 FIX_MAP = {
     "ALPHA_EXEC_PAUSED":    fix_alpha_exec_paused,
     "ORACLE_DEGRADED":      fix_oracle_degraded,
@@ -351,6 +446,7 @@ FIX_MAP = {
     "AXIOM_POOL_LOW":       fix_axiom_pool_low,
     "OMNI_SILENCE":         fix_omni_silence,
     "PIPELINE_STALL_EARLY": fix_pipeline_stall_early,
+    "TRS_DEGRADED":         fix_trs_degraded,  # Registered — routes to SOVEREIGN only (no Ahmed spam)
 }
 
 
@@ -363,14 +459,14 @@ def handle_issue(code: str, detail: str, context: dict) -> None:
     if fix_fn:
         logger.info("Applying fix for %s...", code)
         try:
-            resolved = fix_fn(context) if code == "OMNI_SILENCE" else fix_fn()
+            resolved = fix_fn(context) if code in ("OMNI_SILENCE", "PIPELINE_STALL_EARLY") else fix_fn()
         except Exception as e:
             resolved = False
             logger.error("Fix for %s threw: %s", code, e)
 
         time_fixed = _now_et().isoformat()
         outcome = "solved" if resolved else "unsolved"
-        resolution = "root_cause" if resolved else "failed"
+        resolution = "root_cause" if resolved else "unresolved"
 
         if resolved:
             logger.info("RESOLVED [%s] in %s", code, time_fixed)
@@ -394,11 +490,17 @@ def handle_issue(code: str, detail: str, context: dict) -> None:
             damage=f"Detected by genesis-watcher at {time_id}",
         )
     else:
-        # Unknown issue — page Ahmed and SOVEREIGN immediately
+        # Unknown issue — page Ahmed and SOVEREIGN, but ONLY once per 30-min cooldown
+        cooldown_expiry = _unknown_issue_cooldown.get(code, 0.0)
+        if time.time() < cooldown_expiry:
+            logger.info("Unknown issue [%s] in cooldown — suppressing alert", code)
+            return
+        _unknown_issue_cooldown[code] = time.time() + 1800  # 30-min cooldown per code
+
         logger.warning("No auto-fix for %s — paging Ahmed and SOVEREIGN", code)
         _telegram(f"🚨 <b>GENESIS WATCHER — UNKNOWN ISSUE</b>\n"
                   f"Code: <b>{code}</b>\nDetail: {detail[:300]}\n"
-                  f"No auto-fix available. SOVEREIGN notified.")
+                  f"No auto-fix available. SOVEREIGN notified. (Suppressed for 30min)")
         _bus_send("sovereign",
                   f"GENESIS-WATCHER UNKNOWN: {code} — {detail[:200]}\n"
                   f"No auto-fix registered. Needs investigation.")
