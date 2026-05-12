@@ -212,6 +212,7 @@ class FailureClassifier:
             )
         else:
             resolve_failure(self._db_path, "PIPELINE_STALL")
+            self._notifier.send_resolved("PIPELINE_STALL", "pipeline flowing normally")
 
     def _detect_executor_slow(self, traces: List[Dict[str, Any]]) -> None:
         """
@@ -297,10 +298,16 @@ class FailureClassifier:
         Detect sustained high inter-hop latency across consecutive picks.
 
         Fires if P99 inter-hop latency exceeds 2000ms across 3+ consecutive picks.
+        Suppressed outside market hours — after-hours multi-agent submission spread
+        creates artificially high inter-hop gaps that are not real network issues.
 
         Args:
             traces: Recent trace hops.
         """
+        if not _is_market_hours():
+            resolve_failure(self._db_path, "NETWORK_DEGRADED")
+            return
+
         # Build per-trace inter-hop gap sequences
         by_trace: Dict[str, List[float]] = {}
         for row in sorted(traces, key=lambda r: r["ts"]):
@@ -408,6 +415,7 @@ class FailureClassifier:
                     del _agent_silence_since[svc]
                     _agent_hard_reset_fired.discard(svc)
             resolve_failure(self._db_path, "AGENT_SILENT")
+            self._notifier.send_resolved("AGENT_SILENT", "all agents active")
 
     def _detect_completion_rate_low(self, traces: List[Dict[str, Any]]) -> None:
         """
@@ -454,6 +462,7 @@ class FailureClassifier:
             )
         else:
             resolve_failure(self._db_path, "COMPLETION_RATE_LOW")
+            self._notifier.send_resolved("COMPLETION_RATE_LOW", f"completion rate {rate:.0%}")
 
     def _detect_data_stale(self, traces: List[Dict[str, Any]]) -> None:
         """

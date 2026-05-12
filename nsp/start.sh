@@ -16,4 +16,4 @@ mkdir -p "${NSP_LOG_DIR:-/Users/ahmedsadek/nexus/logs/nsp}"
 exec python3 -m uvicorn main:app \
     --host 0.0.0.0 \
     --port "${NSP_PORT:-8010}" \
-    --log-level "${LOG_LEVEL:-info}"
+    --log-level "$(echo ${LOG_LEVEL:-info} | tr '[:upper:]' '[:lower:]')"

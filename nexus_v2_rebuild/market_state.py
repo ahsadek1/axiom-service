@@ -11,6 +11,7 @@ Authored: 2026-05-02 | Cipher spec + OMNI adversarial review
 from __future__ import annotations
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -89,19 +90,20 @@ def classify_regime(vix: float) -> tuple[str, bool, bool, bool]:
 # ── VIX Fetchers ─────────────────────────────────────────────────────────────
 
 async def _fetch_vix_polygon() -> Optional[float]:
-    """Fetch VIX from Polygon snapshot (primary)."""
+    """Fetch VIX from Polygon indices snapshot (I:VIX — requires index add-on)."""
     import aiohttp
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/VIX"
+    url = "https://api.polygon.io/v3/snapshot"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={"apiKey": POLYGON_API_KEY},
+            async with session.get(url, params={"ticker.any_of": "I:VIX", "apiKey": POLYGON_API_KEY},
                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
                     data = await r.json()
-                    last = (data.get("ticker", {}).get("lastTrade", {}).get("p") or
-                            data.get("ticker", {}).get("day", {}).get("c"))
-                    if last:
-                        return float(last)
+                    results = data.get("results", [])
+                    if results and not results[0].get("error"):
+                        last = results[0].get("session", {}).get("close") or results[0].get("value")
+                        if last:
+                            return float(last)
     except Exception as e:
         logger.warning("Polygon VIX fetch failed: %s", e)
     return None

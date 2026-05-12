@@ -38,7 +38,7 @@ VIX_BRAKE_FULL     = 35   # above this: block all new positions
 # ── Position Limits ───────────────────────────────────────────────────────────
 # MUST match axiom/config.py MAX_POSITIONS — single source of truth is axiom.
 # C-2 fix (2026-05-02): was 10, corrected to 3 to match Ahmed's mandate and Axiom gate.
-MAX_CONCURRENT_POSITIONS = 3
+MAX_CONCURRENT_POSITIONS = 5  # Alpha + Prime combined (per MEMORY.md)
 MAX_NEW_PER_DAY          = 5
 
 # ── Strike Calculation ────────────────────────────────────────────────────────

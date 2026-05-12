@@ -7,6 +7,7 @@ No silent failures: every exception is logged before returning None.
 """
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -276,6 +277,65 @@ def days_to_earnings(ticker: str, api_key: str) -> Optional[int]:
     return max(0, diff)
 
 
+# ── Polygon + Yahoo Finance — VIX (real-time) ──────────────────────────────
+
+def get_vix_polygon() -> Optional[float]:
+    """
+    Fetch real-time VIX from Polygon indices snapshot (I:VIX, primary).
+    Requires Polygon index data plan.
+
+    Returns:
+        Current VIX as float, or None on failure.
+    """
+    polygon_key = os.getenv("POLYGON_API_KEY", "")
+    if not polygon_key:
+        return None
+    try:
+        url = "https://api.polygon.io/v3/snapshot/indices"
+        resp = requests.get(
+            url,
+            params={"ticker": "I:VIX", "apiKey": polygon_key},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            results = resp.json().get("results", [])
+            if results:
+                val = results[0].get("session", {}).get("close") or results[0].get("value")
+                if val:
+                    return float(val)
+    except Exception as e:
+        logger.warning("Polygon VIX fetch failed: %s", e)
+    return None
+
+
+def get_vix_yahoo() -> Optional[float]:
+    """
+    Fetch real-time VIX from Yahoo Finance (^VIX). No API key required.
+    Secondary VIX source — fallback when Polygon unavailable.
+
+    Returns:
+        Current VIX as float, or None on failure.
+    """
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX"
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if result:
+            meta = result[0].get("meta", {})
+            price = meta.get("regularMarketPrice") or meta.get("previousClose")
+            if price:
+                return float(price)
+    except Exception as e:
+        logger.warning("Yahoo Finance VIX fetch failed: %s", e)
+    return None
+
+
 # ── FRED — VIX ────────────────────────────────────────────────────────────────
 
 def get_vix(api_key: str) -> Optional[float]:
@@ -321,7 +381,7 @@ def get_vix(api_key: str) -> Optional[float]:
 
 def get_vix_with_fallback(api_key: str, last_known_vix: Optional[float]) -> tuple[float, bool]:
     """
-    Get VIX with safety fallback if FRED is unavailable.
+    Get VIX: Yahoo Finance (real-time primary) → FRED (EOD fallback) → last_known+2 → 20.0.
 
     Args:
         api_key:         FRED API key.
@@ -329,10 +389,28 @@ def get_vix_with_fallback(api_key: str, last_known_vix: Optional[float]) -> tupl
 
     Returns:
         Tuple of (vix_value, is_estimated).
-        is_estimated=True means FRED was unavailable and last_known + 2 was used.
+        is_estimated=True means live data was unavailable.
     """
+    # Primary: Polygon (real-time index data)
+    vix = get_vix_polygon()
+    if vix is not None:
+        logger.debug("VIX %.2f from Polygon (real-time)", vix)
+        return vix, False
+
+    logger.warning("Polygon VIX failed — trying Yahoo fallback")
+
+    # Secondary: Yahoo Finance (real-time, no key)
+    vix = get_vix_yahoo()
+    if vix is not None:
+        logger.debug("VIX %.2f from Yahoo Finance (real-time)", vix)
+        return vix, False
+
+    logger.warning("Yahoo Finance VIX failed — trying FRED fallback")
+
+    # Tertiary: FRED (end-of-day — stale during market hours but better than nothing)
     vix = get_vix(api_key)
     if vix is not None:
+        logger.warning("VIX %.2f from FRED (EOD — may be stale during market hours)", vix)
         return vix, False
 
     if last_known_vix is not None:
@@ -341,5 +419,5 @@ def get_vix_with_fallback(api_key: str, last_known_vix: Optional[float]) -> tupl
         return estimated, True
 
     # No VIX at all — use conservative default
-    logger.error("FRED unavailable and no last known VIX — defaulting to 20.0 (ELEVATED)")
+    logger.error("All VIX sources failed (Yahoo, FRED, last_known) — defaulting to 20.0 (ELEVATED)")
     return 20.0, True

@@ -172,6 +172,8 @@ async def lifespan(app: FastAPI):
     """Initialize settings and database on startup."""
     global _settings
     _settings = load_settings()
+    from shared.db_guard import assert_unique_db_path  # G4: collision guard
+    assert_unique_db_path("cipher", _settings.db_path)
     init_db(_settings.db_path)
     logger.info("Cipher agent started on port %d", _settings.port)
     report("cipher", "status", {"event": "started", "port": _settings.port})

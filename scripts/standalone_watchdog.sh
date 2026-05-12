@@ -43,13 +43,20 @@ send_alert() {
 
   echo "$now" > "$ALERT_COOLDOWN_FILE"
 
-  if [[ -n "$TELEGRAM_BOT" ]]; then
+  # Route through Alert Broker first; fall back to direct Telegram if unreachable
+  local broker_ok=false
+  curl -s -X POST "http://192.168.1.141:9998/alert" \
+    -H "Content-Type: application/json" \
+    -d "{\"source\": \"standalone-watchdog\", \"level\": \"critical\", \"message\": \"${msg}\", \"key\": \"standalone-watchdog-alert\"}" \
+    --max-time 5 > /dev/null 2>&1 && broker_ok=true
+
+  if [[ "$broker_ok" == false && -n "$TELEGRAM_BOT" ]]; then
     curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT}/sendMessage" \
       -H "Content-Type: application/json" \
       -d "{\"chat_id\": \"${TELEGRAM_CHAT}\", \"text\": \"${msg}\"}" \
       --max-time 8 > /dev/null 2>&1 || true
   fi
-  echo "[watchdog] ALERT SENT: $msg" >> "$LOG"
+  echo "[watchdog] ALERT SENT (broker=$broker_ok): $msg" >> "$LOG"
 }
 
 # Load NEXUS_SECRET from .deploy-secrets (single source of truth)

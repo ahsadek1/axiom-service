@@ -40,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(level
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ORATS_API_KEY   = os.getenv("ORATS_API_KEY") or os.getenv("ORATS_TOKEN")
-POLYGON_KEY     = os.getenv("POLYGON_API_KEY", "OaxOzJMu_JZpl7uF64L7FyhowSZtwcvI")
+POLYGON_KEY     = os.getenv("POLYGON_API_KEY", "ZMEnZ_2GURw_UqbufU5npd49ZDeptMhl")
 TG_BOT_TOKEN    = os.getenv("TG_BOT_TOKEN", "")
 TG_HEALTH_GROUP = os.getenv("TG_HEALTH_GROUP", "-5184172590")
 TG_AHMED_DM     = "8573754783"

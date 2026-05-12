@@ -11,15 +11,16 @@ from dataclasses import dataclass, field
 
 # ── Voting Thresholds ─────────────────────────────────────────────────────────
 # Fully autonomous — no CONDITIONAL verdict. System executes or it doesn't.
-VOTES_REQUIRED_STRONG_GO  = 4   # 4/4 brains GO → STRONG_GO (full size)
-VOTES_REQUIRED_GO         = 3   # 3/4 brains GO → GO (pathway size)
+# Ahmed directive 2026-05-07: 2/4 GO → GO (pathway size), 3+/4 GO → STRONG_GO (full size)
+VOTES_REQUIRED_STRONG_GO  = 3   # 3+ brains GO → STRONG_GO (full size)
+VOTES_REQUIRED_GO         = 2   # 2/4 brains GO → GO (pathway size)
 # 2/4 or fewer GO → NO_GO. No human escalation. No delay.
 BRAIN_TIMEOUT_SECONDS     = 120  # per-brain API timeout — increased to 120s; Gemini 2.5 Flash (no thinking) + Claude can still spike under load
 BRAIN_RETRY_COUNT         = 1    # retry once on timeout/connection-reset before marking as error
-MIN_BRAINS_REQUIRED       = 3   # if fewer respond → CONDITIONAL (system degraded, Ahmed alerted)  # Cipher Finding 12
+MIN_BRAINS_REQUIRED       = 2   # if fewer respond → NO_GO (system degraded, Ahmed alerted)  # Cipher Finding 12
 
 # P3/P4 require minimum 3/4 brains GO to execute (higher bar for solo/OMNI-initiated)
-P3_P4_MIN_VOTES_GO        = 3
+P3_P4_MIN_VOTES_GO        = 2
 
 # ── Brain Names ───────────────────────────────────────────────────────────────
 BRAIN_CLAUDE    = "claude"

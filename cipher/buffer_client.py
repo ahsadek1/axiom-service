@@ -20,6 +20,50 @@ from typing import Optional
 
 logger = logging.getLogger("cipher.buffer")
 
+# ── Axiom universe preflight cache ────────────────────────────────────────────
+# GENESIS-UNIVERSE-FILTER-001 2026-05-05: Pre-submission universe check.
+# Agents were submitting tickers (e.g. GOOG, GOOGL) not in the Axiom universe,
+# wasting buffer HTTP cycles and generating C-01 rejection noise.
+# Fail-open: if Axiom unreachable, proceed (buffer's C-01 is the authoritative backstop).
+_universe_cache: list = []
+_universe_cache_ts: float = 0.0
+_UNIVERSE_CACHE_TTL: float = 300.0  # 5 minutes
+_universe_lock = threading.Lock()
+
+
+def _get_axiom_universe() -> list:
+    """Fetch and cache Axiom universe tickers. Returns [] on any error (fail-open)."""
+    global _universe_cache, _universe_cache_ts
+    with _universe_lock:
+        if time.time() - _universe_cache_ts < _UNIVERSE_CACHE_TTL and _universe_cache:
+            return _universe_cache
+    try:
+        axiom_url = os.getenv("AXIOM_URL", "http://localhost:8001")
+        axiom_secret = os.getenv("AXIOM_SECRET", "")
+        r = requests.get(
+            f"{axiom_url}/universe",
+            headers={"X-Axiom-Secret": axiom_secret},
+            timeout=3,
+        )
+        if r.status_code == 200:
+            tickers = r.json().get("tickers", [])
+            if tickers:
+                with _universe_lock:
+                    _universe_cache = tickers
+                    _universe_cache_ts = time.time()
+                return tickers
+    except Exception:
+        pass
+    return []  # fail-open: empty list = skip check
+
+
+def _ticker_in_universe(ticker: str) -> bool:
+    """True if ticker is in Axiom universe, or universe is unavailable (fail-open)."""
+    universe = _get_axiom_universe()
+    if not universe:
+        return True  # fail-open: can't confirm exclusion
+    return ticker in universe
+
 # Railway direct submission (bypass local buffer for concordance participation)
 RAILWAY_WEBHOOK_URL = os.getenv("RAILWAY_WEBHOOK_URL")  # None if not set — no hardcoded fallback
 RAILWAY_SECRET = os.getenv(
@@ -109,6 +153,9 @@ def submit_to_alpha(
     Returns:
         True if submitted successfully, False otherwise.
     """
+    if not _ticker_in_universe(ticker):
+        logger.debug("Alpha skip %s/%s: ticker not in Axiom universe (pre-filter)", ticker, direction)
+        return False
     if score < ALPHA_MIN_SCORE:
         logger.debug("Alpha skip %s/%s: score %.1f < %.1f", ticker, direction, score, ALPHA_MIN_SCORE)
         return False

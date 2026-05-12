@@ -17,6 +17,61 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 TIMEOUT = (5, 20)
+YAHOO_VIX_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX"
+POLYGON_VIX_URL = "https://api.polygon.io/v3/snapshot/indices"
+
+
+def _fetch_vix_polygon() -> Optional[float]:
+    """
+    Fetch real-time VIX from Polygon indices snapshot (I:VIX, primary).
+
+    Returns:
+        Current VIX as float, or None on failure.
+    """
+    try:
+        resp = requests.get(
+            POLYGON_VIX_URL,
+            params={"ticker": "I:VIX", "apiKey": config.POLYGON_API_KEY},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            results = resp.json().get("results", [])
+            if results:
+                val = results[0].get("session", {}).get("close") or results[0].get("value")
+                if val:
+                    logger.debug("Polygon VIX: %.2f", float(val))
+                    return float(val)
+    except Exception as e:
+        logger.warning("Polygon VIX fetch failed: %s", e)
+    return None
+
+
+def _fetch_vix_yahoo() -> Optional[float]:
+    """
+    Fetch real-time VIX from Yahoo Finance (^VIX, secondary fallback).
+    No API key required.
+
+    Returns:
+        Current VIX as float, or None on failure.
+    """
+    try:
+        resp = requests.get(
+            YAHOO_VIX_URL,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if result:
+            meta = result[0].get("meta", {})
+            price = meta.get("regularMarketPrice") or meta.get("previousClose")
+            if price:
+                logger.debug("Yahoo Finance VIX: %.2f", float(price))
+                return float(price)
+    except Exception as e:
+        logger.warning("Yahoo Finance VIX fetch failed: %s", e)
+    return None
 
 
 def _fetch_series(series_id: str) -> Optional[float]:
@@ -75,7 +130,14 @@ def get_macro_data() -> Dict[str, Any]:
     """
     start = time.monotonic()
 
-    vix = _fetch_series(config.FRED_SERIES["VIX"])
+    # VIX: Polygon primary (real-time index), Yahoo secondary, FRED tertiary (EOD)
+    vix = _fetch_vix_polygon()
+    if vix is None:
+        logger.warning("Polygon VIX unavailable — trying Yahoo fallback")
+        vix = _fetch_vix_yahoo()
+    if vix is None:
+        logger.warning("Yahoo VIX unavailable — trying FRED VIXCLS (EOD)")
+        vix = _fetch_series(config.FRED_SERIES["VIX"])
     ffr = _fetch_series(config.FRED_SERIES["FFR"])
     y10 = _fetch_series(config.FRED_SERIES["YIELD_10Y"])
     y2 = _fetch_series(config.FRED_SERIES["YIELD_2Y"])

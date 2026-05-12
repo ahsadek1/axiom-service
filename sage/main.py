@@ -164,6 +164,8 @@ def _sovereign_comms_loop_sage() -> None:
 async def lifespan(app: FastAPI):
     global _settings
     _settings = load_settings()
+    from shared.db_guard import assert_unique_db_path  # G4: collision guard
+    assert_unique_db_path("sage", _settings.db_path)
     init_db(_settings.db_path)
     # Start midnight reset thread
     reset_thread = threading.Thread(target=_midnight_reset, daemon=True, name="sage-midnight-reset")

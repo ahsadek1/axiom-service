@@ -289,9 +289,33 @@ def _verify_stage4_synthesis_readiness() -> FlowStageResult:
     QUIET is NOT an alert condition. SILENT triggers investigation.
     This prevents false P1 alerts on low-signal market days.
 
+    GENESIS-FIX: Skip this check outside market hours (09:30–16:00 ET weekdays).
+    Off-hours silence is EXPECTED behavior, not a failure.
+
     Returns:
         FlowStageResult for stage 4.
     """
+    # Check market hours FIRST — outside trading hours, silence is expected
+    try:
+        et_offset = datetime.timedelta(hours=-4)  # EDT (Apr-Oct)
+        now_et = datetime.datetime.now(datetime.timezone(et_offset))
+        weekday = now_et.weekday()  # 0=Mon, 6=Sun
+        hour = now_et.hour
+        minute = now_et.minute
+        in_market_hours = (weekday < 5) and (
+            (hour == 9 and minute >= 30) or (10 <= hour < 16)
+        )
+    except Exception:
+        in_market_hours = True  # Fail safe: if clock check fails, assume market hours
+
+    if not in_market_hours:
+        logger.info("Stage 4 (synthesis_readiness): Outside market hours — skipping check (silence expected)")
+        return FlowStageResult(
+            stage=4, name="synthesis_readiness", result=StageResult.PASS,
+            detail="Outside market hours (09:30–16:00 ET weekdays) — silence expected",
+            latency_ms=0,
+        )
+
     start = time.time()
     name = "synthesis_readiness"
 

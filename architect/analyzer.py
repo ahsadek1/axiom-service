@@ -13,7 +13,7 @@ from typing import Optional
 logger = logging.getLogger("architect.analyzer")
 
 AGENT_NAME = "ARCHITECT"
-BRAIN_MODEL = "claude-sonnet-4-6"
+BRAIN_MODEL = "claude-haiku-4-5-20251001"
 
 SYSTEM_PROMPT = (
     "You are ARCHITECT, an elite structural and architectural coherence specialist. "

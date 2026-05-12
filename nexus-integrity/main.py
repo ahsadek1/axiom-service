@@ -197,8 +197,8 @@ def _run_composite_scheduler(interval_s: int = 300) -> None:
                 config_correctness=90.0,  # TODO: implement config check
                 error_rate_score=90.0,    # TODO: implement error rate tracking
                 pipeline_throughput=flow_score,
-                data_freshness=80.0,      # TODO: implement freshness check
-                session_activity=80.0,    # TODO: implement session check
+                data_freshness=100.0,     # TODO: implement real probe — neutral 100.0 until probe is built
+                session_activity=100.0,   # TODO: implement real probe — neutral 100.0 until probe is built
             )
 
             # Write to TRS store

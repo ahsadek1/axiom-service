@@ -2,8 +2,11 @@
 synthesis.py — OMNI Synthesis Engine
 
 Combines quad intelligence results into a final verdict.
-Fully autonomous — no CONDITIONAL verdict.
-Verdict ladder: STRONG_GO (4/4) → GO (3/4) → NO_GO (≤ 2/4 or insufficient brains).
+Fully autonomous — no CONDITIONAL verdict. Brains vote GO or NO_GO only.
+Verdict ladder (Ahmed directive 2026-05-07):
+  STRONG_GO : 3+ brains GO → full sizing
+  GO        : 2/4 brains GO → pathway sizing
+  NO_GO     : ≤1 brain GO, insufficient brains, or Axiom hard stop
 Applies Axiom hard stop check before any GO verdict.
 """
 
@@ -86,15 +89,17 @@ def compute_verdict(
             brain_summary[brain_name] = f"ERROR: {result['error'][:50]}"
             continue
 
+        vote = result.get("vote", "") or ""
+        # G8 SYS-1: empty/falsy vote is treated as a non-response (brain excluded from count)
+        if not vote.strip():
+            brain_summary[brain_name] = "ERROR: empty_vote"
+            continue
         brains_responded += 1
-        vote = result.get("vote", "NO_GO")
         brain_summary[brain_name] = vote
 
         if vote == "GO":
             votes_go += 1
-        elif vote == "CONDITIONAL":
-            # Brain CONDITIONAL = not GO. System is fully autonomous — no escalation.
-            notes.append(f"{brain_name} voted CONDITIONAL (counted as NO_GO)")
+        # NO_GO (any non-GO) is a NO_GO vote — no CONDITIONAL (Ahmed directive 2026-05-07)
 
         if result.get("echo_chamber"):
             echo_detections += 1
@@ -139,17 +144,16 @@ def compute_verdict(
             )
             final_sizing = thesis_sizing_cap
 
-    # ── Insufficient Brain Responses → CONDITIONAL ───────────────────────────
-    # CONDITIONAL = no execution, but a named signal (not silent like NO_GO).
-    # Fires when the quad intelligence layer itself is degraded.
-    # main.py sends Ahmed an alert on CONDITIONAL so he knows the AI layer is impaired.
+    # ── Insufficient Brain Responses → NO_GO ─────────────────────────────────
+    # NO_GO when quad intelligence layer is degraded (< MIN_BRAINS_REQUIRED responding).
+    # main.py alerts Ahmed so he knows the AI layer is impaired.
     if brains_responded < MIN_BRAINS_REQUIRED:
         notes.append(
             f"Only {brains_responded}/{len(brain_results)} brains responded "
-            f"(minimum {MIN_BRAINS_REQUIRED} required) — CONDITIONAL (system degraded)"
+            f"(minimum {MIN_BRAINS_REQUIRED} required) — NO_GO (system degraded)"
         )
         return SynthesisVerdict(
-            verdict              = "CONDITIONAL",
+            verdict              = "NO_GO",
             votes_go             = votes_go,
             brains_responded     = brains_responded,
             echo_chamber_flagged = echo_chamber_flagged,
@@ -192,27 +196,24 @@ def compute_verdict(
             brain_summary        = brain_summary,
         )
 
-    # ── Standard Voting ───────────────────────────────────────────────────────
-    if votes_go >= VOTES_REQUIRED_STRONG_GO:
+    # ── Standard Voting (Ahmed directive 2026-05-07) ─────────────────────────
+    # 2/4 GO = GO (pathway sizing) | 3+/4 GO = STRONG_GO (full sizing)
+    if votes_go >= VOTES_REQUIRED_STRONG_GO:   # 3+
         verdict = "STRONG_GO"
-        notes.append(f"{votes_go}/{brains_responded} brains GO — STRONG_GO")  # Cipher Finding 17: use variables
+        notes.append(f"{votes_go}/{brains_responded} brains GO — STRONG_GO (full sizing)")
 
-    elif votes_go >= VOTES_REQUIRED_GO:
+    elif votes_go >= VOTES_REQUIRED_GO:        # 2
         verdict = "GO"
-        notes.append(f"3/4 brains GO")
+        notes.append(f"{votes_go}/{brains_responded} brains GO — GO (pathway sizing)")
 
-    elif votes_go == 2:
-        # 2/4 GO — borderline, not enough to execute, but named signal (not silent)
-        verdict = "CONDITIONAL"
-        notes.append(f"2/4 brains GO — CONDITIONAL (borderline, minimum 3 required for GO)")
-    else:  # 0 or 1 GO — clear no-conviction, silent drop
+    else:  # 0 or 1 GO — no conviction
         verdict = "NO_GO"
-        notes.append(f"Only {votes_go}/4 brains GO — NO_GO")
+        notes.append(f"Only {votes_go}/{brains_responded} brains GO — NO_GO")
 
-    # Echo chamber downgrade: STRONG_GO → GO
+    # Echo chamber: STRONG_GO → GO (sizing penalty, not a block)
     if echo_chamber_flagged and verdict == "STRONG_GO":
         verdict = "GO"
-        notes.append("Echo chamber detected — downgraded STRONG_GO → GO")
+        notes.append("Echo chamber detected — STRONG_GO → GO (pathway sizing penalty)")
 
     return SynthesisVerdict(
         verdict              = verdict,
@@ -297,6 +298,25 @@ def build_context(
     }
 
 
+# G8 SYS-1: Rate-limit brain degradation alerts to 1 per ticker per hour.
+# Key: ticker string. Value: epoch time of last alert sent.
+_brain_alert_sent: dict = {}
+_BRAIN_ALERT_RATE_LIMIT_SEC: float = 3600.0
+
+
+def send_brain_degradation_alert(bot_token: str, chat_id: str, msg: str) -> None:
+    """
+    Send brain degradation Telegram alert.
+    Extracted for testability (can be mocked in tests).
+    """
+    import requests as _req
+    _req.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        json={"chat_id": chat_id, "text": msg},
+        timeout=5,
+    )
+
+
 def _maybe_alert_brain_degradation(
     ticker: str,
     brains_responded: int,
@@ -306,19 +326,29 @@ def _maybe_alert_brain_degradation(
 ) -> None:
     """
     Alert if fewer than 4 brains responded — synthesis ran on degraded intel.
-    Silent if all 4 responded. Fire-and-forget.
+    Silent if all 4 responded.
+    Rate-limited: max 1 alert per ticker per hour (_brain_alert_sent dict).
+    Fire-and-forget.
     """
-    import logging as _logging, requests as _req
+    import logging as _logging, time as _time
     log = _logging.getLogger("omni.synthesis")
     if brains_responded >= 4:
         return
-    failed = [k for k,v in (brain_summary or {}).items() if isinstance(v, str) and v.startswith("ERROR")]
+    failed = [k for k, v in (brain_summary or {}).items() if isinstance(v, str) and v.startswith("ERROR")]
     log.warning(
         "BRAIN DEGRADATION: %s — only %d/4 brains responded. Failed: %s",
         ticker, brains_responded, failed,
     )
     if not bot_token:
         return
+    # Rate-limit: skip if we already alerted for this ticker within the window
+    now = _time.time()
+    last_sent = _brain_alert_sent.get(ticker, 0.0)
+    if now - last_sent < _BRAIN_ALERT_RATE_LIMIT_SEC:
+        log.debug("Brain degradation alert suppressed for %s (rate limit, %.0fs remaining)",
+                  ticker, _BRAIN_ALERT_RATE_LIMIT_SEC - (now - last_sent))
+        return
+    _brain_alert_sent[ticker] = now
     try:
         msg = (
             f"\u26a0\ufe0f OMNI BRAIN DEGRADATION\n"
@@ -327,10 +357,6 @@ def _maybe_alert_brain_degradation(
             f"Failed: {', '.join(failed) or 'unknown'}\n"
             f"Synthesis proceeded at reduced confidence."
         )
-        _req.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": msg},
-            timeout=5,
-        )
+        send_brain_degradation_alert(bot_token, chat_id, msg)
     except Exception as e:
         log.warning("Brain degradation alert failed: %s", e)

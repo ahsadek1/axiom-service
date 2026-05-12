@@ -34,13 +34,24 @@ logger = logging.getLogger("omni.failure_sentinel")
 ET = pytz.timezone("America/New_York")
 
 # ── Contact config ────────────────────────────────────────────────────────────
-CIPHER_BOT_TOKEN = os.getenv("CIPHER_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
-VECTOR_BOT_TOKEN = os.getenv("VECTOR_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
-AHMED_CHAT_ID    = os.getenv("AHMED_CHAT_ID", "8573754783")
+AHMED_CHAT_ID     = os.getenv("AHMED_CHAT_ID", "8573754783")
+NEXUS_HEALTH_GROUP = os.getenv("NEXUS_HEALTH_GROUP_ID", "-5241272802")
+SOVEREIGN_BUS_URL  = os.getenv("SOVEREIGN_BUS_URL", "http://192.168.1.141:9999")
+ALERT_BROKER_URL   = os.getenv("ALERT_BROKER_URL", "http://localhost:9998")
+ALERT_BROKER_SECRET = os.getenv(
+    "ALERT_BROKER_SECRET",
+    "ab_secret_f4e2d1c8b7a3e9f5d2c4b6a8e0f3d5c7b9a1e4f6d8c0b2a4e6f8d0c2b4a6e8"
+)
 
-# Cipher and Vector share Ahmed's DM for now — will wire to agent sessions
-CIPHER_CHAT_ID   = AHMED_CHAT_ID
-VECTOR_CHAT_ID   = AHMED_CHAT_ID
+# Import alert_client if available (routes through broker with dedup + rate limiting)
+try:
+    import sys as _sys_ac
+    _sys_ac.path.insert(0, "/Users/ahmedsadek/nexus")
+    from shared.alert_client import send_alert as _broker_send_alert
+    _ALERT_CLIENT_AVAILABLE = True
+except Exception as _ac_err:
+    _ALERT_CLIENT_AVAILABLE = False
+    logger.warning("failure_sentinel: alert_client unavailable: %s", _ac_err)
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 F1_BRAIN_FAILS_WINDOW_MIN    = 10   # 2+ brain failures in this window → F1
@@ -57,47 +68,51 @@ SENTINEL_POLL_INTERVAL_S     = 60   # check every 60 seconds
 
 # ── Alert delivery ────────────────────────────────────────────────────────────
 
-def _send_alert(bot_token: str, chat_id: str, text: str) -> bool:
-    """Send Telegram alert. Returns True on success."""
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=8,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        logger.warning("Alert send failed: %s", e)
-        return False
-
-
 def _alert_all(subject: str, body: str, failure_class: str) -> None:
     """
-    Fire alert to Ahmed + Cipher + Vector simultaneously.
-    Ahmed gets it via OMNI bot DM.
-    Cipher and Vector get it via their own bots.
+    Fire alert through Alert Broker (dedup + rate limiting).
+    Ahmed gets ONE DM. Health group gets the broadcast.
+    Cipher + Vector are notified via SOVEREIGN message bus (not Ahmed's DM).
     All logged to CHRONICLE.
     """
-    msg = (
-        f"🚨 <b>OMNI INEVITABLE FAILURE WARNING</b>\n"
-        f"Class: <code>{failure_class}</code>\n"
-        f"Subject: {subject}\n\n"
-        f"{body}\n\n"
-        f"<b>Action required by Cipher + Vector immediately.</b>"
-    )
+    title = f"OMNI INEVITABLE FAILURE — {failure_class}: {subject[:80]}"
+    detail = f"{body}\n\nAction required by Cipher + Vector immediately."
+    dedup_key = f"omni:failure_sentinel:{failure_class}"
 
-    # Ahmed via OMNI bot
-    _send_alert("8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc", AHMED_CHAT_ID, msg)
+    if _ALERT_CLIENT_AVAILABLE:
+        # Route through broker — single deduped message to Ahmed + health group
+        _broker_send_alert(
+            source="omni-failure-sentinel",
+            level="CRITICAL",
+            title=title,
+            body=detail,
+            dedup_key=dedup_key,
+            targets=["ahmed", "nexus_health_group"],
+        )
+    else:
+        # Fallback: direct Telegram (broker unavailable)
+        try:
+            fallback_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            msg = f"🚨 <b>OMNI INEVITABLE FAILURE WARNING</b>\nClass: <code>{failure_class}</code>\nSubject: {subject}\n\n{detail}"
+            if fallback_token:
+                requests.post(
+                    f"https://api.telegram.org/bot{fallback_token}/sendMessage",
+                    json={"chat_id": AHMED_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                    timeout=8,
+                )
+        except Exception as _fb_err:
+            logger.warning("failure_sentinel: fallback Telegram failed: %s", _fb_err)
 
-    # Cipher via Cipher bot
-    _send_alert(CIPHER_BOT_TOKEN, CIPHER_CHAT_ID, msg)
-
-    # Vector via Vector bot
-    _send_alert(VECTOR_BOT_TOKEN, VECTOR_CHAT_ID, msg)
-
-    # Health group
-    _send_alert("8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc",
-                "-1003954790884", msg)
+    # Notify Cipher + Vector via SOVEREIGN bus (not Ahmed's DM)
+    try:
+        bus_msg = f"[CRITICAL] OMNI Failure Sentinel — {failure_class}: {subject}. {body[:300]}"
+        requests.post(
+            f"{SOVEREIGN_BUS_URL}/send",
+            json={"from": "omni-failure-sentinel", "to": "sovereign", "message": bus_msg},
+            timeout=5,
+        )
+    except Exception as _bus_err:
+        logger.warning("failure_sentinel: bus notify failed: %s", _bus_err)
 
     # CHRONICLE
     try:

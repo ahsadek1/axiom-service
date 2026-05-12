@@ -26,6 +26,9 @@ import threading
 import datetime
 import requests
 import pytz
+import sys as _sys
+_sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+from alert_client import send_alert as _send_alert
 
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN",   "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc")
 HEALTH_GROUP   = os.getenv("HEALTH_GROUP_ID", "-5184172590")
@@ -43,20 +46,25 @@ MARKET_CLOSE           = datetime.time(16, 5)
 
 # ── Services ──────────────────────────────────────────────────────────────────
 
+# G3: all Railway URLs from env vars — no hardcoded fallbacks
+_AXIOM_BASE = os.getenv("RAILWAY_AXIOM_URL", "")  # e.g. https://axiom-production-334c.up.railway.app
+_ALPHA_BASE = os.getenv("RAILWAY_ALPHA_URL", "")  # e.g. https://worker-production-2060.up.railway.app
+_PRIME_BASE = os.getenv("RAILWAY_PRIME_URL", "")  # e.g. https://nexus-prime-bot-production.up.railway.app
+
 SERVICES = {
     "Axiom": {
         "display":    "Axiom 🔷",
-        "url":        "https://axiom-production-334c.up.railway.app/health",
+        "url":        f"{_AXIOM_BASE}/health" if _AXIOM_BASE else "",
         "railway_id": os.getenv("AXIOM_RAILWAY_SERVICE_ID", ""),
     },
     "Alpha": {
         "display":    "Alpha 🔵",
-        "url":        "https://worker-production-2060.up.railway.app/health",
+        "url":        f"{_ALPHA_BASE}/health" if _ALPHA_BASE else "",
         "railway_id": os.getenv("ALPHA_RAILWAY_SERVICE_ID", ""),
     },
     "Prime": {
         "display":    "Prime 🟢",
-        "url":        "https://nexus-prime-bot-production.up.railway.app/health",
+        "url":        f"{_PRIME_BASE}/health" if _PRIME_BASE else "",
         "railway_id": os.getenv("PRIME_RAILWAY_SERVICE_ID", ""),
     },
 }
@@ -85,19 +93,26 @@ _last_pulse_hour = -1
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
 def _tg(chat_id, text):
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"[MONITOR] TG failed: {e}")
-        return False
+    """Route through Alert Broker (chat_id kept for signature compat, ignored)."""
+    _send_alert(
+        source="nexus-health-monitor",
+        level="WARNING",
+        title=text[:200],
+        body=text[200:] if len(text) > 200 else "",
+        targets=["nexus_health_group"],
+    )
+    return True
 
 def _alert(text, tier=2):
-    _tg(HEALTH_GROUP, text)
+    level = "CRITICAL" if tier >= 3 else "WARNING"
+    targets = ["ahmed", "nexus_health_group"] if tier >= 3 else ["nexus_health_group"]
+    _send_alert(
+        source="nexus-health-monitor",
+        level=level,
+        title=text[:200],
+        body=text[200:] if len(text) > 200 else "",
+        targets=targets,
+    )
     if tier >= 3:
         _tg(AHMED_DM, text)
 
@@ -173,6 +188,10 @@ def _classify(error_str, status_code=0):
     return "UNKNOWN"
 
 def _run_diagnostic(name, url):
+    # G3: skip Railway checks when URL env var is not set
+    if not url:
+        return {"failure_type": None, "status_code": 0, "latency_ms": 0,
+                "heal_action": "NONE", "detail": "URL not configured (RAILWAY_*_URL not set)", "error": None}
     t0 = time.time()
     try:
         r = requests.get(url, timeout=8)

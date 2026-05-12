@@ -7,6 +7,7 @@ Each heal action returns (healed: bool, action_taken: str).
 
 import logging
 import subprocess
+import sys
 import time
 
 import requests
@@ -21,9 +22,32 @@ from checks import check_service_health, check_execution_health, check_omni_heal
 
 log = logging.getLogger("sentinel.healer")
 
+# Route through alert broker for dedup + rate limiting
+try:
+    sys.path.insert(0, "/Users/ahmedsadek/nexus")
+    from shared.alert_client import send_alert as _broker_send
+    _BROKER_OK = True
+except Exception as _be:
+    _BROKER_OK = False
+    log.warning("healer: alert_client unavailable: %s", _be)
+
 
 def _alert_ahmed(text: str) -> None:
-    """Send an urgent Telegram alert to Ahmed. Best-effort — never raises."""
+    """Route alert through broker (dedup). Best-effort — never raises."""
+    if _BROKER_OK:
+        try:
+            _broker_send(
+                source="sentinel-healer",
+                level="WARNING",
+                title=text[:200],
+                body=text[200:] if len(text) > 200 else "",
+                dedup_key=f"sentinel-healer:{text[:80]}",
+                targets=["nexus_health_group"],  # healer events → health group only
+            )
+            log.info("Healer alert routed via broker: %s", text[:80])
+            return
+        except Exception as _be:
+            log.warning("healer: broker send failed, falling back: %s", _be)
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(
@@ -31,7 +55,7 @@ def _alert_ahmed(text: str) -> None:
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
-        log.info("Ahmed alert sent: %s", text[:80])
+        log.info("Ahmed alert sent (direct fallback): %s", text[:80])
     except Exception as e:
         log.error("Ahmed alert failed: %s", e)
 

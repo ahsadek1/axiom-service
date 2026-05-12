@@ -35,6 +35,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+import sys as _sys
+_sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+from alert_client import send_alert as _send_alert
 
 # ---------------------------------------------------------------------------
 # Config
@@ -229,15 +232,32 @@ def _update_chronicle(credential: str, status: str, detail: str) -> None:
 # Alerts
 # ---------------------------------------------------------------------------
 
-def _send_telegram(message: str, target: str = GROUP_CHAT_ID) -> None:
+ALERT_BROKER = "http://192.168.1.141:9998"
+
+
+def _send_alert_broker(message: str, level: str = "high", key: str = None) -> bool:
+    """Route through Alert Broker (.141:9998). Returns True on success."""
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": target, "text": message, "parse_mode": "Markdown"},
-            timeout=10,
-        )
+        payload = {"source": "vector-credential-watchdog", "level": level, "message": message}
+        if key:
+            payload["key"] = key
+        r = requests.post(f"{ALERT_BROKER}/alert", json=payload, timeout=5)
+        return r.status_code == 200
     except Exception as e:
-        log.warning("Telegram send failed: %s", e)
+        log.warning("Alert Broker unreachable: %s", e)
+        return False
+
+
+def _send_telegram(message: str, target: str = GROUP_CHAT_ID) -> None:
+    """Route through Alert Broker (target kept for signature compat)."""
+    targets = ["ahmed"] if target == AHMED_TELEGRAM_ID else ["nexus_health_group"]
+    _send_alert(
+        source="vector-credential-watchdog",
+        level="CRITICAL",
+        title=message[:200],
+        body=message[200:] if len(message) > 200 else "",
+        targets=targets,
+    )
 
 
 def _notify_sovereign(message: str) -> None:
@@ -361,10 +381,14 @@ def main() -> int:
         lines.append("Action required: rotate/renew affected credentials immediately.")
         alert_msg = "\n".join(lines)
 
-        _send_telegram(alert_msg, GROUP_CHAT_ID)
+        # Route through Alert Broker; fall back to direct Telegram
+        level = "critical" if failed_critical else "high"
+        broker_ok = _send_alert_broker(alert_msg, level=level, key="vector-credential-alert")
+        if not broker_ok:
+            _send_telegram(alert_msg, GROUP_CHAT_ID)
 
         if failed_critical:
-            _send_telegram(alert_msg, AHMED_TELEGRAM_ID)
+            _send_telegram(alert_msg, AHMED_TELEGRAM_ID)  # Always direct DM Ahmed on critical
             _notify_sovereign(
                 f"VECTOR CREDENTIAL ALERT: {', '.join(n for n,_ in failed_critical)} "
                 f"credential(s) INVALID. Trading capability at risk. Immediate action required."

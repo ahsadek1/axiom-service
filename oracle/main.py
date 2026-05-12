@@ -24,6 +24,9 @@ from engines import (flow_engine, fundamental_engine, gamma_engine,
 from intelligence import coherence, patterns
 from models import (ContextPacket, CycleIntelligence, HealthCheck,
                     NewsData, PrefetchRequest, PrefetchResponse)
+import sys as _sys_wd
+_sys_wd.path.insert(0, "/Users/ahmedsadek/nexus")
+from shared.watchdog import Watchdog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,6 +75,8 @@ def _set_oracle_active() -> None:
     logger.info("Block 2: ORACLE mode → ACTIVE (%d warm tickers)", cache.warm_count())
 
 
+_nns_watchdog = Watchdog("oracle")
+
 # OMNI M3 fix: replace deprecated @app.on_event("startup") with lifespan context manager.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -83,6 +88,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_startup_self_test())  # DATA INTEGRITY: verify engines return real data before serving
     asyncio.create_task(_warmup_gate_monitor())  # Block 2: monitor warmup, flip to ACTIVE when ready
     logger.info("ORACLE ready (warming)")
+    _nns_watchdog.start()
     yield
     logger.info("ORACLE shutting down")
 
@@ -539,6 +545,101 @@ async def get_macro(
         "macro": data.model_dump() if data else None,
         "data_freshness": freshness,
     })
+
+
+@app.get("/oracle/intelligence/cycle", response_model=CycleIntelligence)
+async def get_cycle_intelligence(
+    x_oracle_secret: Optional[str] = Header(None, alias="X-Oracle-Secret"),
+) -> CycleIntelligence:
+    """
+    Return cycle-level cross-ticker pattern detection.
+    
+    Detects echo chamber risks and cross-ticker patterns for the current cycle.
+    Used by Axiom during pool refresh cycles to assess synthesis quality.
+    
+    Returns:
+        CycleIntelligence with patterns_detected and echo_chamber_risk_tickers.
+    """
+    _check_auth(x_oracle_secret)
+    
+    # Generate cycle_id based on current 10-minute window
+    import time as _time
+    import requests as _requests
+    cycle_time_unix = int(_time.time() / 600) * 600  # Round down to nearest 10-min boundary
+    cycle_id = datetime.fromtimestamp(cycle_time_unix, tz=timezone.utc).isoformat()
+    
+    # Get current pool tickers from Axiom
+    tickers = []
+    try:
+        axiom_url = config.AXIOM_URL if hasattr(config, 'AXIOM_URL') else "http://localhost:8001"
+        axiom_secret = config.AXIOM_SECRET if hasattr(config, 'AXIOM_SECRET') else ""
+        resp = _requests.get(
+            f"{axiom_url}/pool",
+            headers={"X-Axiom-Secret": axiom_secret},
+            timeout=3,
+        )
+        if resp.ok:
+            body = resp.json()
+            tickers = body.get("pool", body.get("tickers", []))[:50]
+    except Exception as e:
+        logger.warning("Cycle intelligence: could not fetch Axiom pool: %s", e)
+        # Fallback: use a default set of liquid tickers
+        tickers = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"]
+    
+    if not tickers:
+        # Return empty intelligence if no tickers available
+        return CycleIntelligence(
+            cycle_id=cycle_id,
+            cycle_time=datetime.now(tz=timezone.utc).isoformat(),
+            tickers_in_pool=[],
+            patterns_detected=[],
+            echo_chamber_risk_tickers=[],
+        )
+    
+    # Build full context cards for warm/cached tickers
+    loop = asyncio.get_event_loop()
+    full_cards = []
+    packet_tasks = [_assemble_full_packet(t) for t in tickers]
+    packets = await asyncio.gather(*packet_tasks, return_exceptions=True)
+    
+    for packet in packets:
+        if not isinstance(packet, Exception) and packet is not None:
+            full_cards.append(packet.model_dump())
+    
+    # Run pattern detection
+    try:
+        cycle_intel = await loop.run_in_executor(
+            None, patterns.detect, cycle_id, full_cards
+        )
+    except Exception as e:
+        logger.error("Cycle intelligence pattern detection failed: %s", e)
+        cycle_intel = None
+    
+    if cycle_intel is None:
+        # Fallback if pattern detection fails
+        cycle_intel = CycleIntelligence(
+            cycle_id=cycle_id,
+            cycle_time=datetime.now(tz=timezone.utc).isoformat(),
+            tickers_in_pool=tickers,
+            patterns_detected=[],
+            echo_chamber_risk_tickers=[],
+        )
+    
+    return cycle_intel
+
+
+@app.get("/oracle/cycle", response_model=CycleIntelligence)
+async def get_cycle_intelligence_alias(
+    x_oracle_secret: Optional[str] = Header(None, alias="X-Oracle-Secret"),
+) -> CycleIntelligence:
+    """
+    Alias for /oracle/intelligence/cycle.
+    
+    GENESIS-FIX-ORACLE-CYCLE-ALIAS: Axiom and other agents call /oracle/cycle
+    but the canonical endpoint is /oracle/intelligence/cycle. This alias maintains
+    backward compatibility without duplicating logic.
+    """
+    return await get_cycle_intelligence(x_oracle_secret)
 
 
 @app.get("/ping")

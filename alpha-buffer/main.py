@@ -52,6 +52,16 @@ from database import (
 )
 from omni_client import dispatch_to_omni
 
+# ── Shared sovereign_comms (module-level import so route handlers can call report()) ──
+import sys as _sys_sc
+_sys_sc.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+try:
+    from shared.sovereign_comms import report as _sov_report, get_instructions as _sov_get_instructions
+except Exception:  # pragma: no cover
+    def _sov_report(*a, **kw): pass  # type: ignore[misc]
+    def _sov_get_instructions(*a, **kw): return []  # type: ignore[misc]
+from shared.watchdog import Watchdog
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level  = logging.INFO,
@@ -275,6 +285,8 @@ def _alert_lost_concordance(row: dict) -> None:
         logger.error("Lost concordance notification failed: %s", e)
 
 
+_nns_watchdog = Watchdog("alpha-buffer")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB and circuit breaker state on startup."""
@@ -328,6 +340,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             except Exception as _we:
                 logger.warning("Score watchdog error: %s", _we)
     threading.Thread(target=_score_watchdog_thread, daemon=True, name="score-dist-watchdog").start()
+    _nns_watchdog.start()
     yield
     retry_task.cancel()
     logger.info("Alpha Buffer stopped")
@@ -633,13 +646,24 @@ def submit_pick(
             },
         )
 
-    # GENESIS concordance-window-fix: use the agent's window_id as the DB key.
-    # All 3 agents analyze the same Axiom pool push and carry its window_id.
-    # If submissions span a 15-min boundary (server clock ticks), using server's
-    # current_window_id() splits agents into different DB windows → concordance
-    # never forms. Using the agent's window_id unifies them in the same bucket.
-    # The staleness check above already rejected truly EXPIRED picks.
-    if body.window_id:
+    # GENESIS-BLOCKER-FIX (May 11 2026, 13:45 ET): Resolve window coalescence issue.
+    # Problem: Submissions with stale window_ids (1-2 cycles old) were being saved
+    # with their old window_id, preventing concordance across agents (e.g. Sage in
+    # window 1215, Cipher in window 1230). This created zero concordances for 147 min.
+    # Solution: When a submission is STALE but ACCEPTED (cycles_stale 1-2),
+    # use CURRENT window for DB storage so recent submissions converge in same bucket.
+    # Sizing adjustment from evaluate_window is preserved separately.
+    if _window_result["cycles_stale"] >= 1 and _window_result["action"] != "REJECTED":
+        # Stale but accepted — use current window to enable concordance
+        logger.info(
+            "GENESIS-FIX: %s/%s stale by %d cycle(s) — coalescing to current window %s (was %s)",
+            body.ticker, body.direction, _window_result["cycles_stale"],
+            _current_window,
+            body.window_id if hasattr(body, "window_id") else "(none)",
+        )
+        window_id = _current_window
+    elif body.window_id:
+        # Fresh submission — use agent's window_id to avoid concordance splitting across 15-min boundaries
         window_id = body.window_id
 
     # Persist submission
@@ -995,17 +1019,17 @@ def sovereign_directive(
     logger.info("SOVEREIGN direct push to alpha-buffer: %s", d)
 
     if d == "PING":
-        report("alpha_buffer", "ack", {"directive": "PING", "status": "alive"})
+        _sov_report("alpha_buffer", "ack", {"directive": "PING", "status": "alive"})
         return JSONResponse({"ok": True, "directive": "PING", "status": "alive"})
     elif d == "STATUS":
         snap = {"directive": "STATUS", "service": "alpha_buffer", "port": int(__import__("os").getenv("PORT", "8002"))}
-        report("alpha_buffer", "status", snap)
+        _sov_report("alpha_buffer", "status", snap)
         return JSONResponse({"ok": True, **snap})
     elif d in ("FLUSH", "RESET_DAY"):
-        report("alpha_buffer", "ack", {"directive": d, "status": "applied"})
+        _sov_report("alpha_buffer", "ack", {"directive": d, "status": "applied"})
         return JSONResponse({"ok": True, "directive": d})
     else:
-        report("alpha_buffer", "ack", {"directive": d, "status": "unrecognized"})
+        _sov_report("alpha_buffer", "ack", {"directive": d, "status": "unrecognized"})
         return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
 
 

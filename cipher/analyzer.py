@@ -26,7 +26,7 @@ from shared.scorer import compute_score, determine_direction, build_reasoning_pr
 logger = logging.getLogger("cipher.analyzer")
 
 AGENT_NAME  = "Cipher"
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 
 def analyze(

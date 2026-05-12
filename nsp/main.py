@@ -36,6 +36,11 @@ from fastapi.responses import JSONResponse
 # nexus-integrity import path (imported as library, not HTTP peer)
 # ---------------------------------------------------------------------------
 sys.path.insert(0, "/Users/ahmedsadek/nexus/nexus-integrity")
+import importlib.util as _wd_util
+_wd_spec = _wd_util.spec_from_file_location("nns_watchdog", "/Users/ahmedsadek/nexus/shared/watchdog.py")
+_wd_mod = _wd_util.module_from_spec(_wd_spec)
+_wd_spec.loader.exec_module(_wd_mod)
+Watchdog = _wd_mod.Watchdog
 
 # Load env before importing config (env may come from launchd plist or shell)
 _log_dir = os.environ.get("NSP_LOG_DIR", "/Users/ahmedsadek/nexus/logs/nsp")
@@ -64,6 +69,8 @@ _start_time: float = time.time()
 # ---------------------------------------------------------------------------
 # Lifespan — startup + shutdown
 # ---------------------------------------------------------------------------
+
+_nns_watchdog = Watchdog("nsp")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -116,6 +123,7 @@ async def lifespan(app: FastAPI):
         len(telemetry.get_collector_service_names()),
         config.NSP_PORT,
     )
+    _nns_watchdog.start()
 
     yield
 

@@ -27,8 +27,8 @@ GROUP_ID     = "-5184172590"
 ALPACA_KEY   = os.getenv("ALPACA_API_KEY",    "PKPGM3BRNYPGCF5Z56IAUZCZJL")
 ALPACA_SEC   = os.getenv("ALPACA_SECRET_KEY", "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs")
 ALPACA_BASE  = "https://paper-api.alpaca.markets"
-ALPHA_URL    = "https://worker-production-2060.up.railway.app"
-PRIME_URL    = "https://nexus-prime-bot-production.up.railway.app"
+ALPHA_URL    = os.getenv("RAILWAY_ALPHA_URL", "")  # G3: no hardcoded fallback
+PRIME_URL    = os.getenv("RAILWAY_PRIME_URL", "")  # G3: no hardcoded fallback
 PRIME_DB     = os.getenv("NEXUS_PRIME_DB_PATH", "/tmp/nexus_prime.db")
 CIRCUIT_LOG  = os.path.join(os.path.dirname(__file__), "nexus_circuit_log.json")
 

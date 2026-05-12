@@ -405,6 +405,11 @@ def get_stalled_picks(db_path: str, stall_window_s: int) -> List[Dict[str, Any]]
     """
     try:
         cutoff = time.time() - stall_window_s
+        # Only consider traces from the current trading session (last 12 hours)
+        # to avoid counting all-time historical incomplete traces as stalls.
+        session_start = time.time() - (12 * 3600)
+        # Terminal hops: any of these means the pick reached a final state.
+        # Picks without a terminal hop AND no activity for stall_window_s are stalled.
         conn = sqlite3.connect(db_path, check_same_thread=False)
         rows = conn.execute(
             """
@@ -412,11 +417,17 @@ def get_stalled_picks(db_path: str, stall_window_s: int) -> List[Dict[str, Any]]
                    t.hop     AS last_hop,
                    MAX(t.ts) AS last_seen_ts
             FROM   traces t
+            WHERE  t.ts > ?
             GROUP  BY t.trace_id
             HAVING MAX(t.ts) < ?
-               AND t.hop != 'alpaca_confirmed'
+               AND t.hop NOT IN (
+                   'alpaca_confirmed', 'alpaca_submitted',
+                   'no_go_dropped', 'synthesis_complete',
+                   'score_below_threshold', 'dropped'
+               )
+               AND t.hop != 'agent_received'
             """,
-            (cutoff,),
+            (session_start, cutoff),
         ).fetchall()
         conn.close()
         return [

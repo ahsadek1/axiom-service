@@ -17,11 +17,12 @@ NEXUS_SECRET  = "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d
 TG_BOT        = "8747601602:AAGTzRd3NJWq44Bvbzd5JvhtnO2edBUvjbc"
 TG_HEALTH     = "-5184172590"
 TG_AHMED      = "8573754783"
-ALPHA_URL     = "https://worker-production-2060.up.railway.app"  # Railway alpha-execution v3.0.0
-AXIOM_URL     = "https://axiom-production-334c.up.railway.app"  # Railway axiom v4.0.0
-PRIME_URL     = "https://nexus-prime-bot-production.up.railway.app"  # Railway prime-scheduler v2.1.0
+# G3: Railway URLs from env vars — no hardcoded fallbacks
+ALPHA_URL     = os.getenv("RAILWAY_ALPHA_URL", "")   # Railway alpha-execution
+AXIOM_URL     = os.getenv("RAILWAY_AXIOM_URL", "")   # Railway axiom
+PRIME_URL     = os.getenv("RAILWAY_PRIME_URL", "")   # Railway prime-scheduler
 PRIME_EXEC_URL = "http://localhost:8006"  # Local prime-execution v3.0.0 — reconciler lives here
-RAILWAY_TOKEN = "95959846-6306-47e7-a502-b7461514ffff"
+RAILWAY_TOKEN = os.getenv("RAILWAY_TOKEN", "")  # G3: no hardcoded token
 
 ISSUES   = []
 WARNINGS = []
@@ -72,6 +73,9 @@ def check_alpaca():
 
 # ── 2. Alpha service ──────────────────────────────────────────────────────────
 def check_alpha():
+    if not ALPHA_URL:
+        warn("⚠️ RAILWAY_ALPHA_URL not set — skipping Railway alpha check")
+        return True
     try:
         r = requests.get(f"{ALPHA_URL}/health", timeout=8)
         d = r.json()
@@ -118,6 +122,9 @@ def check_alpha():
 
 # ── 3. Axiom ──────────────────────────────────────────────────────────────────
 def check_axiom():
+    if not AXIOM_URL:
+        warn("⚠️ RAILWAY_AXIOM_URL not set — skipping Railway axiom check")
+        return True
     try:
         r = requests.get(f"{AXIOM_URL}/health", timeout=8)
         d = r.json()
@@ -133,6 +140,9 @@ def check_axiom():
 
 # ── 4. Prime service — health + scan activity ────────────────────────────────
 def check_prime():
+    if not PRIME_URL:
+        warn("⚠️ RAILWAY_PRIME_URL not set — skipping Railway prime check")
+        return True
     try:
         r = requests.get(f"{PRIME_URL}/health", timeout=8)
         d = r.json()

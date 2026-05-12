@@ -61,7 +61,7 @@ YOUR ROLE: {role_description}
 
 Respond in this EXACT JSON format:
 {{
-  "vote": "GO" or "NO_GO" or "CONDITIONAL",
+  "vote": "GO" or "NO_GO",
   "confidence": <integer 0-100>,
   "concern_1": "<primary concern ≤100 chars, or 'None'>",
   "concern_2": "<secondary concern ≤100 chars, or 'None'>",
@@ -579,9 +579,10 @@ def _parse_brain_response(raw_text: str, brain_name: str) -> dict:
 
     # Validate and normalize vote
     vote = str(parsed.get("vote", "")).upper().strip()
-    if vote not in ("GO", "NO_GO", "CONDITIONAL"):
-        logger.warning("Brain %s returned invalid vote '%s' — treating as CONDITIONAL", brain_name, vote)
-        vote = "CONDITIONAL"
+    if vote not in ("GO", "NO_GO"):
+        # CONDITIONAL or any invalid vote is treated as NO_GO (Ahmed directive 2026-05-07: no CONDITIONAL)
+        logger.warning("Brain %s returned invalid/CONDITIONAL vote '%s' — treating as NO_GO", brain_name, vote)
+        vote = "NO_GO"
 
     return {
         "vote":          vote,

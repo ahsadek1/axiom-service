@@ -177,8 +177,30 @@ class ScanResult:
         return self.skip_count / self.pool_size
 
     def is_data_failure(self) -> bool:
-        """True if skip rate exceeds 50% — likely a data outage, not normal HOLDs."""
-        return self.skip_rate > 0.50 and self.pool_size >= 5
+        """
+        True if skip rate exceeds 50% due to a real data or pipeline failure.
+
+        Excludes expected non-failure skip reasons:
+          - axiom_standby: Axiom market-closed gate (submissions_open=False after 3:30 PM ET)
+          - stale_ivr / stale_ivr_axiom: after-hours IVR data known to be stale
+          - already_processed: normal dedup, not a failure
+
+        FIX-AXIOM-STANDBY (2026-05-05): Post-market scans all hitting AXIOM_STANDBY
+        is expected behaviour, not a data failure. Without this exclusion, every
+        post-market window fires a false HIGH SKIP RATE alert.
+        """
+        _EXPECTED_SKIP_REASONS = {"axiom_standby", "stale_ivr", "stale_ivr_axiom", "already_processed"}
+        expected_skip_count = sum(
+            count for reason, count in self.skips.items()
+            if reason in _EXPECTED_SKIP_REASONS
+        )
+        real_skip_count = self.skip_count - expected_skip_count
+        # Effective pool = total pool minus tickers that were correctly expected to skip
+        effective_pool = self.pool_size - expected_skip_count
+        if effective_pool < 5:
+            return False  # too few real candidates to judge
+        real_skip_rate = real_skip_count / effective_pool
+        return real_skip_rate > 0.50
 
     def log_skip(self, reason: str) -> None:
         self.skips[reason] = self.skips.get(reason, 0) + 1

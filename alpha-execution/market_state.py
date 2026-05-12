@@ -11,6 +11,7 @@ Authored: 2026-05-02 | Cipher spec + OMNI adversarial review
 from __future__ import annotations
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -108,7 +109,7 @@ async def _fetch_vix_yahoo() -> Optional[float]:
 
 
 async def _fetch_vix_polygon() -> Optional[float]:
-    """Fetch VIX from Polygon (secondary — requires index-entitled plan)."""
+    """Fetch VIX from Polygon indices snapshot (primary — I:VIX, real-time)."""
     import aiohttp
     # NOTE: VIX is I:VIX (index), not a stock. Requires Polygon index data plan.
     url = "https://api.polygon.io/v3/snapshot"
@@ -152,26 +153,26 @@ async def _fetch_vix_fred() -> Optional[float]:
 
 async def get_vix_with_fallback() -> tuple[Optional[float], str]:
     """
-    Fetch VIX: Yahoo Finance primary (no API key), Polygon secondary, FRED tertiary.
+    Fetch VIX: Polygon primary (real-time index), Yahoo secondary, FRED tertiary.
     Returns (vix_value, source_string).
     Returns (None, "unavailable") if all three fail — caller must pause scanning.
     NEVER returns a silent default.
     """
-    vix = await _fetch_vix_yahoo()
-    if vix is not None:
-        return vix, "yahoo"
-
-    logger.warning("Yahoo Finance VIX failed — trying Polygon fallback")
     vix = await _fetch_vix_polygon()
     if vix is not None:
-        return vix, "polygon_fallback"
+        return vix, "polygon"
 
-    logger.warning("Polygon VIX failed — trying FRED fallback")
+    logger.warning("Polygon VIX failed — trying Yahoo fallback")
+    vix = await _fetch_vix_yahoo()
+    if vix is not None:
+        return vix, "yahoo_fallback"
+
+    logger.warning("Yahoo VIX failed — trying FRED fallback")
     vix = await _fetch_vix_fred()
     if vix is not None:
         return vix, "fred_fallback"
 
-    logger.error("All three VIX sources failed (Yahoo, Polygon, FRED)")
+    logger.error("All three VIX sources failed (Polygon, Yahoo, FRED)")
     return None, "unavailable"
 
 

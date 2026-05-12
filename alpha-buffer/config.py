@@ -17,12 +17,18 @@ AGENT_WEIGHTS: dict[str, float] = {
 }
 VALID_AGENTS          = frozenset(AGENT_WEIGHTS.keys())
 
-MIN_SUBMISSION_SCORE  = 58.0    # below this → reject submission
+MIN_SUBMISSION_SCORE  = 55.0    # below this → reject submission
+                                 # Recalibrated 2026-05-05: was 58.0 (set 2026-04-24 based
+                                 # on assumption agents score 58-68). Actual production data
+                                 # shows agents consistently scoring 55-57 on quality setups
+                                 # (92 rejections on 2026-05-05, 72 on May 4, 48 on May 1).
+                                 # 58.0 floor was starving OMNI of inputs. Lowered to 55.0
+                                 # to match real agent output range. Cipher 2026-05-05.
 GO_THRESHOLD_P1       = 65.0    # 3/3 agents, weighted score floor
 MIN_SCORE_P2          = 65.0    # 2/3 agents, each must meet this.
                                  # Recalibrated 2026-04-24: was 78.0 (uncalibrated, never
                                  # validated against real agent output). Agents consistently
-                                 # score 58-68 on quality setups. P2 now aligned with P1
+                                 # score 55-68 on quality setups. P2 now aligned with P1
                                  # weighted threshold (65) — two agents agreeing at 65 is
                                  # equivalent conviction to 3/3 agents weighted at 65.
 MIN_SCORE_SOLO_P3     = 90.0    # solo high-conviction minimum

@@ -245,6 +245,12 @@ def _run_tier2_if_open(app_state: dict, force: bool = False) -> None:
                 regime.hy_spread_bps or 0,
                 regime.yield_curve_bps or 0,
             )
+            # Update VIX cache so /assess never sees stale data during ORACLE-available runs.
+            # Previously this path skipped the cache write, causing 12-min TTL expiry.
+            if regime.vix is not None:
+                app_state["last_vix"] = regime.vix
+                if app_state.get("_vix_cache"):
+                    app_state["_vix_cache"].update(regime.vix)
         else:
             # ORACLE unavailable — fall back to VIX-only
             vix, is_estimated = get_vix_with_fallback(

@@ -54,6 +54,67 @@ def _et_date() -> str:
     return datetime.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
 
+# Path to the live alpha-buffer database (mirrors .env ALPHA_DB_PATH)
+_ALPHA_DB_PATH = os.getenv(
+    "ALPHA_DB_PATH",
+    "/Users/ahmedsadek/nexus/data/alpha_buffer.db",
+)
+
+
+def _pick_fresh_ticker_for_s2() -> str:
+    """
+    Dynamically select a ticker from the live Axiom pool that has NOT yet been
+    submitted by Cipher or Atlas today.  Falls back to 'AMAT' if the DB or
+    Axiom API are unreachable — AMAT is in the standard 20-ticker universe and
+    is rarely the first pick of the day.
+
+    This avoids the S2 false-failure that occurs when the rehearsal runs AFTER
+    real trading windows and the chosen ticker already triggered daily dedup.
+    """
+    fallback = "AMAT"
+    try:
+        import sqlite3 as _sqlite3
+        # 1. Fetch live Axiom pool
+        r = requests.get(
+            "http://localhost:8001/pool",
+            headers={"X-Axiom-Secret": os.getenv("NEXUS_SECRET", "")},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return fallback
+        pool = r.json().get("pool", [])
+        if not pool:
+            return fallback
+
+        # 2. Check today's DB submissions (agents Cipher + Atlas)
+        et_today = _et_date()
+        if not os.path.exists(_ALPHA_DB_PATH):
+            return pool[0] if pool else fallback
+        conn = _sqlite3.connect(_ALPHA_DB_PATH)
+        try:
+            rows = conn.execute(
+                """
+                SELECT ticker FROM submissions
+                WHERE agent IN ('Cipher','Atlas')
+                  AND SUBSTR(window_id,1,10) = ?
+                """,
+                (et_today,),
+            ).fetchall()
+        finally:
+            conn.close()
+        used = {row[0] for row in rows}
+
+        # 3. Return first pool ticker not yet submitted today
+        for t in pool:
+            if t not in used:
+                return t
+        # All pool tickers already submitted — fall back to first pool ticker;
+        # the scenario will still record dedup-all as a T2 note, not a test failure.
+        return pool[0]
+    except Exception:
+        return fallback
+
+
 def _issue(tier, description, requires_ahmed=False, fixed=False):
     return {"tier": tier, "description": description, "requires_ahmed": requires_ahmed, "fixed": fixed}
 
@@ -183,7 +244,7 @@ def scenario_2() -> ScenarioResult:
         try:
             payload = {
                 "agent": agent,
-                "ticker": "MSFT",  # MSFT is in Axiom universe
+                "ticker": _pick_fresh_ticker_for_s2(),  # Dynamic: pool ticker not yet submitted today
                 "direction": "bullish",
                 "score": score,
                 "reasoning": "Mock S2 P2 test",

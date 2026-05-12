@@ -31,10 +31,12 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
+
+# load_dotenv() MUST run before config.py module-level execution reads env vars
+load_dotenv()
+
 from config import REGIME_THRESHOLDS  # Cipher Pass 3 P3-12: import from canonical source
 from universe_full import FULL_UNIVERSE
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,

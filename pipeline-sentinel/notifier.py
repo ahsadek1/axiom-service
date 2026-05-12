@@ -19,7 +19,26 @@ load_dotenv()
 
 logger = logging.getLogger("sentinel.notifier")
 
-_DEDUP_WINDOW_S = 300   # 5 minutes between same-class alerts
+# SENTINEL escalation routing fix (Ahmed, April 22 2026):
+# Critical failures must also route to SOVEREIGN via message bus.
+# Import here — if sentinel can't import its own module, we want a clear error.
+try:
+    from sovereign_escalator import escalate_to_sovereign as _escalate
+except ImportError:
+    _escalate = None  # type: ignore[assignment]
+    logger.warning("sovereign_escalator not available — SOVEREIGN routing disabled")
+
+# Failure classes that warrant SOVEREIGN escalation (not just Ahmed Telegram)
+_SOVEREIGN_ESCALATION_CLASSES = {
+    "PIPELINE_STALL",
+    "AGENT_SILENCE",
+    "COMPLETION_RATE_LOW",
+    "NETWORK_DEGRADED",
+    "SCORE_CRITICAL",
+}
+
+_DEDUP_WINDOW_S          = 1800   # 30 minutes between same-class alerts (was 5 min — caused alert floods)
+_DEDUP_WINDOW_CRITICAL_S = 600    # 10 minutes for critical classes during market hours
 _MAX_RETRIES    = 3
 _BACKOFF_BASE_S = 1
 
@@ -53,12 +72,25 @@ class TelegramNotifier:
         now = time.time()
         last = self._last_sent.get(failure_class, 0.0)
 
-        if now - last < _DEDUP_WINDOW_S:
+        # Use tighter dedup window for critical classes during market hours
+        import datetime
+        import pytz
+        _et = pytz.timezone("America/New_York")
+        _now_et = datetime.datetime.now(_et)
+        _is_market = (
+            _now_et.weekday() < 5
+            and (_now_et.hour * 60 + _now_et.minute) >= 9 * 60 + 30
+            and (_now_et.hour * 60 + _now_et.minute) < 16 * 60
+        )
+        _critical_classes = {"PIPELINE_STALL", "AGENT_SILENCE", "SCORE_CRITICAL"}
+        _window = _DEDUP_WINDOW_CRITICAL_S if (_is_market and failure_class in _critical_classes) else _DEDUP_WINDOW_S
+
+        if now - last < _window:
             logger.debug(
                 "Alert suppressed for %s — last sent %.0fs ago (dedup window=%ds)",
                 failure_class,
                 now - last,
-                _DEDUP_WINDOW_S,
+                _window,
             )
             return
 
@@ -83,6 +115,9 @@ class TelegramNotifier:
                 if resp.status_code == 200:
                     logger.info("Alert sent for failure_class=%s", failure_class)
                     self._last_sent[failure_class] = now
+                    # SENTINEL escalation routing fix: also route to SOVEREIGN for critical classes
+                    if _escalate and failure_class in _SOVEREIGN_ESCALATION_CLASSES:
+                        _escalate(message=message, level="WARNING", dedup_key=failure_class)
                     return
                 logger.warning(
                     "Telegram returned %d on attempt %d for %s",
@@ -101,3 +136,52 @@ class TelegramNotifier:
             "Failed to send Telegram alert for %s after %d attempts",
             failure_class, _MAX_RETRIES,
         )
+
+        # SENTINEL escalation routing fix:
+        # Also route critical failure classes to SOVEREIGN via NNS message bus.
+        # This runs after Telegram delivery (not instead of it) so Ahmed and
+        # SOVEREIGN both receive the alert.
+        if _escalate and failure_class in _SOVEREIGN_ESCALATION_CLASSES:
+            _escalate(
+                message=message,
+                level="CRITICAL" if "STALL" in failure_class or "SILENCE" in failure_class else "WARNING",
+                dedup_key=failure_class,
+            )
+        elif _escalate is None:
+            logger.debug("sovereign_escalator unavailable — SOVEREIGN routing skipped")
+
+    def send_resolved(self, failure_class: str, detail: str = "") -> None:
+        """
+        Send a single 'RESOLVED' notification when a failure class clears.
+
+        This is the partner to send_alert: Ahmed gets told when something is fixed,
+        not just when it breaks. Uses its own dedup key so it never suppresses.
+
+        Args:
+            failure_class: The failure class that has resolved.
+            detail:        Optional resolution detail (e.g. score, action taken).
+        """
+        # Only fire resolved if we actually sent an alert for this failure recently (last 8h)
+        last_alert = self._last_sent.get(failure_class, 0.0)
+        if time.time() - last_alert > 28800:  # 8 hours — no recent alert, skip
+            return
+
+        resolve_key = f"RESOLVED_{failure_class}"
+        now = time.time()
+        last = self._last_sent.get(resolve_key, 0.0)
+        if now - last < 300:   # Don't spam resolved either
+            return
+
+        detail_str = f" — {detail}" if detail else ""
+        message = f"✅ *RESOLVED: {failure_class}*{detail_str}"
+        url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
+        import re
+        safe_message = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', message)
+        payload = {"chat_id": self._chat_id, "text": safe_message, "parse_mode": "MarkdownV2"}
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                logger.info("Resolved notification sent for %s", failure_class)
+                self._last_sent[resolve_key] = now
+        except Exception as exc:
+            logger.warning("Failed to send resolved notification for %s: %s", failure_class, exc)

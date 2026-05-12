@@ -35,6 +35,9 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import psutil
 import requests
+import sys as _sys
+_sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+from alert_client import send_alert as _send_alert
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -248,21 +251,19 @@ def _init_healing_db(path: str) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 def _send_telegram(message: str, tier: int = 2) -> None:
-    """Send Telegram message to Ahmed. tier=1 → silent."""
+    """Route alert through Alert Broker. tier=1 → silent."""
     if tier < 2:
         return
-    prefix = {2: "🔧", 3: "⚠️", 4: "🚨"}.get(tier, "ℹ️")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_AHMED_CHAT_ID,
-            "text": f"{prefix} *GUARDIAN v3*\n\n{message}",
-            "parse_mode": "Markdown",
-        }, timeout=10)
-        if not resp.ok:
-            log.error("Telegram failed: %s", resp.status_code)
-    except requests.RequestException as exc:
-        log.error("Telegram error: %s", exc)
+    level_map = {2: "WARNING", 3: "CRITICAL", 4: "CRITICAL"}
+    level = level_map.get(tier, "WARNING")
+    targets = ["ahmed", "nexus_health_group"] if tier >= 3 else ["nexus_health_group"]
+    _send_alert(
+        source="guardian-angel-v3",
+        level=level,
+        title=message[:200],
+        body=message[200:] if len(message) > 200 else "",
+        targets=targets,
+    )
 
 
 # ---------------------------------------------------------------------------

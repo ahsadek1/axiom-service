@@ -8,4 +8,4 @@ if [ -f ".env" ]; then
   source .env
   set +a
 fi
-exec .venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8008}" --log-level info
+exec /usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8008}" --log-level info

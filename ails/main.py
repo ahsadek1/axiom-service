@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 import config
 from database import init_ails_db, init_backtest_db
+from failure import error_response  # G6: structured failure disclosure
 from regime import get_current_regime, classify_vix
 from bayesian import get_win_rate, ingest_outcome
 from patterns import store_pattern, find_similar
@@ -25,6 +26,9 @@ from reports import (
     generate_eod_report, deliver_eod_report,
     generate_eow_report, deliver_eow_report,
 )
+import sys as _sys_wd
+_sys_wd.path.insert(0, "/Users/ahmedsadek/nexus")
+from shared.watchdog import Watchdog
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -110,6 +114,8 @@ class ContextResponse(BaseModel):
 # Lifespan
 # ---------------------------------------------------------------------------
 
+_nns_watchdog = Watchdog("ails")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize DBs on startup."""
@@ -118,6 +124,7 @@ async def lifespan(app: FastAPI):
     _ails_conn = init_ails_db(config.AILS_DB_PATH)
     _backtest_conn = init_backtest_db(config.BACKTEST_DB_PATH)
     log.info("AILS ready — port %d", config.PORT)
+    _nns_watchdog.start()
     yield
     log.info("AILS shutting down")
     # OMNI H1 fix: drain in-flight background calibration tasks before closing DB.
@@ -313,21 +320,61 @@ def get_context(
     ails = get_ails_conn()
     backtest = get_backtest_conn()
 
+    # G6: fail fast with structured response if DB connections are unavailable
+    if ails is None or backtest is None:
+        return JSONResponse(
+            status_code=503,
+            content=error_response(
+                "DB_CONNECTION_NONE",
+                f"/context/{ticker}",
+                "AILS DB connection unavailable — service may be initializing",
+                ticker=ticker,
+            ),
+        )
+
     if regime is None:
         regime_info = get_current_regime()
         regime = regime_info.get("regime", "UNKNOWN")
 
     # Adversarial fix #3: all DB reads serialized on _db_lock to avoid concurrent
     # read/write conflicts on the shared global connection.
-    with _db_lock:
-        win_data = get_win_rate(ticker, strategy, regime, direction, ails, backtest)
+    # G6: wrap DB access in try/except to return structured failure response
+    try:
+        with _db_lock:
+            win_data = get_win_rate(ticker, strategy, regime, direction, ails, backtest)
 
-        # Calibration for all agents
-        cal_rows = ails.execute(
-            "SELECT agent, predicted_confidence, actual_win_rate, n "
-            "FROM agent_calibration WHERE strategy=? AND regime=?",
-            (strategy, regime),
-        ).fetchall()
+            # Calibration for all agents
+            cal_rows = ails.execute(
+                "SELECT agent, predicted_confidence, actual_win_rate, n "
+                "FROM agent_calibration WHERE strategy=? AND regime=?",
+                (strategy, regime),
+            ).fetchall()
+    except Exception as exc:
+        log.error("AILS /context/%s DB error: %s", ticker, exc)
+        err_type = (
+            "BACKTEST_DB_UNAVAILABLE"
+            if "backtest" in str(exc).lower()
+            else "AILS_DB_UNAVAILABLE"
+        )
+        return JSONResponse(
+            status_code=503,
+            content=error_response(
+                err_type, f"/context/{ticker}",
+                f"DB error reading context: {type(exc).__name__}",
+                ticker=ticker,
+            ),
+        )
+
+    # G6: if ticker had no backtest rows, win_data source will be 'missing'
+    if win_data.get("source") == "missing" and win_data.get("sample_count", 0) == 0:
+        return JSONResponse(
+            status_code=404,
+            content=error_response(
+                "TICKER_NOT_IN_BACKTEST", f"/context/{ticker}",
+                f"No historical data for ticker '{ticker}'",
+                ticker=ticker,
+            ),
+        )
 
     calibration = {
         row["agent"]: {
@@ -367,9 +414,38 @@ def get_similar(
     _verify_auth(x_ails_secret)
     ails = get_ails_conn()
 
+    # G6: structured failure if DB unavailable
+    if ails is None:
+        return JSONResponse(
+            status_code=503,
+            content=error_response(
+                "DB_CONNECTION_NONE", f"/similar/{ticker}",
+                "AILS DB unavailable", ticker=ticker,
+            ),
+        )
+
     # Basic vector: use regime/strategy defaults
     setup_vector = {"iv_rank": 0.5, "rsi": 50.0, "momentum": 0.0}
-    similar = find_similar(setup_vector, regime, strategy, ails)
+    try:
+        similar = find_similar(setup_vector, regime, strategy, ails)
+    except Exception as exc:
+        log.error("AILS /similar/%s pattern search error: %s", ticker, exc)
+        return JSONResponse(
+            status_code=503,
+            content=error_response(
+                "PATTERN_SEARCH_FAIL", f"/similar/{ticker}",
+                f"Pattern search failed: {type(exc).__name__}", ticker=ticker,
+            ),
+        )
+
+    if not similar:
+        return JSONResponse(
+            status_code=404,
+            content=error_response(
+                "PATTERN_SEARCH_FAIL", f"/similar/{ticker}",
+                "No similar historical setups found", ticker=ticker,
+            ),
+        )
 
     return JSONResponse({
         "ticker": ticker,
@@ -393,18 +469,41 @@ def get_calibration(
     _verify_auth(x_ails_secret)
     ails = get_ails_conn()
 
-    rows = ails.execute(
-        "SELECT strategy, regime, predicted_confidence, actual_win_rate, n "
-        "FROM agent_calibration WHERE agent=?",
-        (agent,),
-    ).fetchall()
+    # G6: structured failure if DB unavailable
+    if ails is None:
+        return JSONResponse(
+            status_code=503,
+            content=error_response(
+                "DB_CONNECTION_NONE", f"/calibration/{agent}",
+                "AILS DB unavailable",
+            ),
+        )
+
+    try:
+        rows = ails.execute(
+            "SELECT strategy, regime, predicted_confidence, actual_win_rate, n "
+            "FROM agent_calibration WHERE agent=?",
+            (agent,),
+        ).fetchall()
+    except Exception as exc:
+        log.error("AILS /calibration/%s DB error: %s", agent, exc)
+        return JSONResponse(
+            status_code=503,
+            content=error_response(
+                "AILS_DB_UNAVAILABLE", f"/calibration/{agent}",
+                f"DB error: {type(exc).__name__}",
+            ),
+        )
 
     if not rows:
-        return JSONResponse({
-            "agent": agent,
-            "status": "no_data",
-            "message": "No calibration data yet — submit trade outcomes via POST /outcome",
-        })
+        # G6: structured missing-data response (not a 200 with status:no_data)
+        return JSONResponse(
+            status_code=404,
+            content=error_response(
+                "AGENT_CALIBRATION_MISSING", f"/calibration/{agent}",
+                f"No calibration data for agent '{agent}'",
+            ),
+        )
 
     total_n = sum(r["n"] for r in rows)
     avg_error = sum(

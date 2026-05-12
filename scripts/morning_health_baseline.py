@@ -29,6 +29,9 @@ import time
 
 import requests
 from zoneinfo import ZoneInfo
+import sys as _sys
+_sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+from alert_client import send_alert as _send_alert
 
 ET = ZoneInfo("America/New_York")
 
@@ -52,14 +55,14 @@ logger = logging.getLogger("morning_baseline")
 
 
 def _telegram(msg: str) -> None:
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": AHMED_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10,
-        )
-    except Exception:
-        pass
+    """Route through Alert Broker."""
+    _send_alert(
+        source="morning-health-baseline",
+        level="CRITICAL",
+        title=msg[:200],
+        body=msg[200:] if len(msg) > 200 else "",
+        targets=["ahmed", "nexus_health_group"],
+    )
 
 
 def check_and_fix() -> list:

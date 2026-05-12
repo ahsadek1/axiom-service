@@ -20,6 +20,50 @@ from typing import Optional
 
 logger = logging.getLogger("sage.buffer")
 
+# ── Axiom universe preflight cache ────────────────────────────────────────────
+# GENESIS-UNIVERSE-FILTER-001 2026-05-05: Pre-submission universe check.
+# Agents were submitting tickers (e.g. GOOG, GOOGL) not in the Axiom universe,
+# wasting buffer HTTP cycles and generating C-01 rejection noise.
+# Fail-open: if Axiom unreachable, proceed (buffer's C-01 is the authoritative backstop).
+_universe_cache: list = []
+_universe_cache_ts: float = 0.0
+_UNIVERSE_CACHE_TTL: float = 300.0  # 5 minutes
+_universe_lock = threading.Lock()
+
+
+def _get_axiom_universe() -> list:
+    """Fetch and cache Axiom universe tickers. Returns [] on any error (fail-open)."""
+    global _universe_cache, _universe_cache_ts
+    with _universe_lock:
+        if time.time() - _universe_cache_ts < _UNIVERSE_CACHE_TTL and _universe_cache:
+            return _universe_cache
+    try:
+        axiom_url = os.getenv("AXIOM_URL", "http://localhost:8001")
+        axiom_secret = os.getenv("AXIOM_SECRET", "")
+        r = requests.get(
+            f"{axiom_url}/universe",
+            headers={"X-Axiom-Secret": axiom_secret},
+            timeout=3,
+        )
+        if r.status_code == 200:
+            tickers = r.json().get("tickers", [])
+            if tickers:
+                with _universe_lock:
+                    _universe_cache = tickers
+                    _universe_cache_ts = time.time()
+                return tickers
+    except Exception:
+        pass
+    return []  # fail-open: empty list = skip check
+
+
+def _ticker_in_universe(ticker: str) -> bool:
+    """True if ticker is in Axiom universe, or universe is unavailable (fail-open)."""
+    universe = _get_axiom_universe()
+    if not universe:
+        return True  # fail-open: can't confirm exclusion
+    return ticker in universe
+
 SUBMIT_TIMEOUT_S = 10
 RETRY_DELAY_S = 30
 
@@ -111,6 +155,9 @@ def submit_to_alpha(
     Returns:
         True if submitted to local buffer successfully, False otherwise.
     """
+    if not _ticker_in_universe(ticker):
+        logger.debug("Alpha skip %s/%s: ticker not in Axiom universe (pre-filter)", ticker, direction)
+        return False
     if score < ALPHA_MIN_SCORE:
         logger.debug("Alpha skip %s/%s: score %.1f < %.1f", ticker, direction, score, ALPHA_MIN_SCORE)
         return False
@@ -125,55 +172,125 @@ def submit_to_alpha(
     if window_id:
         payload["window_id"] = window_id  # GENESIS concordance-window-fix
 
-    # Fire Railway submission in background (non-blocking)
-    # Railway V1 validator requires strategy + confidence (mapped from score)
-    # for non-neutral picks. Derive strategy from direction so Phase 2
-    # validation passes the required-fields check. [GENESIS 2026-04-20]
+    # Fire Railway submission in background (non-blocking).
+    # GENESIS 2026-05-08: Railway /submit hard-rejects (422) if expiry, strike_entry,
+    # or strike_target are None. Fixed with multi-fallback price resolution + proper
+    # strike spread calculation. strike_target was previously hardcoded to None — fixed.
     _railway_strategy = "bull_put" if direction == "bullish" else "bear_call"
-    # V3 fix (2026-04-28): Railway v3 requires expiry + strike_entry for alpha arena.
+
     import datetime as _dt
-    def _nearest_friday_expiry(min_dte=28, max_dte=38):
+
+    def _nearest_friday_expiry(min_dte: int = 28, max_dte: int = 45) -> str:
+        """Return nearest Friday expiry between min_dte and max_dte days out."""
         today = _dt.date.today()
         for d in range(min_dte, max_dte + 1):
             candidate = today + _dt.timedelta(days=d)
-            if candidate.weekday() == 4:
+            if candidate.weekday() == 4:  # Friday
                 return candidate.strftime("%Y-%m-%d")
         return (today + _dt.timedelta(days=min_dte)).strftime("%Y-%m-%d")
-    def _get_atm_strike(sym, direction):
+
+    def _resolve_stock_price(sym: str) -> float:
+        """
+        Resolve current stock price via multiple fallbacks.
+        Polygon snapshot -> Polygon daily bars -> Axiom -> $100 last resort.
+        Never raises. Always returns a positive float.
+        """
+        _poly_key = os.getenv("POLYGON_API_KEY", "")
+
+        # 1. Polygon snapshot (real-time)
+        if _poly_key:
+            try:
+                r = requests.get(
+                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}",
+                    params={"apiKey": _poly_key}, timeout=5,
+                )
+                if r.status_code == 200:
+                    snap = r.json()
+                    price = (
+                        snap.get("ticker", {}).get("day", {}).get("c") or
+                        snap.get("ticker", {}).get("lastTrade", {}).get("p")
+                    )
+                    if price and float(price) > 0:
+                        return float(price)
+            except Exception:
+                pass
+
+        # 2. Polygon daily bars fallback
+        if _poly_key:
+            try:
+                today = _dt.date.today()
+                from_d = (today - _dt.timedelta(days=5)).isoformat()
+                r2 = requests.get(
+                    f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{today.isoformat()}",
+                    params={"adjusted": "true", "sort": "desc", "limit": 3, "apiKey": _poly_key},
+                    timeout=5,
+                )
+                if r2.status_code == 200:
+                    bars = r2.json().get("results", [])
+                    if bars and float(bars[0]["c"]) > 0:
+                        return float(bars[0]["c"])
+            except Exception:
+                pass
+
+        # 3. Axiom price cache (local service — always available on Mac mini)
         try:
-            import requests as _req
-            _poly_key = os.getenv("POLYGON_API_KEY", "ZMEnZ_2GURw_UqbufU5npd49ZDeptMhl")
-            resp = _req.get(
-                f"https://api.polygon.io/v2/aggs/ticker/{sym}/prev?adjusted=true&apiKey={_poly_key}",
-                timeout=5,
+            axiom_url = os.getenv("AXIOM_URL", "http://localhost:8001")
+            axiom_secret = os.getenv("AXIOM_SECRET", "")
+            r3 = requests.get(
+                f"{axiom_url}/price/{sym}",
+                headers={"X-Axiom-Secret": axiom_secret},
+                timeout=3,
             )
-            if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                if results:
-                    price = float(results[0]["c"])
-                    if direction == "bullish":
-                        return round(price * 0.95 / 5) * 5
-                    else:
-                        return round(price * 1.05 / 5) * 5
+            if r3.status_code == 200:
+                price = r3.json().get("price") or r3.json().get("last_price")
+                if price and float(price) > 0:
+                    return float(price)
         except Exception:
             pass
-        return None
+
+        # 4. Last resort: $100 placeholder (Railway auto-resolver corrects at execution)
+        logger.warning(
+            "[Railway] Cannot resolve price for %s — using $100 fallback for strike calc", sym
+        )
+        return 100.0
+
+    def _resolve_strikes(sym: str, dir_: str, price: float) -> tuple:
+        """
+        Compute (strike_entry, strike_target) from current price. Never returns None.
+        bull_put: sell put ~5% OTM below price, buy put 5pts lower
+        bear_call: sell call ~5% OTM above price, buy call 5pts higher
+        """
+        _ETF_LIST = {"SPY", "QQQ", "IWM", "XLK", "XLF", "XLV", "XLE", "TLT", "GLD", "SOXX"}
+        _round_to = 5 if sym in _ETF_LIST else 1
+        _spread_width = _round_to * 5  # 25pts ETF, 5pts equity
+
+        if dir_ == "bullish":
+            entry  = round(price * 0.95 / _round_to) * _round_to
+            target = entry - _spread_width
+        else:
+            entry  = round(price * 1.05 / _round_to) * _round_to
+            target = entry + _spread_width
+
+        return float(entry), float(target)
+
     _expiry = _nearest_friday_expiry()
-    _strike = _get_atm_strike(ticker, direction)
+    _price  = _resolve_stock_price(ticker)
+    _strike_entry, _strike_target = _resolve_strikes(ticker, direction, _price)
+
     _submit_to_railway_async({
-        "agent":      agent,
-        "ticker":     ticker,
-        "direction":  direction,
-        "score":      score,
-        "confidence": int(score),
-        "strategy":   _railway_strategy,
-        "reasoning":  reasoning,
-        "arena":    "alpha",
-        "round":    1,
-        "r1_score": score,
-        "expiry":       _expiry,
-        "strike_entry": _strike,
-        "strike_target": None,
+        "agent":         agent,
+        "ticker":        ticker,
+        "direction":     direction,
+        "score":         score,
+        "confidence":    int(score),
+        "strategy":      _railway_strategy,
+        "reasoning":     reasoning,
+        "arena":         "alpha",
+        "round":         1,
+        "r1_score":      score,
+        "expiry":        _expiry,
+        "strike_entry":  _strike_entry,
+        "strike_target": _strike_target,
     })
 
     return _submit(payload, f"{alpha_buffer_url}/submit", alpha_headers, "Alpha")

@@ -8,6 +8,7 @@ Tier 3: OMNI + Cipher AI diagnosis (3 min after Tier 2)
 
 import logging
 import subprocess
+import sys
 import time
 from datetime import datetime
 
@@ -23,24 +24,54 @@ from omni_consult import run_tier3_consult
 
 log = logging.getLogger("sentinel.escalation")
 
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+# Route through alert broker (dedup + rate limiting)
+try:
+    sys.path.insert(0, "/Users/ahmedsadek/nexus")
+    from shared.alert_client import send_alert as _broker_send
+    _BROKER_OK = True
+except Exception as _be:
+    _BROKER_OK = False
+    log.warning("escalation: alert_client unavailable, falling back to direct Telegram: %s", _be)
 
 
 def _now_str() -> str:
     return datetime.now(ET).strftime("%H:%M ET")
 
 
-def _telegram(text: str) -> bool:
-    """Send a Telegram message to Ahmed."""
+# Tier labels → broker levels
+_TIER_LEVELS = {1: "WARNING", 2: "WARNING", 3: "CRITICAL"}
+
+
+def _telegram(text: str, tier: int = 2) -> bool:
+    """Send alert through broker (dedup) with direct Telegram fallback."""
+    level = _TIER_LEVELS.get(tier, "WARNING")
+    # Ahmed DM only for Tier 3; Tier 1/2 go to health group only
+    targets = ["ahmed", "nexus_health_group"] if tier >= 3 else ["nexus_health_group"]
+
+    if _BROKER_OK:
+        try:
+            _broker_send(
+                source="sentinel",
+                level=level,
+                title=text[:200],
+                body=text[200:] if len(text) > 200 else "",
+                dedup_key=f"sentinel:{text[:80]}",
+                targets=targets,
+            )
+            return True
+        except Exception as _be:
+            log.warning("escalation: broker send failed: %s", _be)
+
+    # Fallback: direct Telegram to Ahmed
     try:
         resp = requests.post(
-            TELEGRAM_URL,
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
         return resp.status_code == 200
     except Exception as e:
-        log.error("Telegram send failed: %s", e)
+        log.error("Telegram fallback failed: %s", e)
         return False
 
 
@@ -250,7 +281,8 @@ def run_escalation(component: str, failure_detail: str) -> None:
         _telegram(
             f"✅ <b>SENTINEL — GENESIS Fixed It</b>\n"
             f"Component: <code>{component}</code> is healthy.\n"
-            f"Time: {_now_str()}"
+            f"Time: {_now_str()}",
+            tier=2,
         )
         return
 
@@ -261,7 +293,8 @@ def run_escalation(component: str, failure_detail: str) -> None:
         f"Component: <code>{component}</code>\n"
         f"GENESIS has not resolved this in {(TIER2_WAIT_SECONDS + TIER3_WAIT_SECONDS) // 60} minutes.\n"
         f"Requesting independent AI diagnosis now.\n"
-        f"Time: {_now_str()}"
+        f"Time: {_now_str()}",
+        tier=3,
     )
 
     result = run_tier3_consult(component, failure_detail, log_tail, actions_tried)
@@ -271,7 +304,8 @@ def run_escalation(component: str, failure_detail: str) -> None:
         f"🔬 <b>SENTINEL — AI Diagnosis Complete</b>\n"
         f"Component: <code>{component}</code>\n\n"
         f"<b>Recommendations:</b>\n{summary}\n\n"
-        f"Time: {_now_str()}"
+        f"Time: {_now_str()}",
+        tier=3,
     )
 
     log.error(

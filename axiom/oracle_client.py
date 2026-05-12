@@ -94,7 +94,9 @@ def get_macro_data(timeout: float = 5.0) -> Optional[Dict[str, Any]]:
         )
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("data") or data  # handle both wrapped and bare responses
+            # ORACLE /oracle/macro returns {"macro": {...}, "data_freshness": ...}
+            # Fall back to bare dict for legacy compatibility
+            return data.get("macro") or data.get("data") or data
         logger.warning("ORACLE macro endpoint returned %d", resp.status_code)
         return None
     except requests.exceptions.Timeout:

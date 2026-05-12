@@ -17,6 +17,8 @@ Routing hierarchy:
 """
 
 import logging
+import os
+import sys
 import time
 from typing import Dict, Optional
 
@@ -24,6 +26,14 @@ import requests
 
 import config
 from models import AlertTier
+
+# Alert Broker client — route all alerts through broker for dedup/batching
+sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+try:
+    from alert_client import send_alert as _broker_send
+    _BROKER_AVAILABLE = True
+except ImportError:
+    _BROKER_AVAILABLE = False
 
 logger = logging.getLogger("integrity.notifier")
 

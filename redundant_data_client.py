@@ -44,7 +44,7 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(level
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ORATS_KEY    = os.getenv("ORATS_API_KEY") or os.getenv("ORATS_TOKEN")
-POLYGON_KEY  = os.getenv("POLYGON_API_KEY", "OaxOzJMu_JZpl7uF64L7FyhowSZtwcvI")
+POLYGON_KEY  = os.getenv("POLYGON_API_KEY", "ZMEnZ_2GURw_UqbufU5npd49ZDeptMhl")
 ALPACA_KEY   = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SEC   = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_DATA  = "https://data.alpaca.markets"

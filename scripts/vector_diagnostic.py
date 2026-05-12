@@ -72,6 +72,7 @@ TELEGRAM_BOT_TOKEN        = _require("TELEGRAM_BOT_TOKEN")
 TELEGRAM_BOT_TOKEN_VECTOR = _require("TELEGRAM_BOT_TOKEN")  # same token, alias
 HEALTH_GROUP = "-5241272802"
 MESSAGE_BUS = "http://192.168.1.141:9999"
+ALERT_BROKER = "http://192.168.1.141:8099"
 LOG_BASE = "/Users/ahmedsadek/nexus/logs"
 CHRONICLE_DB = "/Users/ahmedsadek/nexus/data/chronicle.db"
 
@@ -141,6 +142,18 @@ def send_telegram(chat_id: str, message: str) -> None:
         )
     except Exception:
         pass
+
+
+def post_alert_broker(message: str, level: str = "high", key: str = None) -> None:
+    """Route alert through Alert Broker (.141:9998). Fail-safe — never raises."""
+    try:
+        payload = {"source": "vector-diagnostic", "level": level, "message": message}
+        if key:
+            payload["key"] = key
+        requests.post(f"{ALERT_BROKER}/alert", json=payload, timeout=5)
+    except Exception as e:
+        log.warning("Alert Broker unreachable — falling back to direct Telegram: %s", e)
+        send_telegram(HEALTH_GROUP, message)
 
 
 def restart_service(label: str, service_name: str) -> bool:
@@ -290,21 +303,33 @@ def check_chronicle_reachable() -> Optional[str]:
 
 
 def check_vector_heartbeat_failures() -> Optional[str]:
-    """Read vector.log and return alert if consecutive heartbeat failures >= 5.
+    """Read vector.log and return alert if consecutive heartbeat failures >= 5
+    AND the last failure was recent (within 30 minutes).
     Catches CHRONICLE-down storms before they spam the group for hours.
+    Ignores stale failure counts from previous worker runs.
     """
+    import re
+    from datetime import datetime, timezone, timedelta
     vector_log = "/Users/ahmedsadek/vector/vector.log"
     try:
         with open(vector_log, "r") as f:
             lines = f.readlines()
-        # Find the most recent consecutive count
+        # Find the most recent consecutive count entry
         for line in reversed(lines):
             if "consecutive=" in line:
-                import re
                 m = re.search(r"consecutive=(\d+)", line)
                 if m:
                     count = int(m.group(1))
                     if count >= 5:
+                        # Parse timestamp from log line (format: YYYY-MM-DD HH:MM:SS,mmm)
+                        ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                        if ts_match:
+                            entry_time = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
+                            entry_time = entry_time.replace(tzinfo=timezone.utc)
+                            age = datetime.now(timezone.utc) - entry_time
+                            if age > timedelta(minutes=30):
+                                # Stale — from a previous worker run, not an active failure
+                                return None
                         return f"VECTOR_HEARTBEAT_FAILURES: {count} consecutive failures — CHRONICLE likely down"
                 break
     except Exception:
@@ -351,7 +376,7 @@ def act_on_down_services(
                    f"— restart deferred, escalating to SOVEREIGN")
             log.warning(msg)
             post_bus("sovereign", msg)
-            send_telegram(HEALTH_GROUP, msg)
+            post_alert_broker(msg, level="critical", key=f"vector-down-positions-{name}")
             continue
 
         # Restart
@@ -378,12 +403,12 @@ def act_on_down_services(
             log.info(msg)
             post_bus("sovereign", msg)
             if not recovered:
-                send_telegram(HEALTH_GROUP, msg)
+                post_alert_broker(msg, level="critical", key=f"vector-restart-failed-{name}")
             log_to_chronicle(f"{name}_DOWN: {detail}", f"Restarted via launchctl", outcome)
         else:
             msg = f"🚨 VECTOR: {name} DOWN, restart FAILED — escalating"
             post_bus("sovereign", msg)
-            send_telegram(HEALTH_GROUP, msg)
+            post_alert_broker(msg, level="critical", key=f"vector-restart-failed-{name}")
             log_to_chronicle(f"{name}_DOWN: {detail}", "Restart failed", "unsolved")
 
 
@@ -460,15 +485,18 @@ def main() -> None:
         for issue in resource_issues:
             log.warning("Resource issue: %s", issue)
             post_bus("sovereign", f"⚠️ VECTOR RESOURCE: {issue}")
+            post_alert_broker(f"⚠️ VECTOR RESOURCE: {issue}", level="high", key=f"vector-resource-{issue[:40]}")
             log_to_chronicle(issue, "Flagged to SOVEREIGN", "in_progress")
 
     if bus_issue:
         log.error("Message bus: %s", bus_issue)
         post_bus("sovereign", f"🚨 VECTOR: {bus_issue}")
+        post_alert_broker(f"🚨 VECTOR BUS: {bus_issue}", level="critical", key="vector-bus-down")
 
     if chronicle_issue:
         log.error("CHRONICLE: %s", chronicle_issue)
         post_bus("sovereign", f"🚨 VECTOR DIAGNOSTIC: {chronicle_issue} — SOVEREIGN must restart CHRONICLE on 192.168.1.42. VECTOR has no restart authority on that machine.")
+        post_alert_broker(f"🚨 VECTOR CHRONICLE: {chronicle_issue}", level="critical", key="vector-chronicle-down")
         log_to_chronicle(chronicle_issue, "Escalated to SOVEREIGN — outside VECTOR jurisdiction", "in_progress")
 
     if heartbeat_issue:
@@ -476,6 +504,7 @@ def main() -> None:
         # Only alert if chronicle_issue not already caught (avoid duplicate)
         if not chronicle_issue:
             post_bus("sovereign", f"🚨 VECTOR: {heartbeat_issue}")
+            post_alert_broker(f"🚨 VECTOR HEARTBEAT: {heartbeat_issue}", level="high", key="vector-heartbeat-failures")
 
     if bus_directives:
         act_on_bus_directives(bus_directives)

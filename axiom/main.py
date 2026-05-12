@@ -27,6 +27,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).parent.parent))
 from shared.sovereign_comms import get_instructions, report
+from shared.watchdog import Watchdog
 
 # ── Axiom 30% Resilience Layer ─────────────────────────────────────────────
 from resilience.state import make_vix_cache, make_regime_cache
@@ -184,6 +185,8 @@ def _axiom_preflight_retry_loop() -> None:
             return
 
 
+_nns_watchdog = Watchdog("axiom")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """FastAPI lifespan — initialize DB and start scheduler on startup."""
@@ -289,6 +292,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _instr = get_instructions("axiom")
     if _instr:
         logger.info("Axiom: %d instruction(s) from SOVEREIGN on startup", len(_instr))
+    _nns_watchdog.start()
 
     yield
 

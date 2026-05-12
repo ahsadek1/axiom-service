@@ -32,6 +32,7 @@ import sys as _sys_p
 import os.path as _osp
 _sys_p.path.insert(0, _osp.join(_osp.dirname(_osp.abspath(__file__)), ".."))
 from shared.service_state import ServiceStateWriter as _ServiceStateWriter
+from shared.watchdog import Watchdog
 from shared.resilience.state import FreshValue as _FreshValue
 from datetime import timedelta as _timedelta
 
@@ -490,6 +491,8 @@ def _is_market_hours() -> bool:
            now.replace(hour=16, minute=0, second=0, microsecond=0)
 
 
+_nns_watchdog = Watchdog("prime-execution")
+
 @asynccontextmanager
 async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
     """Initialize DB and start exit monitor + reconciler scheduler."""
@@ -588,6 +591,16 @@ async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
     _instr = get_instructions("prime_execution")
     if _instr:
         logger.info("Prime Execution: %d instruction(s) from SOVEREIGN on startup", len(_instr))
+
+    # ── TCA Tracker schema init (Institutional Gap 3) ────────────────────────
+    try:
+        from tca_tracker import init_tca_schema
+        init_tca_schema(settings.prime_db_path)
+        logger.info("[TCA] Schema ready")
+    except Exception as _tca_err:
+        logger.warning("[TCA] Schema init failed (non-fatal): %s", _tca_err)
+    _nns_watchdog.start()
+
     yield
     scheduler.shutdown(wait=False)
     logger.info("Prime Execution stopped")
@@ -926,6 +939,51 @@ def execute(
     # Adversarial fix #8: Alpaca paper supports fractional shares (2 decimal places).
     # Round to 2 dp; enforce minimum of 1 share to prevent micro-lot orders.
     shares = round(max(1.0, body.position_size_usd / current_price), 2)
+
+    # ── Correlation Gate (GENESIS 2026-05-07) ────────────────────────────────────
+    # Check incoming ticker against all open positions. Adjust size or block.
+    try:
+        from correlation_tracker import evaluate_correlation_gate, init_correlation_schema
+        init_correlation_schema(settings.prime_db_path)
+        _open_tickers_p = [p["ticker"] for p in get_open_positions(settings.prime_db_path)]
+        _corr_result_p = evaluate_correlation_gate(
+            new_ticker            = body.ticker,
+            direction             = body.direction,
+            open_position_tickers = _open_tickers_p,
+            db_path               = settings.prime_db_path,
+            polygon_api_key       = os.getenv("POLYGON_API_KEY", ""),
+            telegram_bot_token    = settings.telegram_bot_token,
+            telegram_chat_id      = settings.ahmed_chat_id,
+        )
+        if _corr_result_p.gate_decision == "BLOCK":
+            logger.warning(
+                "CORRELATION GATE BLOCK: %s max_corr=%.3f — order rejected",
+                body.ticker, _corr_result_p.max_correlation,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "executed":        False,
+                    "reason":          f"Correlation BLOCK: {body.ticker} has max_corr={_corr_result_p.max_correlation:.3f} with open positions",
+                    "gate":            "correlation",
+                    "max_correlation": _corr_result_p.max_correlation,
+                    "existing_tickers": _corr_result_p.existing_tickers,
+                },
+            )
+        if _corr_result_p.size_adjustment < 1.0:
+            _old_shares = shares
+            shares = round(shares * _corr_result_p.size_adjustment, 2)
+            shares = max(1.0, shares)  # minimum 1 share always
+            _position_size_usd_p = body.position_size_usd * _corr_result_p.size_adjustment
+            logger.info(
+                "CORRELATION GATE REDUCE: %s max_corr=%.3f → shares %.2f→%.2f size_adj=%.2fx",
+                body.ticker, _corr_result_p.max_correlation, _old_shares, shares,
+                _corr_result_p.size_adjustment,
+            )
+    except Exception as _corr_exc_p:
+        logger.warning(
+            "Correlation gate failed (non-fatal, execution continues): %s", _corr_exc_p
+        )
 
     # ── Atomic limit check + PENDING slot reservation (Cipher Finding 1+2 fix) ─
     import json as _json
@@ -1378,6 +1436,24 @@ def sovereign_directive(
         return JSONResponse({"ok": False, "error": f"unrecognized directive: {d}"}, status_code=400)
 
 
+
+
+# ── TCA (Institutional Gap 3) ───────────────────────────────────────────────
+@app.get("/tca")
+def prime_tca_endpoint(
+    secret: str = Header(None, alias="X-Nexus-Prime-Secret")
+):
+    """Transaction Cost Analysis: recent records + today's summary."""
+    if secret != settings.nexus_prime_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        from tca_tracker import get_recent_records, get_daily_summary
+        return {
+            "summary": get_daily_summary(settings.prime_db_path),
+            "records": get_recent_records(settings.prime_db_path, limit=50),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── GAP-006: /log_tail — Runtime log access (2026-04-27) ─────────────────────

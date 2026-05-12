@@ -46,6 +46,9 @@ from database import (
     save_concordance_result,
 )
 from omni_client import dispatch_to_omni
+import sys as _sys_wd
+_sys_wd.path.insert(0, "/Users/ahmedsadek/nexus")
+from shared.watchdog import Watchdog
 
 logging.basicConfig(
     level  = logging.INFO,
@@ -202,15 +205,20 @@ def _alert_lost_concordance(row: dict) -> None:
         logger.error("Prime lost concordance alert failed: %s", e)
 
 
+_nns_watchdog = Watchdog("prime-buffer")
+
 @asynccontextmanager
 async def lifespan(app: "FastAPI") -> AsyncGenerator[None, None]:
     """Initialize DB and circuit breaker state on startup."""
     import asyncio as _asyncio
     logger.info("Prime Buffer starting...")
+    from shared.db_guard import assert_unique_db_path  # G4: collision guard
+    assert_unique_db_path("prime-buffer", settings.prime_db_path)
     init_db(settings.prime_db_path)
     init_circuit_breaker(settings.prime_db_path)
     logger.info("Prime Buffer ready (solo_entries=%s)", settings.solo_entries_enabled)
     retry_task = _asyncio.create_task(_omni_retry_loop())
+    _nns_watchdog.start()
     yield
     retry_task.cancel()
     logger.info("Prime Buffer stopped")
@@ -232,6 +240,7 @@ class SubmitRequest(BaseModel):
     direction: str
     score:     float
     reasoning: Optional[str] = None
+    window_id: Optional[str] = None  # G7: agent's pool window (YYYY-MM-DD-HHMM)
 
     @field_validator("agent")
     @classmethod
@@ -350,6 +359,35 @@ def submit_pick(
         )
 
     window_id = current_window_id()
+
+    # G7: Window mismatch check
+    try:
+        import os as _os
+        import requests as _req
+        _axiom_url    = _os.getenv("AXIOM_URL", "http://localhost:8001")
+        _axiom_secret = _os.getenv("AXIOM_SECRET", "")
+        _axiom_resp   = _req.get(f"{_axiom_url}/pool", headers={"X-Axiom-Secret": _axiom_secret}, timeout=2)
+        if _axiom_resp.status_code == 200:
+            window_id = _axiom_resp.json().get("window_id", window_id)
+    except Exception:
+        pass  # fail-open: treat as FRESH
+
+    _agent_window = body.window_id or window_id
+    from shared.window_coordinator import evaluate_window  # G7
+    _window_result = evaluate_window(_agent_window, window_id, body.ticker, body.agent)
+    if _window_result["action"] == "REJECTED":
+        logger.warning(
+            "WINDOW EXPIRED (Prime) — rejecting %s/%s from %s",
+            body.ticker, body.direction, body.agent,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "accepted":     False,
+                "reason":       f"Window EXPIRED: pick is {_window_result['cycles_stale'] * 15} min stale",
+                "window_match": _window_result,
+            },
+        )
 
     save_submission(
         db_path   = settings.prime_db_path,

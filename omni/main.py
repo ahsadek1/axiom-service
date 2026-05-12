@@ -20,10 +20,11 @@ from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor, Future
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Dict
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
+from shared.watchdog import Watchdog
 from shared.service_state import ServiceStateWriter as _StateWriter
 _svc_state = _StateWriter("omni")  # GAP-002: durable state across restarts
 
@@ -100,11 +101,12 @@ def _check_min_brains_required(value: int) -> None:
         value: The MIN_BRAINS_REQUIRED value to validate.
 
     Raises:
-        RuntimeError: If value < 3.
+        RuntimeError: If value < 2.
     """
-    if value < 3:
+    # Ahmed directive 2026-05-07: minimum lowered to 2 (2/4 GO = GO verdict)
+    if value < 2:
         raise RuntimeError(
-            f"MIN_BRAINS_REQUIRED={value} is below safe minimum of 3. "
+            f"MIN_BRAINS_REQUIRED={value} is below safe minimum of 2. "
             "This is a system safety parameter — do not lower it."
         )
 
@@ -176,6 +178,7 @@ def _dispatch_sovereign_instruction(instr: dict) -> None:
         logger.warning("SOVEREIGN DIRECTIVE: unrecognized '%s'", directive[:100])
         report("omni", "ack", {"directive": directive[:100], "status": "unrecognized"})
 _state_lock    = threading.Lock()   # Pass B fix (V6): guards app_state counter mutations
+_last_alert_hashes: Dict[str, str] = {}  # GENESIS-FIX-WATCHDOG-SPAM: deduplicate alerts. service -> hash of last reported alert
 app_state = {
     "settings":          settings,
     "start_time":        datetime.now(ET).isoformat(),
@@ -656,6 +659,15 @@ def _trade_blocker_watchdog() -> None:
                 if count > 0:
                     recent = type('R', (), {'stdout': recent_content, 'returncode': 0})()
                     lines = recent.stdout.strip().split("\n")[-5:]
+                    # GENESIS-FIX-WATCHDOG-SPAM: Deduplicate alerts
+                    # Hash the alert to detect if it's the same as last time
+                    import hashlib as _h
+                    alert_msg = f"{service}:{count}:" + "|".join(l[-80:] for l in lines if l)
+                    alert_hash = _h.md5(alert_msg.encode()).hexdigest()[:8]
+                    if _last_alert_hashes.get(service) == alert_hash:
+                        # Same alert as last cycle — skip logging to reduce spam
+                        continue
+                    _last_alert_hashes[service] = alert_hash
                     logger.warning(
                         "WATCHDOG LOG SCAN: %s has %d CRITICAL entries. Recent: %s",
                         service, count, " | ".join(l[-100:] for l in lines if l)
@@ -897,6 +909,8 @@ def _sovereign_comms_loop_omni() -> None:
         _comms_stop_omni.wait(SOVEREIGN_POLL_INTERVAL_S)
     logger.info("SOVEREIGN comms loop stopped")
 
+_nns_watchdog = Watchdog("omni")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialize DB on startup."""
@@ -1071,6 +1085,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         state_lock = _state_lock,
     )
     logger.info("Failure sentinel started ✅")
+    _nns_watchdog.start()
 
     yield
 
@@ -1185,7 +1200,7 @@ def health() -> JSONResponse:
         })
 
     _last_ts = app_state["last_synthesis_time"]
-    _silence_min = round((time.time() - _last_ts) / 60, 1) if _last_ts else None
+    _silence_min = round((time.time() - _last_ts) / 60, 1) if _last_ts else 999  # Never return None — gate comparisons fail
     # GAP-008: pool stats
     try:
         _pool_stats = {
@@ -1749,6 +1764,15 @@ def _run_synthesis(
             # Also launch auto-recovery in background thread
             try:
                 from execution_recovery import auto_recover_async as _ar
+                _route_now = lambda: route_to_execution(
+                    system            = concordance["system"],
+                    alpha_exec_url    = settings.alpha_execution_url,
+                    prime_exec_url    = settings.prime_execution_url,
+                    auth_secret       = exec_auth,
+                    concordance       = concordance,
+                    synthesis_verdict = verdict.to_dict(),
+                    position_size     = position_size,
+                )
                 _ar(
                     ticker    = concordance["ticker"],
                     system    = concordance["system"],
@@ -1906,6 +1930,46 @@ def get_synthesis(
 
     return JSONResponse(dict(row))
 
+
+@app.get("/verdicts")
+def get_verdicts(
+    x_nexus_secret: str = Header(default=""),
+    limit: int = 50,
+) -> JSONResponse:
+    """
+    Return recent synthesized verdicts (GO/CONDITIONAL/NO_GO).
+    Execution layer uses this to fetch verdicts ready for trade.
+    
+    Query params:
+      limit=N  — max verdicts to return (default 50, max 100)
+    """
+    verify_secret(x_nexus_secret)
+    limit = min(limit, 100)  # cap at 100
+    
+    with get_conn(settings.omni_db_path) as conn:
+        # Fetch recent syntheses ordered by id DESC
+        rows = conn.execute(
+            "SELECT id, ticker, verdict, agent_weighted_score, created_at FROM synthesis_results ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    
+    verdicts = [
+        {
+            "id": row[0],
+            "ticker": row[1],
+            "verdict": row[2],
+            "score": row[3],
+            "created_at": row[4],
+        }
+        for row in rows
+    ]
+    
+    return JSONResponse({
+        "verdicts": verdicts,
+        "count": len(verdicts),
+        "status": "ok",
+        "checked_at": datetime.now(ET).isoformat(),
+    })
 
 
 # ── SOVEREIGN Push Endpoints ──────────────────────────────────────────────────

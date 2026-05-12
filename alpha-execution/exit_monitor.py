@@ -15,6 +15,9 @@ Exit rules (approved Apr 10, 2026):
 """
 
 import logging
+import sys as _sys
+_sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+from alert_client import send_alert as _send_alert
 from datetime import date, datetime, timezone
 from typing import Optional
 import zoneinfo as _zoneinfo
@@ -265,10 +268,24 @@ def _evaluate_position(
             pnl_pct = current_pnl_pct,
         )
 
-    # ── DTE Roll Flag (≤ 21) ─────────────────────────────────────────────────
+    # ── DTE Auto-Roll (≤ 21) ──────────────────────────────────────────────────
     if dte <= DTE_ROLL_THRESHOLD:
-        logger.info("ROLL FLAG: position %d (%s) DTE=%d — manual roll needed", pos_id, ticker, dte)
-        _send_roll_alert(bot_token, chat_id, ticker, pos_id, dte, current_pnl_pct)
+        logger.info("AUTO-ROLL: position %d (%s) DTE=%d — attempting roll forward", pos_id, ticker, dte)
+        from roll_manager import _attempt_roll
+        roll_result = _attempt_roll(
+            pos           = pos,
+            db_path       = db_path,
+            alpaca_client = alpaca_client,
+            bot_token     = bot_token,
+            chat_id       = chat_id,
+        )
+        if roll_result.action == "rolled":
+            # Position was closed and replaced — return the close event
+            return [{"event": "ROLLED", "position_id": pos_id, "new_position_id": roll_result.new_position_id, "ticker": ticker}]
+        elif roll_result.action == "failed":
+            logger.error("AUTO-ROLL FAILED for pos %d (%s): %s", pos_id, ticker, roll_result.error)
+        else:
+            logger.info("AUTO-ROLL SKIPPED for pos %d (%s): %s", pos_id, ticker, roll_result.reason)
 
     # ── +100% Full Close ──────────────────────────────────────────────────────
     if current_pnl_pct >= EXIT_FULL_CLOSE_PCT:
@@ -668,26 +685,17 @@ def _send_close_notification(
     ticker: str, pos_id: int,
     reason: str, pnl_pct: float, pnl_usd: float,
 ) -> None:
-    """Send trade closed Telegram notification."""
-    import requests
+    """Route trade-closed notification through Alert Broker."""
     emoji  = "✅" if pnl_pct > 0 else "❌"
     result = "WIN" if pnl_pct > 0 else "LOSS"
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id":    chat_id,
-                "text":       (
-                    f"{emoji} <b>ALPHA TRADE CLOSED — {ticker}</b>\n"
-                    f"Result: {result} | P&L: {pnl_pct*100:+.1f}% (${pnl_usd:+,.0f})\n"
-                    f"Reason: {reason} | Position #{pos_id}"
-                ),
-                "parse_mode": "HTML",
-            },
-            timeout=8,
-        )
-    except Exception:
-        pass
+    _send_alert(
+        source="alpha-exit-monitor",
+        level="INFO",
+        title=f"{emoji} ALPHA TRADE CLOSED — {ticker} — {result} | P&L: {pnl_pct*100:+.1f}% (${pnl_usd:+,.0f})",
+        body=f"Reason: {reason} | Position #{pos_id}",
+        dedup_key=f"trade_closed_{pos_id}",
+        targets=["nexus_health_group"],
+    )
 
 
 def _send_roll_alert(
@@ -695,21 +703,12 @@ def _send_roll_alert(
     ticker: str, pos_id: int,
     dte: int, pnl_pct: float,
 ) -> None:
-    """Send roll reminder for positions approaching DTE threshold."""
-    import requests
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id":    chat_id,
-                "text":       (
-                    f"⏰ <b>ALPHA ROLL NEEDED — {ticker}</b>\n"
-                    f"DTE: {dte} | P&L: {pnl_pct*100:+.1f}%\n"
-                    f"Position #{pos_id} — consider rolling forward"
-                ),
-                "parse_mode": "HTML",
-            },
-            timeout=8,
-        )
-    except Exception:
-        pass
+    """Route roll-reminder notification through Alert Broker."""
+    _send_alert(
+        source="alpha-exit-monitor",
+        level="WARNING",
+        title=f"⏰ ALPHA ROLL NEEDED — {ticker} | DTE: {dte} | P&L: {pnl_pct*100:+.1f}%",
+        body=f"Position #{pos_id} — consider rolling forward",
+        dedup_key=f"roll_needed_{pos_id}",
+        targets=["nexus_health_group"],
+    )

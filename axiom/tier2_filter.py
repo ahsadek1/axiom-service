@@ -275,8 +275,10 @@ def _evaluate_tier2(
     # IV rank
     iv_rank = polygon_get_iv_rank(ticker, polygon_api_key)
     if iv_rank is None:
-        # IV rank unknown — allow with neutral score, OMNI handles deeper analysis
-        iv_rank = 50.0
+        # IV rank unknown — reject. Do NOT default to 50; that masked low-IVR stocks
+        # that Cipher's liquidity gate then hard-capped at 30. Require confirmed data.
+        logger.debug("Tier 2 reject %s: iv_rank=None (ORATS unavailable)", ticker)
+        return False, 0.0, "iv_rank=None"
 
     if not (MIN_IV_RANK <= iv_rank <= MAX_IV_RANK):
         return False, 0.0, f"iv_rank={iv_rank:.1f}"

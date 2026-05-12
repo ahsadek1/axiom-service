@@ -37,6 +37,9 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import psutil
 import requests
+import sys as _sys
+_sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+from alert_client import send_alert as _send_alert
 
 # Serializes backup writes vs TelemetryWriter to prevent SQLite deadlock.
 # Acquired by _backup_dbs; TelemetryWriter yields when this is held.
@@ -345,21 +348,19 @@ def _init_healing_db(path: str) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 def _send_telegram(message: str, tier: int = 2) -> None:
-    """Send Telegram message to Ahmed. tier=1 → silent."""
+    """Route alert through Alert Broker. tier=1 → silent."""
     if tier < 2:
         return
-    prefix = {2: "⚠️", 3: "🚨", 4: "🆘"}.get(tier, "ℹ️")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_AHMED_CHAT_ID,
-            "text": f"{prefix} *GUARDIAN v4*\n\n{message}",
-            "parse_mode": "Markdown",
-        }, timeout=10)
-        if not resp.ok:
-            log.error("Telegram failed: %s", resp.status_code)
-    except requests.RequestException as exc:
-        log.error("Telegram error: %s", exc)
+    level_map = {2: "WARNING", 3: "CRITICAL", 4: "CRITICAL"}
+    level = level_map.get(tier, "WARNING")
+    targets = ["ahmed", "nexus_health_group"] if tier >= 3 else ["nexus_health_group"]
+    _send_alert(
+        source="guardian-angel-v4",
+        level=level,
+        title=message[:200],
+        body=message[200:] if len(message) > 200 else "",
+        targets=targets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -875,7 +876,7 @@ CRITICAL: confidence must be a float 0.0-1.0. Be honest — return low confidenc
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 600,
                     "messages": [{"role": "user", "content": prompt}],
                 },
@@ -1709,6 +1710,7 @@ class PipelineTelemetry:
     def __init__(self, escalation: EscalationEngine) -> None:
         self._escalation = escalation
         self._vix_states: Dict[str, str] = {}
+        self._zero_trades_last_alert: Dict[str, float] = {}  # cooldown: 60min per service
 
     def _query_agent_db(self, db_name: str, sql: str,
                         params: tuple = ()) -> Optional[Any]:
@@ -1891,11 +1893,17 @@ class PipelineTelemetry:
         if now_et is None or now_et.hour < 12:
             return
 
+        now_ts = time.time()
         for svc in self.EXEC_SERVICES:
             try:
+                auth = (
+                    {"X-Nexus-Prime-Secret": NEXUS_PRIME_SECRET}
+                    if svc["name"] == "prime-execution"
+                    else {"X-Nexus-Secret": NEXUS_SECRET}
+                )
                 resp = requests.get(
                     f"http://localhost:{svc['port']}/health",
-                    headers={"X-Nexus-Secret": NEXUS_SECRET},
+                    headers=auth,
                     timeout=5,
                 )
                 if not resp.ok:
@@ -1903,6 +1911,10 @@ class PipelineTelemetry:
                 data = resp.json()
                 trades = data.get("trades_today", -1)
                 if isinstance(trades, int) and trades == 0:
+                    last = self._zero_trades_last_alert.get(svc["name"], 0.0)
+                    if now_ts - last < 3600:  # 60-min cooldown per service
+                        continue
+                    self._zero_trades_last_alert[svc["name"]] = now_ts
                     tier = 3 if now_et.hour >= 14 else 2
                     _send_telegram(
                         f"*ZERO TRADES — {svc['name']}*\n"
@@ -2374,7 +2386,7 @@ class GuardianAngelV4:
         _is_execution_svc = _port in (8005, 8006)
 
         # Market hours gate: execution services before 9:25 AM or after 16:05 PM ET
-        _now_et = datetime.now(ET if "ET" in dir() else __import__("pytz").timezone("America/New_York"))
+        _now_et = datetime.now(__import__("zoneinfo").ZoneInfo("America/New_York"))
         _market_start = _now_et.replace(hour=9, minute=25, second=0, microsecond=0)
         _market_end   = _now_et.replace(hour=16, minute=5,  second=0, microsecond=0)
         if _is_execution_svc and not (_market_start <= _now_et <= _market_end):
