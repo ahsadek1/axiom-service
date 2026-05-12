@@ -241,6 +241,61 @@ def run_preflight_endpoint(x_nexus_secret: str = Header(default="", alias="X-Nex
     }
 
 
+@app.post("/verdicts")
+def verdicts_endpoint(
+    x_nexus_secret: str = Header(default="", alias="X-Nexus-Secret"),
+    **kwargs
+):
+    """Accept synthesis verdict from OMNI. Legacy endpoint for compatibility."""
+    _verify(x_nexus_secret)
+    # Accept but acknowledge — verdict is already in the system via omni_dispatch callback
+    logger.info("Verdicts endpoint received: %s", kwargs)
+    return {"status": "accepted", "message": "Verdict received and queued for execution"}
+
+
+@app.post("/execute")
+def execute_endpoint(
+    ticker: str,
+    strategy: str,
+    direction: str,
+    window_id: str,
+    pathway: str,
+    arena: str = "alpha",
+    sizing_mult: float = 1.0,
+    dte: int = 30,
+    expiry: str = "",
+    axiom_risk: dict = None,
+    x_nexus_secret: str = Header(default="", alias="X-Nexus-Secret"),
+):
+    """Execute a trade. Idempotent via deterministic client_order_id."""
+    _verify(x_nexus_secret)
+    if axiom_risk is None:
+        axiom_risk = {}
+
+    from execution import execute_trade
+    result = execute_trade(
+        db_path=DB_PATH,
+        ticker=ticker,
+        strategy=strategy,
+        direction=direction,
+        window_id=window_id,
+        pathway=pathway,
+        arena=arena,
+        sizing_mult=sizing_mult,
+        dte=dte,
+        expiry=expiry,
+        axiom_risk=axiom_risk,
+    )
+    return {
+        "success": result.success,
+        "client_order_id": result.client_order_id,
+        "alpaca_order_id": result.alpaca_order_id,
+        "fill_price": result.fill_price,
+        "error": result.error,
+        "already_existed": result.already_existed,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8010, log_level="info")
