@@ -128,9 +128,13 @@ def init_db(db_path: str) -> None:
                 execution_url         TEXT,
                 execution_response    TEXT,
 
+                psychology_overlay    TEXT,
+
                 created_at            TEXT    NOT NULL,
                 UNIQUE(window_id, ticker, direction, system)
             );
+
+            ALTER TABLE IF EXISTS synthesis_results ADD COLUMN psychology_overlay TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_synthesis_ticker
                 ON synthesis_results(ticker, direction, created_at);
