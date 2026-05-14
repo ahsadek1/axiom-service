@@ -89,26 +89,40 @@ async def check_resume() -> bool:
 
 # ── OMNI dispatch ─────────────────────────────────────────────────────────────
 
-def omni_dispatch(ticker, ctx, axiom, score_result) -> None:
-    """Send pick to OMNI synthesis endpoint."""
+def omni_dispatch(ticker, ctx, axiom, score_result, direction="bullish", window_id="") -> None:
+    """Send pick to OMNI synthesis endpoint (/concordance)."""
     try:
+        # Build complete ConcordancePayload
+        payload = {
+            "ticker":    ticker,
+            "direction": direction.lower(),
+            "system":    "alpha",
+            "pathway":   score_result.recommendation or "P1",
+            "weighted_score": float(score_result.score),
+            "agents_involved": ["Sage", "Cipher"],
+            "scores": {
+                "vol": float(ctx.vol.iv_rank) if ctx.vol.iv_rank else 0.0,
+                "tech": float(ctx.tech.rsi_14) if ctx.tech.rsi_14 else 50.0,
+                "momentum": float(score_result.score),
+            },
+            "verdict": "GO",
+            "sizing_mult": 1.0,
+            "window_id": window_id,
+            "echo_chamber": False,
+            "notes": ["Railway V2 dispatch"],
+        }
+        
         r = requests.post(
-            f"{OMNI_URL}/synthesize",
+            f"{OMNI_URL}/concordance",
             headers={"Content-Type": "application/json",
                      "X-Nexus-Secret": NEXUS_SECRET},
-            json={
-                "ticker":    ticker,
-                "direction": "bullish",
-                "score":     score_result.score,
-                "pathway":   score_result.recommendation,
-                "ivr":       ctx.vol.iv_rank,
-                "rsi":       ctx.tech.rsi_14,
-                "axiom":     axiom,
-            },
+            json=payload,
             timeout=10,
         )
         if r.status_code not in (200, 202):
-            logger.warning("OMNI dispatch returned %s for %s", r.status_code, ticker)
+            logger.warning("OMNI dispatch returned %s for %s: %s", r.status_code, ticker, r.text[:100])
+        else:
+            logger.info("OMNI dispatch successful for %s", ticker)
     except Exception as e:
         logger.error("OMNI dispatch failed for %s: %s", ticker, e)
         raise

@@ -306,7 +306,7 @@ def run_scan_cycle(
 
         # Dispatch to OMNI synthesis
         try:
-            omni_dispatch_fn(ticker, ctx, axiom, score_result)
+            omni_dispatch_fn(ticker, ctx, axiom, score_result, direction, window_id)
             result.verdicts.append({
                 "ticker":    ticker,
                 "direction": direction,
