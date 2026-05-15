@@ -459,7 +459,7 @@ def handle_issue(code: str, detail: str, context: dict) -> None:
     if fix_fn:
         logger.info("Applying fix for %s...", code)
         try:
-            resolved = fix_fn(context) if code in ("OMNI_SILENCE", "PIPELINE_STALL_EARLY") else fix_fn()
+            resolved = fix_fn(context) if code in ("OMNI_SILENCE", "PIPELINE_STALL_EARLY", "TRS_DEGRADED") else fix_fn()
         except Exception as e:
             resolved = False
             logger.error("Fix for %s threw: %s", code, e)

@@ -206,3 +206,96 @@ def verify_integrity() -> bool:
     except Exception as e:
         logger.error("chronicle_reader: verify_integrity failed: %s", e)
         return False
+
+
+def check_chronicle_health() -> dict:
+    """
+    Health check for CHRONICLE database — used by self-awareness daemon.
+
+    Returns:
+        Dict with keys:
+        - db_status: 'OK', 'DEGRADED', or 'CRITICAL'
+        - tables: list of table names found
+        - record_count: total governance documents
+        - last_write: ISO timestamp of most recent write
+        - connection: 'OK' or error message
+        - errors: list of any errors encountered
+    """
+    errors = []
+    tables = []
+    record_count = 0
+    last_write = None
+    db_status = "OK"
+    connection = "OK"
+
+    try:
+        conn = _connect()
+
+        # Check tables
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = [row[0] for row in cursor.fetchall()]
+        expected_tables = {"governance_documents", "governance_reads", "intervention_log"}
+        missing = expected_tables - set(tables)
+        if missing:
+            errors.append(f"Missing tables: {missing}")
+            db_status = "DEGRADED"
+
+        # Count records in governance_documents
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM governance_documents").fetchone()
+            record_count = row[0] if row else 0
+        except Exception as e:
+            errors.append(f"Cannot count governance_documents: {e}")
+            db_status = "CRITICAL"
+
+        # Get last write timestamp
+        try:
+            row = conn.execute(
+                "SELECT created_at FROM governance_documents ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                last_write = row[0]
+        except Exception as e:
+            errors.append(f"Cannot query last_write: {e}")
+            db_status = "CRITICAL"
+
+        # Integrity check (sample if many records)
+        if record_count > 0:
+            try:
+                sample_size = min(3, record_count)
+                rows = conn.execute(
+                    f"SELECT content, checksum FROM governance_documents ORDER BY created_at DESC LIMIT {sample_size}"
+                ).fetchall()
+                bad_checksums = 0
+                for row in rows:
+                    computed = hashlib.sha256(row[0].encode()).hexdigest()
+                    if computed != row[1]:
+                        bad_checksums += 1
+                if bad_checksums > 0:
+                    errors.append(f"Checksum failures detected: {bad_checksums}/{sample_size} sampled")
+                    db_status = "CRITICAL"
+            except Exception as e:
+                errors.append(f"Cannot verify checksums: {e}")
+                db_status = "CRITICAL"
+
+        conn.close()
+
+    except sqlite3.OperationalError as e:
+        connection = f"FAILED: {e}"
+        db_status = "CRITICAL"
+        errors.append(f"Database connection failed: {e}")
+    except Exception as e:
+        connection = f"ERROR: {e}"
+        db_status = "CRITICAL"
+        errors.append(f"Unexpected error: {e}")
+
+    return {
+        "db_status": db_status,
+        "tables": tables,
+        "record_count": record_count,
+        "last_write": last_write,
+        "connection": connection,
+        "errors": errors,
+    }

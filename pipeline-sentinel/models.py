@@ -11,10 +11,14 @@ from pydantic import BaseModel, Field
 
 
 class HopEnum(str, Enum):
-    """Valid pipeline hops in order of execution."""
+    """Valid pipeline hops in order of execution.
+    
+    Note: buffer_accepted is deprecated (pipeline evolved to omni_started → omni_completed).
+    Legacy entries in the database with buffer_accepted are treated as terminal hops
+    for stall detection purposes.
+    """
     axiom_push           = "axiom_push"
     agent_received       = "agent_received"
-    buffer_accepted      = "buffer_accepted"
     omni_started         = "omni_started"
     omni_completed       = "omni_completed"
     execution_received   = "execution_received"

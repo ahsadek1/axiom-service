@@ -46,7 +46,7 @@ def _require(var: str) -> str:
         raise RuntimeError(f"{var} is required but not set. Source .deploy-secrets before running.")
     return val
 
-ORACLE_URL    = os.environ.get("ORACLE_URL",    "http://localhost:8007")
+ORACLE_URL    = os.environ.get("ORACLE_URL",    "http://192.168.1.141:8007")
 ORACLE_SECRET = _require("ORACLE_SECRET")
 TELEGRAM_BOT  = _require("TELEGRAM_BOT_TOKEN")
 OMNI_BOT      = TELEGRAM_BOT  # alias

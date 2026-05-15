@@ -124,7 +124,7 @@ PRIME_BUFFER_URL: str = os.environ.get("PRIME_BUFFER_URL", "http://localhost:800
 OMNI_URL: str = os.environ.get("OMNI_URL", "http://localhost:8004")
 ALPHA_EXEC_URL: str = os.environ.get("ALPHA_EXEC_URL", "http://localhost:8005")
 PRIME_EXEC_URL: str = os.environ.get("PRIME_EXEC_URL", "http://localhost:8006")
-ORACLE_URL: str = os.environ.get("ORACLE_URL", "http://localhost:8007")
+ORACLE_URL: str = os.environ.get("ORACLE_URL", "http://192.168.1.141:8007")
 AILS_URL: str = os.environ.get("AILS_URL", "http://localhost:8008")
 PIPELINE_SENTINEL_URL: str = os.environ.get("PIPELINE_SENTINEL_URL", "http://localhost:8010")
 

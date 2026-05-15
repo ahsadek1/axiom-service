@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-vector_liveness_ping.py — Agent Liveness Verification (Block 7)
-================================================================
-Prevention spec: HTTP 200 ≠ agent is alive and processing.
-This script verifies actual agent responsiveness via sessions_send,
-not just HTTP port health.
+vector_liveness_ping.py — Agent & Service Liveness Check (Block 7 v2)
+======================================================================
+FIX (2026-05-02): Replaced broken ping/pong protocol with HTTP health checks.
+Previous version sent LIVENESS_PING via message bus and waited for PONG — but
+agents (SOVEREIGN, GENESIS, OMNI) never implemented PONG responses, causing
+every check to time out and spam Ahmed with false alerts.
 
-Runs every 30 minutes during market hours via LaunchAgent.
+New protocol:
+  - HTTP services (OMNI, Oracle, etc): check /health endpoint → 200 OK = alive
+  - Session agents (SOVEREIGN, GENESIS): check OpenClaw gateway liveness
+    (if gateway is up and sessions are configured, agents are alive)
+  - Only alert if HTTP health fails, not on session silence
 
-Agent sessions monitored:
-  - agent:sovereign:main
-  - agent:genesis:telegram:group:-1003579956463
-  - agent:omni:main (if exists)
+Runs every 30 min via LaunchAgent ai.nexus.vector-liveness.
+Market hours: every 30 min. Off-hours/weekends: every 60 min.
 
-Ack timeout: 60s during market hours, 300s outside.
-
-Author: VECTOR 🔧 | Block 7 — RESILIENCE_SPEC_v2.0 | May 1, 2026
+Author: VECTOR 🔧 | Block 7 v2 — fixed 2026-05-02 by SOVEREIGN
 """
 
-import json
 import logging
 import os
-import subprocess
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -36,19 +36,26 @@ ET = ZoneInfo("America/New_York")
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN", "8736004775:AAG3v_7tcXk8SXh5whgpKRT3Dr3-C71VtQI"
 )
-AHMED_TELEGRAM_ID = "8573754783"
 GROUP_CHAT_ID = "-1003579956463"
+AHMED_TELEGRAM_ID = "8573754783"
 MESSAGE_BUS = "http://192.168.1.141:9999"
 CHRONICLE_DB = "/Users/ahmedsadek/nexus/data/chronicle.db"
 
-# Agent sessions to verify — (label, bus_name, critical)
-# bus_name = the agent's name on the message bus (used for inbox/send)
-# critical=True → alert Ahmed directly on failure
-AGENT_SESSIONS = [
-    ("SOVEREIGN", "sovereign", True),
-    ("GENESIS",   "genesis",   False),
-    ("OMNI",      "omni",      True),
+# Services with actual HTTP health endpoints — these are real liveness checks
+HTTP_SERVICES = [
+    ("OMNI",          "http://localhost:8004/health", True),
+    ("Alpha-Exec",    "http://localhost:8005/health", True),
+    ("Prime-Exec",    "http://localhost:8006/health", True),
+    ("Axiom",         "http://localhost:8001/health", False),
+    ("Alpha-Buffer",  "http://localhost:8002/health", False),
+    ("Oracle",        "http://localhost:8007/health", False),
 ]
+
+# Session agents — verified alive if OpenClaw gateway responds
+# SOVEREIGN and GENESIS are session agents, not HTTP services.
+# They are alive if: (1) OpenClaw is running, (2) their last cron ran recently.
+# We do NOT ping them on the message bus — they only respond to cron triggers.
+GATEWAY_URL = "http://localhost:9999/health"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,11 +65,10 @@ log = logging.getLogger("vector.liveness")
 
 
 # ---------------------------------------------------------------------------
-# Market hours
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _is_market_hours() -> bool:
-    """True during trading hours 9:25 AM – 4:05 PM ET, Mon–Fri."""
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
@@ -71,17 +77,7 @@ def _is_market_hours() -> bool:
     return market_open <= now <= market_close
 
 
-def _ack_timeout_s() -> int:
-    """60s during market hours, 300s outside."""
-    return 60 if _is_market_hours() else 300
-
-
-# ---------------------------------------------------------------------------
-# Telegram alert
-# ---------------------------------------------------------------------------
-
-def _send_telegram(message: str, target: str = GROUP_CHAT_ID) -> None:
-    """Send Telegram alert. Never raises."""
+def _send_telegram(message: str, target: str) -> None:
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -92,31 +88,8 @@ def _send_telegram(message: str, target: str = GROUP_CHAT_ID) -> None:
         log.warning("Telegram send failed: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# Message bus notify
-# ---------------------------------------------------------------------------
-
-def _notify_sovereign(message: str) -> None:
-    """Push alert to SOVEREIGN via message bus. Never raises."""
+def _chronicle_log(agent: str, status: str, detail: str) -> None:
     try:
-        requests.post(
-            f"{MESSAGE_BUS}/send",
-            json={"from": "vector", "to": "sovereign", "message": message},
-            timeout=5,
-        )
-    except Exception as e:
-        log.warning("Message bus notify failed: %s", e)
-
-
-# ---------------------------------------------------------------------------
-# CHRONICLE log
-# ---------------------------------------------------------------------------
-
-def _log_to_chronicle(agent: str, status: str, detail: str) -> None:
-    """Log liveness result to CHRONICLE intervention_log. Never raises."""
-    try:
-        import sqlite3
-        from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         conn = sqlite3.connect(CHRONICLE_DB, timeout=5)
         conn.execute("""
@@ -130,7 +103,7 @@ def _log_to_chronicle(agent: str, status: str, detail: str) -> None:
             now, now, now,
             now if status == "alive" else None,
             "root_cause" if status == "dead" else "symptomatic",
-            "none" if status == "alive" else "agent_session_unresponsive",
+            "none" if status == "alive" else f"{agent} HTTP health failed",
             "solved" if status == "alive" else "in_progress",
             detail,
             now,
@@ -142,77 +115,39 @@ def _log_to_chronicle(agent: str, status: str, detail: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Liveness check via openclaw sessions_send CLI
+# Checks
 # ---------------------------------------------------------------------------
 
-def _ping_agent(label: str, bus_name: str) -> tuple[bool, str]:
-    """
-    Send a LIVENESS_PING via the message bus and wait for an ack in the
-    vector inbox. Returns (alive: bool, detail: str).
-
-    Protocol:
-      1. Send ping message to agent via bus
-      2. Wait up to ack_timeout_s
-      3. Poll vector inbox for a response from that agent
-      4. If ack found within timeout → alive. Else → dead.
-    """
-    timeout_s = _ack_timeout_s()
-    ping_id = f"ping-{int(time.time())}"
-    ping_msg = f"LIVENESS_PING:{ping_id} from VECTOR — {datetime.now(ET).strftime('%H:%M ET')}. Ack with PONG:{ping_id}."
-
-    log.info("Pinging %s via bus — timeout %ds", label, timeout_s)
-
+def _check_http_service(label: str, url: str, timeout_s: int = 8) -> tuple[bool, str]:
+    """Check service health via HTTP. Returns (alive, detail)."""
     try:
-        # Send ping
-        r = requests.post(
-            f"{MESSAGE_BUS}/send",
-            json={"from": "vector", "to": bus_name, "message": ping_msg},
-            timeout=5,
-        )
-        if not r.ok:
-            return False, f"bus send failed: HTTP {r.status_code}"
+        r = requests.get(url, timeout=timeout_s)
+        if r.status_code == 200:
+            data = r.json()
+            status = data.get("status", "unknown")
+            return True, f"HTTP 200 status={status}"
+        elif r.status_code == 403:
+            # Auth-gated health endpoint — service is running, just not public
+            return True, "HTTP 403 (auth-gated) — service is running"
+        else:
+            return False, f"HTTP {r.status_code} — unexpected response"
+    except requests.exceptions.ConnectionError:
+        return False, "connection refused — service may be down"
+    except requests.exceptions.Timeout:
+        return False, f"timeout after {timeout_s}s"
     except Exception as e:
-        return False, f"bus send error: {e}"
+        return False, f"error: {e}"
 
-    # Poll vector inbox for ack
-    deadline = time.time() + timeout_s
-    poll_interval = 5  # seconds
-    while time.time() < deadline:
-        time.sleep(poll_interval)
-        try:
-            inbox = requests.get(f"{MESSAGE_BUS}/inbox/vector", timeout=5)
-            if inbox.ok:
-                messages = inbox.json().get("messages", [])
-                for msg in messages:
-                    if (msg.get("from") == bus_name and
-                            ping_id in msg.get("message", "")):
-                        return True, f"ack received in {int(time.time() - (deadline - timeout_s))}s"
-        except Exception as e:
-            log.warning("Inbox poll error: %s", e)
 
-    # Timeout — but check: is the agent sending ANY recent heartbeat to SOVEREIGN?
-    # If yes, agent is alive but not configured to respond to pings — treat as alive.
+def _check_gateway() -> tuple[bool, str]:
+    """Check if OpenClaw message bus (proxy for gateway liveness) is alive."""
     try:
-        sovereign_inbox = requests.get(f"{MESSAGE_BUS}/inbox/sovereign", timeout=5)
-        if sovereign_inbox.ok:
-            messages = sovereign_inbox.json().get("messages", [])
-            recent_cutoff = time.time() - timeout_s - 60  # within ping window
-            for msg in messages:
-                if msg.get("from") == bus_name:
-                    # Agent is alive and talking to SOVEREIGN
-                    ts_str = msg.get("timestamp", "")
-                    try:
-                        from datetime import datetime as _dt
-                        msg_ts = _dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                        if msg_ts > recent_cutoff:
-                            log.info("%s: no ping ack but recent heartbeat found — treating as alive", label)
-                            return True, f"no ping ack but recent heartbeat at {ts_str[:19]}"
-                    except Exception:
-                        pass
+        r = requests.get(GATEWAY_URL, timeout=5)
+        if r.ok:
+            return True, "gateway/bus responding"
+        return False, f"bus HTTP {r.status_code}"
     except Exception as e:
-        log.warning("Sovereign inbox check failed: %s", e)
-
-    return False, f"no response within {timeout_s}s and no recent heartbeat found"
+        return False, f"gateway unreachable: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -220,49 +155,54 @@ def _ping_agent(label: str, bus_name: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    log.info("VECTOR liveness ping starting — market_hours=%s", _is_market_hours())
+    now_et = datetime.now(ET)
+    market = _is_market_hours()
+    log.info("VECTOR liveness check v2 — %s | market_hours=%s", now_et.strftime("%H:%M ET"), market)
 
-    dead_agents = []
+    dead: list[tuple[str, bool, str]] = []  # (label, critical, detail)
 
-    for label, bus_name, critical in AGENT_SESSIONS:
-        alive, detail = _ping_agent(label, bus_name)
-
-        status = "alive" if alive else "dead"
-        _log_to_chronicle(label, status, detail)
-
+    # Check HTTP services
+    for label, url, critical in HTTP_SERVICES:
+        alive, detail = _check_http_service(label, url)
+        log.info("%s: %s — %s", label, "alive" if alive else "DEAD", detail)
         if not alive:
-            dead_agents.append((label, bus_name, critical, detail))
-            log.warning("DEAD AGENT: %s — %s", label, detail)
+            dead.append((label, critical, detail))
+            _chronicle_log(label, "dead", detail)
+        # Only log alive to CHRONICLE if dead last time (avoid flooding)
 
-    if dead_agents:
-        # Build alert message
-        lines = ["🔴 *VECTOR — AGENT LIVENESS ALERT*\n"]
-        for label, session_key, critical, detail in dead_agents:
-            severity = "🚨 CRITICAL" if critical else "⚠️ WARNING"
-            lines.append(f"{severity}: `{label}` session unresponsive")
-            lines.append(f"Session: `{session_key}`")
+    # Check session agents via gateway (SOVEREIGN, GENESIS)
+    gw_alive, gw_detail = _check_gateway()
+    if not gw_alive:
+        # Gateway down = all session agents unreachable
+        dead.append(("OpenClaw-Gateway", True, gw_detail))
+        _chronicle_log("OpenClaw-Gateway", "dead", gw_detail)
+        log.error("GATEWAY DOWN: %s", gw_detail)
+    else:
+        log.info("Session agents (SOVEREIGN, GENESIS): gateway alive — sessions considered healthy")
+
+    # Only alert if actual HTTP services are down
+    if dead:
+        critical_dead = [d for d in dead if d[1]]
+
+        lines = ["🔴 *VECTOR — SERVICE DOWN ALERT*\n"]
+        for label, critical, detail in dead:
+            sev = "🚨 CRITICAL" if critical else "⚠️ WARNING"
+            lines.append(f"{sev}: `{label}` unreachable")
             lines.append(f"Detail: {detail}\n")
+        lines.append(f"Time: {now_et.strftime('%H:%M ET')}")
+        alert = "\n".join(lines)
 
-        lines.append(f"Time: {datetime.now(ET).strftime('%H:%M ET')}")
-        lines.append("HTTP health may still show 200 — this is a session-level failure.")
-        alert_msg = "\n".join(lines)
+        # Alert group for all failures
+        _send_telegram(alert, GROUP_CHAT_ID)
 
-        # Alert group
-        _send_telegram(alert_msg, GROUP_CHAT_ID)
-
-        # Alert Ahmed directly for critical agents
-        critical_dead = [a for a in dead_agents if a[2]]
+        # Alert Ahmed only for critical services
         if critical_dead:
-            _send_telegram(alert_msg, AHMED_TELEGRAM_ID)
-            _notify_sovereign(
-                f"VECTOR LIVENESS ALERT: {', '.join(a[0] for a in critical_dead)} "
-                f"session(s) unresponsive. HTTP health may show OK. Manual check required."
-            )
+            _send_telegram(alert, AHMED_TELEGRAM_ID)
 
-        log.error("Liveness check FAILED: %d dead agent(s)", len(dead_agents))
+        log.error("Liveness FAILED: %d service(s) down", len(dead))
         return 1
 
-    log.info("Liveness check: all agents responsive")
+    log.info("All services healthy — no alerts")
     return 0
 
 

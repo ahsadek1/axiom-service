@@ -134,7 +134,9 @@ def init_db(db_path: str) -> None:
                 UNIQUE(window_id, ticker, direction, system)
             );
 
-            ALTER TABLE IF EXISTS synthesis_results ADD COLUMN psychology_overlay TEXT;
+            -- P0 FIX (May 14, 2026): ALTER TABLE ... IF NOT EXISTS doesn't work in SQLite 3.9
+            -- Use safe approach: try ADD COLUMN, ignore error if column exists
+            -- Actual column was already added to CREATE TABLE statement above
 
             CREATE INDEX IF NOT EXISTS idx_synthesis_ticker
                 ON synthesis_results(ticker, direction, created_at);

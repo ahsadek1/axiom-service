@@ -47,7 +47,7 @@ def load_settings() -> Settings:
         "NEXUS_SECRET":         os.getenv("NEXUS_SECRET"),
         "NEXUS_PRIME_SECRET":   os.getenv("NEXUS_PRIME_SECRET"),
         "ORACLE_SECRET":        os.getenv("ORACLE_SECRET"),
-        "ORACLE_URL":           os.getenv("ORACLE_URL", "http://localhost:8007"),
+        "ORACLE_URL":           os.getenv("ORACLE_URL", "http://192.168.1.141:8007"),
         "ALPHA_BUFFER_URL":     os.getenv("ALPHA_BUFFER_URL", "http://localhost:8002"),
         "PRIME_BUFFER_URL":     os.getenv("PRIME_BUFFER_URL", "http://localhost:8003"),
         "ANTHROPIC_API_KEY":    os.getenv("ANTHROPIC_API_KEY"),

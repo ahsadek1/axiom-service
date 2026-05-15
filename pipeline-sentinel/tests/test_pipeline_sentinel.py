@@ -118,14 +118,17 @@ def _make_trace(
 
 def test_happy_path_full_trace(db_path: str) -> None:
     """
-    Submit all 8 hops for a single pick.
-    Confirm GET /pipeline/{trace_id} returns all 8 in chronological order.
+    Submit all 7 hops for a single pick (current pipeline architecture).
+    Confirm GET /pipeline/{trace_id} returns all 7 in chronological order.
+    
+    Note: buffer_accepted is deprecated. Current hop sequence:
+    axiom_push -> agent_received -> omni_started -> omni_completed ->
+    execution_received -> alpaca_submitted -> alpaca_confirmed
     """
     tid = "trace-happy-001"
     hops = [
         ("axiom_push",         "axiom"),
         ("agent_received",     "cipher"),
-        ("buffer_accepted",    "alpha-buffer"),
         ("omni_started",       "omni"),
         ("omni_completed",     "omni"),
         ("execution_received", "alpha-execution"),
@@ -139,7 +142,7 @@ def test_happy_path_full_trace(db_path: str) -> None:
         time.sleep(0.01)  # ensure ts ordering
 
     result = get_traces_for_id(db_path, tid)
-    assert len(result) == 8, f"Expected 8 hops, got {len(result)}"
+    assert len(result) == 7, f"Expected 7 hops, got {len(result)}"
     hop_names = [r["hop"] for r in result]
     assert hop_names == [h for h, _ in hops], f"Hop order wrong: {hop_names}"
 

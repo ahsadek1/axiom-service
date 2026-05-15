@@ -31,7 +31,7 @@ AILS_DB_PATH: str = os.environ.get("AILS_DB_PATH", f"{DATA_DIR}/ails.db")
 BACKTEST_DB_PATH: str = os.environ.get("BACKTEST_DB_PATH", f"{DATA_DIR}/backtest.db")
 
 # Service URLs (inter-service communication)
-ORACLE_URL: str = os.environ.get("ORACLE_URL", "http://localhost:8007")
+ORACLE_URL: str = os.environ.get("ORACLE_URL", "http://192.168.1.141:8007")
 ORACLE_SECRET: str = os.environ.get("ORACLE_SECRET", "")
 
 # Bayesian weighting

@@ -52,8 +52,18 @@ ALPHA_URL = "https://worker-production-2060.up.railway.app/health"
 PRIME_URL = "https://nexus-prime-bot-production.up.railway.app/health"
 ALPACA_URL = "https://paper-api.alpaca.markets/v2/account"
 
-# Railway deploy token
-RAILWAY_TOKEN = os.getenv("RAILWAY_TOKEN", "08612a1a-4bb4-4ccb-9c75-6ef9277d74db")
+# P0 FIX (May 14, 2026): Railway token auto-refresh manager
+# ROOT CAUSE: Hardcoded token with no refresh → 360min trading halt today
+# SOLUTION: Use RailwayTokenManager for auto-refresh 24h before expiration
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from shared.railway_token_manager import get_manager as _get_railway_manager
+
+_railway_mgr = _get_railway_manager()
+
+def get_railway_token() -> str:
+    """Get current valid Railway token (auto-refreshed if needed)."""
+    return _railway_mgr.get_token()
 
 # Expected Axiom values
 EXPECTED_LIMITS = {

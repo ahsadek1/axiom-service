@@ -347,18 +347,32 @@ def _init_healing_db(path: str) -> sqlite3.Connection:
 # Telegram
 # ---------------------------------------------------------------------------
 
-def _send_telegram(message: str, tier: int = 2) -> None:
-    """Route alert through Alert Broker. tier=1 → silent."""
+def _send_telegram(message: str, tier: int = 2, dedup_key: Optional[str] = None) -> None:
+    """Route alert through Alert Broker. tier=1 → silent.
+    
+    Args:
+        message: Alert text (first 200 chars = title, remainder = body).
+        tier: Alert tier (1=silent, 2=warning, 3=critical, 4=critical).
+        dedup_key: Deduplication key for cooldown. If None, defaults to derived from title.
+                   IMPORTANT: Use condition-based keys (no timestamps) for proper dedup.
+    """
     if tier < 2:
         return
     level_map = {2: "WARNING", 3: "CRITICAL", 4: "CRITICAL"}
     level = level_map.get(tier, "WARNING")
     targets = ["ahmed", "nexus_health_group"] if tier >= 3 else ["nexus_health_group"]
+    
+    title = message[:200]
+    body = message[200:] if len(message) > 200 else ""
+    
+    # Use provided dedup_key, or auto-derive from title (alert_client will use title if None)
+    # Condition-based keys are essential for dedup to work across repeated alerts
     _send_alert(
         source="guardian-angel-v4",
         level=level,
-        title=message[:200],
-        body=message[200:] if len(message) > 200 else "",
+        title=title,
+        body=body,
+        dedup_key=dedup_key,
         targets=targets,
     )
 
@@ -1101,18 +1115,21 @@ class CoherenceVerifier:
                             "*AUTO-HEAL* — Axiom pool was empty\n"
                             "Tier 1 rebuild triggered. Pool repopulating (~2 min).",
                             tier=3,
+                            dedup_key="axiom-pool-empty-healed",
                         )
                     else:
                         _send_telegram(
                             "*AXIOM POOL EMPTY — AUTO-HEAL FAILED*\n"
                             f"HTTP {heal_resp.status_code}. Manual intervention required.",
                             tier=4,
+                            dedup_key="axiom-pool-empty-heal-failed",
                         )
                 except Exception as exc:
                     _send_telegram(
                         "*AXIOM POOL EMPTY — AXIOM UNREACHABLE*\n"
                         f"{str(exc)[:100]}",
                         tier=4,
+                        dedup_key="axiom-unreachable",
                     )
                 return False
             self._log_check("axiom_pool_alive", True, f"pool_size={pool_size}")
@@ -1138,6 +1155,7 @@ class CoherenceVerifier:
                     f"*COHERENCE* — ORACLE cache stale ({cache_age_s/60:.0f} min)\n"
                     "Agents getting stale market data.",
                     tier=2,
+                    dedup_key="oracle-cache-stale",
                 )
                 return False
             self._log_check("oracle_cache_fresh", True, f"cache_age={cache_age_s}s")
@@ -1211,6 +1229,7 @@ class CoherenceVerifier:
                         f"*ORPHANS AUTO-CLOSED* — {closed}\n"
                         f"Positions in Alpaca but not DB. Auto-liquidated.",
                         tier=3,
+                        dedup_key="orphan-positions-closed",
                     )
                 else:
                     _send_telegram(
@@ -1218,6 +1237,7 @@ class CoherenceVerifier:
                         f"Closed: {closed} | Failed: {failed_close}\n"
                         f"Manually close {failed_close} in Alpaca immediately.",
                         tier=4,
+                        dedup_key="orphan-positions-alert",
                     )
             return len(failed_close) == 0
 
@@ -1481,10 +1501,12 @@ class EscalationEngine:
 
     def alert_tier4(self, component: str, detail: str) -> None:
         """Fire Tier 4 immediately — critical, requires manual intervention."""
+        dedup_key = f"critical-{component}"
         _send_telegram(
             f"*CRITICAL — {component}*\n\n{detail}\n\n"
             f"Requires immediate manual intervention.",
             tier=4,
+            dedup_key=dedup_key,
         )
         _notify_genesis(component, detail)
 
@@ -1514,22 +1536,26 @@ class EscalationEngine:
             if new_tier == 2:
                 log.warning("EscalationEngine: → Tier 2 for %s (unresolved %.0fs)",
                             component, now - state["first_seen"])
+                dedup_key = f"unresolved-{component}"
                 _send_telegram(
                     f"*UNRESOLVED — {component}*\n\n"
                     f"{detail}\n\n"
                     f"Duration: {elapsed_min:.1f} min — auto-heal attempted, not recovered.",
                     tier=2,
+                    dedup_key=dedup_key,
                 )
                 _notify_genesis(component, detail, log_tail)
 
             elif new_tier == 3:
                 log.error("EscalationEngine: → Tier 3 for %s (unresolved %.0f min)",
                           component, elapsed_min)
+                dedup_key = f"escalated-{component}"
                 _send_telegram(
                     f"*ESCALATED — {component}*\n\n"
                     f"{detail}\n\n"
                     f"Duration: {elapsed_min:.1f} min — requesting AI diagnosis.",
                     tier=3,
+                    dedup_key=dedup_key,
                 )
                 if self._multi_ai:
                     try:
@@ -1537,6 +1563,7 @@ class EscalationEngine:
                             component, detail, log_tail, ""
                         )
                         if result:
+                            ai_dedup_key = f"ai-diagnosis-{component}"
                             _send_telegram(
                                 f"*AI DIAGNOSIS — {component}*\n\n"
                                 f"*Claude:* {(result.get('claude') or 'N/A')[:300]}\n\n"
@@ -1544,6 +1571,7 @@ class EscalationEngine:
                                 f"*Cipher:* {(result.get('cipher') or 'N/A')[:200]}\n\n"
                                 f"*Best action:* {result.get('best_action', 'Manual review')}",
                                 tier=3,
+                                dedup_key=ai_dedup_key,
                             )
                     except Exception as exc:
                         log.error("EscalationEngine Tier 3 AI diagnosis failed: %s", exc)
@@ -1916,10 +1944,13 @@ class PipelineTelemetry:
                         continue
                     self._zero_trades_last_alert[svc["name"]] = now_ts
                     tier = 3 if now_et.hour >= 14 else 2
+                    # Use condition-based dedup_key (no timestamps) for proper alert deduplication
+                    dedup_key = f"zero-trades-{svc['name']}"
                     _send_telegram(
                         f"*ZERO TRADES — {svc['name']}*\n"
                         f"trades_today=0 at {now_et.strftime('%H:%M')} ET.",
                         tier=tier,
+                        dedup_key=dedup_key,
                     )
             except requests.RequestException:
                 pass
@@ -1939,10 +1970,12 @@ class PipelineTelemetry:
                 open_pos = data.get("open_positions", 0)
                 max_pos = data.get("max_positions", 999)
                 if isinstance(open_pos, int) and isinstance(max_pos, int) and open_pos >= max_pos:
+                    dedup_key = f"position-limit-{svc['name']}"
                     _send_telegram(
                         f"*POSITION LIMIT — {svc['name']}*\n"
                         f"open_positions={open_pos} >= max={max_pos}. No new entries possible.",
                         tier=2,
+                        dedup_key=dedup_key,
                     )
             except requests.RequestException:
                 pass
@@ -1963,6 +1996,7 @@ class PipelineTelemetry:
             _send_telegram(
                 "*ALPHA BUFFER SILENT*\n0 submissions received in last 30 min.",
                 tier=3,
+                dedup_key="alpha-buffer-silent",
             )
 
     def check_vix_brake_states(self) -> None:

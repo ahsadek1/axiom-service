@@ -345,15 +345,22 @@ def _reset_daily_counters(db_path: str, today: str) -> None:
     OMNI C1 fix: also resets weekly P&L on Monday (or on first run of a new ISO week).
     Without this, weekly_pnl_pct accumulated indefinitely — one bad week permanently
     trips CB_STOP_WEEKLY_LOSS_PCT and halts the system until manual intervention.
+
+    FIX (May 14): consecutive_losses is reset to 0 each day UNLESS system is in STOP state.
+    RED level auto-resumes next trading day — that means consecutive_losses counter must reset.
+    STOP state is manual-only and persists via manual_override flag, so RED→GREEN naturally.
     """
     from datetime import date as _date
+    state = get_circuit_breaker_state(db_path)
     updates: dict = {
         "daily_trades":    0,
         "daily_wins":      0,
         "daily_losses":    0,
         "daily_pnl_pct":   0.0,
         "last_trade_date": today,
-        # consecutive_losses and portfolio_pnl_pct intentionally preserved
+        # Reset consecutive_losses UNLESS in STOP state (which is manual-override only)
+        "consecutive_losses": 0 if state.get("manual_override") != 1 else state.get("consecutive_losses", 0),
+        # portfolio_pnl_pct intentionally preserved
     }
 
     # Weekly reset: check ISO (year, week) against last recorded reset

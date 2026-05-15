@@ -44,11 +44,14 @@ from database import (
     save_synthesis_result,
 )
 from execution_router import calculate_position_size, route_to_execution
+from execution_confirmation import confirm_order_submitted
+from credential_loader import get_credentials as get_cached_credentials
 from quad_intelligence import run_all_brains
 from synthesis import build_context, compute_verdict, _maybe_alert_brain_degradation
 from psychology_overlay import apply_psychology_overlay, PsychologyOverlayResult
 import oracle_client
 from telegram import send_axiom_block_alert, send_synthesis_card
+from synthesis_pool_monitor import PoolHealthMonitor
 
 # P0-A: Stale deploy detection
 import hashlib as _hashlib
@@ -128,6 +131,9 @@ _PATHWAY_PRIORITY    = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}  # lower = higher pr
 # GAP-14: Semaphore mirrors pool size — ensures release() is ALWAYS called (try/finally)
 # even if _run_synthesis() raises uncaught exception inside a pool worker.
 _SYNTHESIS_SEMAPHORE = __import__("threading").Semaphore(3)
+
+# P0 FIX (May 14, 2026): Pool health monitor initialized in lifespan, accessible here for marking completions
+_pool_monitor: Optional[PoolHealthMonitor] = None
 
 
 def _dispatch_sovereign_instruction(instr: dict) -> None:
@@ -1087,8 +1093,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Failure sentinel started ✅")
     _nns_watchdog.start()
 
+    # ── FIX P0: Initialize OMNI Synthesis Pool Health Monitor (May 14, 2026) ────
+    # ROOT CAUSE: Monitor was imported but never started. Coroutine crashes went undetected.
+    # SOLUTION: Start monitor on service startup; it auto-restarts failed synthesis pool.
+    global _pool_monitor
+    _pool_monitor = PoolHealthMonitor(
+        pool=_SYNTHESIS_POOL,
+        semaphore=_SYNTHESIS_SEMAPHORE,
+        check_interval_sec=10,
+        hang_timeout_sec=45,
+        silence_window_sec=20 * 60,  # 20 minutes
+    )
+    _pool_monitor.start()
+    logger.info("OMNI Synthesis Pool Health Monitor started ✅ (check_interval=10s, silence_window=1200s)")
+
     yield
 
+    if _pool_monitor:
+        _pool_monitor.shutdown()
     _comms_stop_omni.set()
     report("omni", "status", {"event": "stopped"})
     logger.info("OMNI service stopped")
@@ -1602,14 +1624,18 @@ def _run_synthesis(
     context = build_context(concordance, axiom_result, regime, oracle_ctx)
 
     # ── Step 4: Quad Intelligence ─────────────────────────────────────────────
+    # FIX-CREDENTIAL-VAULT: Reload credentials before synthesis (catch rotations)
+    cached_creds = get_cached_credentials()
+    creds_to_use = cached_creds if cached_creds else settings
+    
     brain_results = run_all_brains(
         context           = context,
-        anthropic_api_key = settings.anthropic_api_key,
-        openai_api_key    = settings.openai_api_key,
-        gemini_api_key    = settings.gemini_api_key,
-        deepseek_api_key  = settings.deepseek_api_key,
-        bot_token         = settings.telegram_bot_token,   # FIX-GEMINI-HEALTH: for brain-down alerts
-        ahmed_chat_id     = settings.ahmed_chat_id,        # FIX-GEMINI-HEALTH
+        anthropic_api_key = creds_to_use.anthropic_api_key,
+        openai_api_key    = creds_to_use.openai_api_key,
+        gemini_api_key    = creds_to_use.gemini_api_key,
+        deepseek_api_key  = creds_to_use.deepseek_api_key,
+        bot_token         = creds_to_use.telegram_bot_token,   # FIX-GEMINI-HEALTH: for brain-down alerts
+        ahmed_chat_id     = creds_to_use.ahmed_chat_id,        # FIX-GEMINI-HEALTH
     )
 
     # ── Step 5: Compute verdict ───────────────────────────────────────────────
@@ -1661,6 +1687,10 @@ def _run_synthesis(
         axiom_result         = axiom_result,
         psychology_overlay   = psychology_overlay.to_dict() if psychology_overlay else None,
     )
+
+    # P0 FIX (May 14, 2026): Signal pool health monitor that synthesis completed successfully
+    if _pool_monitor:
+        _pool_monitor.mark_synthesis_complete()
 
     with _state_lock:                          # Pass B fix (V6): thread-safe counter
         app_state["syntheses_today"] += 1
@@ -1748,6 +1778,32 @@ def _run_synthesis(
             position_size      = position_size,
         )
         execution_ok = exec_ok
+        
+        # FIX-EXEC-CONFIRM (2026-05-13): Confirm order was actually submitted
+        # Do NOT assume HTTP 202 means the order is live. Poll the execution engine.
+        if exec_ok:
+            exec_system = concordance["system"]
+            exec_ticker = concordance["ticker"]
+            exec_url    = (
+                settings.alpha_execution_url
+                if exec_system == "alpha"
+                else settings.prime_execution_url
+            )
+            confirmed, conf_detail = confirm_order_submitted(
+                system         = exec_system,
+                ticker         = exec_ticker,
+                execution_url  = exec_url,
+                auth_secret    = exec_auth,
+            )
+            if not confirmed:
+                logger.warning(
+                    "EXEC_CONFIRM FAILED: %s/%s order not confirmed (%s). "
+                    "Escalating to recovery.",
+                    exec_system.upper(), exec_ticker, conf_detail,
+                )
+                # Mark as unconfirmed so auto-recovery kicks in
+                execution_ok = False
+                exec_resp = f"unconfirmed: {conf_detail}"
         mark_execution_dispatched(
             settings.omni_db_path,
             synthesis_id,

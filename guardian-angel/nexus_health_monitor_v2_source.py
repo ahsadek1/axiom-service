@@ -27,6 +27,14 @@ import datetime
 import requests
 import pytz
 import sys as _sys
+
+# Load .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv("/Users/ahmedsadek/nexus/.env")
+except ImportError:
+    pass
+
 _sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
 from alert_client import send_alert as _send_alert
 
@@ -516,6 +524,19 @@ def _monitor_loop():
         except Exception as e:
             print(f"[MONITOR] Loop error: {e}")
         time.sleep(POLL_INTERVAL_SEC)
+
+
+def run_single_check():
+    """Run a single health check poll cycle. Used by cron/wrapper scripts.
+    Returns: 0 if all services UP, 1 if any service DOWN.
+    """
+    _poll_cycle()
+    
+    # Check if any service is DOWN
+    with _state_lock:
+        any_down = any(s["status"] == "DOWN" for s in _state.values())
+    
+    return 1 if any_down else 0
 
 
 def start_health_monitor():

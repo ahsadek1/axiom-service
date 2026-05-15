@@ -5,7 +5,7 @@ Build the complete pipeline-sentinel microservice for the Nexus trading system.
 ## Files to create:
 
 **models.py** — Pydantic v1 models (Python 3.9, use Union[X,Y] not X|Y):
-- HopEnum (axiom_push, agent_received, buffer_accepted, omni_started, omni_completed, execution_received, alpaca_submitted, alpaca_confirmed)
+- HopEnum (axiom_push, agent_received, omni_started, omni_completed, execution_received, alpaca_submitted, alpaca_confirmed) [buffer_accepted is deprecated]
 - ServiceEnum (axiom, cipher, atlas, sage, alpha-buffer, prime-buffer, omni, alpha-execution, prime-execution)
 - TraceRequest(trace_id, hop, service, ticker, pathway, status, metadata)
 - HealthScoreComponents(pipeline_completion_rate, inter_service_latency_p95_ms, omni_brain_latency_p95_ms, oracle_cache_freshness, active_anomaly_count, stalled_picks_count)
@@ -66,7 +66,7 @@ PORT=8008
 **MANDATE.md** — Pipeline Sentinel observes only. Never writes to other services' DBs. Never modifies picks. Never calls Alpaca.
 
 **tests/test_pipeline_sentinel.py** — 12 tests, pytest + httpx TestClient, mock Telegram, tmp_path DB:
-1. Happy path — 8 hops for one pick, GET /pipeline/{id} returns all 8
+1. Happy path — 7 hops for one pick (current pipeline architecture), GET /pipeline/{id} returns all 7
 2. Stall detection — axiom_push trace at T-360s, confirm PIPELINE_STALL in failure_events
 3. Score computation — 12 picks / 7 complete → score deduction ~12pts from completion
 4. Health halt — score=40 → submissions_open=False

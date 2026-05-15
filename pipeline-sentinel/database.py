@@ -423,7 +423,8 @@ def get_stalled_picks(db_path: str, stall_window_s: int) -> List[Dict[str, Any]]
                AND t.hop NOT IN (
                    'alpaca_confirmed', 'alpaca_submitted',
                    'no_go_dropped', 'synthesis_complete',
-                   'score_below_threshold', 'dropped'
+                   'score_below_threshold', 'dropped',
+                   'buffer_accepted'
                )
                AND t.hop != 'agent_received'
             """,

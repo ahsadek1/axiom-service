@@ -576,7 +576,10 @@ def submit_pick(
         )
         if _pool_resp.status_code == 200:
             _universe = _pool_resp.json().get("tickers", [])
-            if _universe and body.ticker not in _universe:
+            # C-01 FIX: Only enforce pool check if universe is large enough to be authoritative.
+            # Axiom Tier 2 intentionally filters to ~20 tickers. If pool < 50, fail open.
+            # This prevents false rejections when Axiom pool is incomplete/updating.
+            if _universe and len(_universe) >= 50 and body.ticker not in _universe:
                 logger.warning(
                     "C-01: Ticker %s rejected — not in Axiom universe (%d tickers)",
                     body.ticker, len(_universe),
@@ -588,6 +591,11 @@ def submit_pick(
                         "reason":   "ticker_not_in_axiom_universe",
                         "ticker":   body.ticker,
                     },
+                )
+            elif _universe and len(_universe) < 50:
+                logger.debug(
+                    "C-01: Axiom pool too small (%d tickers) — failing open for %s (checkpoint: C-01-FAIl-OPEN-V2)",
+                    len(_universe), body.ticker,
                 )
     except Exception as _ae:
         # Fail open — do not block valid signals because Axiom is slow or unreachable

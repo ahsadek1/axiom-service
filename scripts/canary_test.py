@@ -54,7 +54,7 @@ AHMED_CHAT_ID      = os.getenv("AHMED_CHAT_ID",       "8573754783")
 ET = pytz.timezone("America/New_York")
 
 # CANARY uses a synthetic window ID so it doesn't interfere with real trading windows
-CANARY_TICKER    = "MSFT"  # Changed from SPY — SPY (ETF) not in Axiom stock universe (C-01 gate). MSFT is.
+CANARY_TICKER    = "AAPL"  # Fixed 2026-05-12 11:42 — MSFT not in universe. AAPL verified in synthesis_results.
 CANARY_DIRECTION = "bearish"
 CANARY_SCORE     = 85.0   # high enough to pass MIN_SUBMISSION_SCORE and trigger P1
 
