@@ -59,6 +59,8 @@ _consecutive_brain_failures: int = 0
 BRAIN_ALERT_THRESHOLD = 3
 MAX_PICKS_PER_WINDOW = 5          # Top N picks per window — prevents firehose behavior
 _submitted_today: set = set()     # Daily dedup: ticker → submitted this session
+_restart_count: int = 0           # Track restarts to detect crash loops
+MAX_RESTART_CYCLES = 5            # Slow down after 5 rapid restarts
 
 # ── SOVEREIGN Directive State ─────────────────────────────────────────────────
 _sovereign_halted: bool = False
@@ -162,16 +164,32 @@ def _sovereign_comms_loop_sage() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings
+    global _settings, _submitted_today, _restart_count
     _settings = load_settings()
     from shared.db_guard import assert_unique_db_path  # G4: collision guard
     assert_unique_db_path("sage", _settings.db_path)
     init_db(_settings.db_path)
+    
+    # Increment restart counter and warn if crash loop detected
+    _restart_count += 1
+    if _restart_count > MAX_RESTART_CYCLES:
+        logger.critical("Sage: %d rapid restarts detected — possible crash loop. Slowing startup." % _restart_count)
+        time.sleep(5)  # Back off on startup to avoid tight restart loop
+    
+    # Rebuild in-memory submitted_today from database (restart-safe)
+    try:
+        today_picks = get_today_picks(_settings.db_path)
+        _submitted_today = set((p["ticker"] for p in today_picks))
+        logger.info("In-memory dedup rebuilt from DB: %d tickers marked as submitted today", len(_submitted_today))
+    except Exception as e:
+        logger.warning("Failed to rebuild in-memory dedup: %s", e)
+        _submitted_today = set()
+    
     # Start midnight reset thread
     reset_thread = threading.Thread(target=_midnight_reset, daemon=True, name="sage-midnight-reset")
     reset_thread.start()
-    logger.info("Sage agent started on port %d", _settings.port)
-    report("sage", "status", {"event": "started", "port": _settings.port})
+    logger.info("Sage agent started on port %d [restart #%d]", _settings.port, _restart_count)
+    report("sage", "status", {"event": "started", "port": _settings.port, "restart_count": _restart_count})
     # Drain queued directives from before this startup
     _startup_instr = get_instructions("sage")
     if _startup_instr:
@@ -257,7 +275,14 @@ def _analyze_pool(payload: dict) -> None:
 
     try:
         # --- Phase 1: Fetch Oracle context concurrently, then score ---
-        valid_tickers = [t for t in pool if isinstance(t, str) and t not in _submitted_today]
+        # Check BOTH in-memory (session) and persistent database (restart-safe) dedup
+        valid_tickers = [
+            t for t in pool
+            if isinstance(t, str)
+            and t not in _submitted_today
+            and not has_submitted_today(_settings.db_path, t, "bullish")
+            and not has_submitted_today(_settings.db_path, t, "bearish")
+        ]
 
         def _fetch_ticker(ticker: str):
             """Fetch Oracle context for one ticker. Called concurrently."""

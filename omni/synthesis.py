@@ -39,8 +39,18 @@ class SynthesisVerdict:
     brain_summary:        dict[str, str]  # brain_name → vote label
 
     def can_execute(self) -> bool:
-        """Return True if this verdict allows execution."""
-        return self.verdict in ("STRONG_GO", "GO") and not self.axiom_blocked
+        """Return True if this verdict allows execution.
+        
+        Checks:
+        1. Verdict is GO or STRONG_GO
+        2. Axiom has not blocked (hard stop)
+        3. Sizing multiplier is above minimum threshold (0.0 means stand-aside)
+        """
+        return (
+            self.verdict in ("STRONG_GO", "GO")
+            and not self.axiom_blocked
+            and (self.sizing_mult is not None and self.sizing_mult > 0.0)
+        )
 
     def to_dict(self) -> dict:
         return {

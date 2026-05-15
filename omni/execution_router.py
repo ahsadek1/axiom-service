@@ -105,25 +105,39 @@ def route_to_execution(
     execution_url = alpha_exec_url if system == "alpha" else prime_exec_url
     auth_header   = "X-Nexus-Secret" if system == "alpha" else "X-Nexus-Prime-Secret"
 
+    # FIX-PAYLOAD (2026-05-15): Defensively populate payload. Execution services are strict
+    # about required fields. Ensure all fields are present even if concordance/verdict are incomplete.
     payload = {
-        "ticker":            concordance.get("ticker"),
-        "direction":         concordance.get("direction"),
+        "ticker":            concordance.get("ticker") or synthesis_verdict.get("ticker"),
+        "direction":         concordance.get("direction") or synthesis_verdict.get("direction"),
         "system":            system,
-        "pathway":           concordance.get("pathway"),
-        "agent_scores":      concordance.get("scores", {}),
-        "weighted_score":    concordance.get("weighted_score"),
+        "pathway":           concordance.get("pathway") or synthesis_verdict.get("pathway"),
+        "agent_scores":      concordance.get("scores") or concordance.get("agent_scores") or {},
+        "weighted_score":    concordance.get("weighted_score") or synthesis_verdict.get("agent_weighted_score"),
         "verdict":           synthesis_verdict.get("verdict"),
-        "votes_go":          synthesis_verdict.get("votes_go"),
-        "sizing_mult":       synthesis_verdict.get("sizing_mult"),
+        "votes_go":          synthesis_verdict.get("votes_go") or 0,
+        "sizing_mult":       synthesis_verdict.get("sizing_mult") or synthesis_verdict.get("axiom_sizing_mult") or 1.0,
         "position_size_usd": position_size,
-        "window_id":         concordance.get("window_id"),
-        "echo_chamber":      synthesis_verdict.get("echo_chamber_flagged"),
+        "window_id":         concordance.get("window_id") or synthesis_verdict.get("window_id"),
+        "echo_chamber":      synthesis_verdict.get("echo_chamber_flagged") or 0,
         "brain_summary":     synthesis_verdict.get("brain_summary", {}),
-        "axiom_risk_score":  synthesis_verdict.get("axiom_risk_score"),
+        "axiom_risk_score":  synthesis_verdict.get("axiom_risk_score") or 0.0,
         # CONTRACT-1: include auto_execute for observability. Execution services
         # gate on their own NEXUS_AUTO_EXECUTE env var -- this field is informational only.
         "auto_execute":      True,
     }
+    
+    # P0 VALIDATION (2026-05-15): Reject payload if critical fields are still None
+    required_fields = ["ticker", "direction", "verdict", "weighted_score", "window_id", "sizing_mult"]
+    missing = [f for f in required_fields if payload.get(f) is None]
+    if missing:
+        logger.critical(
+            "ROUTE_TO_EXECUTION: Cannot dispatch %s/%s — missing required fields: %s. "
+            "payload=%s | synthesis_verdict=%s",
+            payload.get("ticker"), payload.get("direction"), missing,
+            payload, synthesis_verdict
+        )
+        return False, f"Missing required fields: {missing}"
 
     # ── P0 FIX 2026-05-08: Direction validation before routing ────────────────────
     # Log the exact direction being sent to catch bearish↔bullish inversion.

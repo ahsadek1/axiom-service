@@ -1,0 +1,46 @@
+/Users/ahmedsadek/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-05-05 21:48:32,810 [INFO] command_relay: command_relay: bus poll loop started
+2026-05-05 21:48:32,810 [INFO] command_relay: Command Relay started — bus polling active
+2026-05-05 21:48:40,295 [INFO] command_relay: relay/command:  → vector [ping] → {'routed': True, 'bus_status': 200, 'agent': 'vector'}
+2026-05-05 22:58:27,008 [INFO] command_relay: relay/command:  → cipher [PING] → {'routed': True, 'bus_status': 200, 'agent': 'cipher'}
+2026-05-05 22:59:36,849 [INFO] command_relay: relay/command:  → cipher [PING] → {'routed': True, 'bus_status': 200, 'agent': 'cipher'}
+2026-05-05 23:01:52,010 [INFO] command_relay: command_relay: executing directive 'PING' (id=8e006631-1974-4f2d-a2c6-b7616a226528)
+2026-05-05 23:02:22,172 [INFO] command_relay: command_relay: executing directive 'PING' (id=12968de0-2f4b-47e2-8ae6-e8d5c6295a85)
+2026-05-05 23:03:22,349 [INFO] command_relay: relay/command:  → cipher [PING] → {'routed': True, 'bus_status': 200, 'agent': 'cipher'}
+2026-05-05 23:03:22,484 [INFO] command_relay: command_relay: executing directive 'PING' (id=369897ba-0119-43e6-9d4c-f6f7b4f1d138)
+2026-05-05 23:04:24,193 [INFO] command_relay: relay/command:  → cipher [PING] → {'routed': True, 'bus_status': 200, 'agent': 'cipher'}
+2026-05-05 23:04:57,484 [INFO] command_relay: relay/command:  → cipher [PING] → {'routed': True, 'bus_status': 200, 'agent': 'cipher'}
+2026-05-05 23:05:23,113 [INFO] command_relay: command_relay: executing directive 'PING' (id=df0d6d29-6147-40d3-b206-e65a559e7d4d)
+2026-05-05 23:05:23,114 [INFO] command_relay: command_relay: executing directive 'PING' (id=b4641d03-b0d8-46f4-a619-173954b4480c)
+2026-05-05 23:05:53,268 [INFO] command_relay: command_relay: executing directive 'FLEET_STATUS' (id=948ddc92-9a2e-4e03-b04c-5609f30e5cfe)
+2026-05-05 23:13:55,911 [INFO] command_relay: command_relay: executing directive 'FLEET_STATUS' (id=2f66e3a0-755f-400c-aba7-b5fe18cb10f5)
+2026-05-06 03:01:27,870 [WARNING] command_relay: command_relay: bus poll failed: HTTPConnectionPool(host='192.168.1.141', port=9999): Max retries exceeded with url: /inbox/command-relay (Caused by NewConnectionError("HTTPConnection(host='192.168.1.141', port=9999): Failed to establish a new connection: [Errno 51] Network is unreachable"))
+/Users/ahmedsadek/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-05-08 08:53:01,054 [INFO] command_relay: command_relay: bus poll loop started
+2026-05-08 08:53:01,057 [INFO] command_relay: Command Relay started — bus polling active
+/Users/ahmedsadek/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-05-08 09:57:15,430 [INFO] command_relay: command_relay: bus poll loop started
+2026-05-08 09:57:15,437 [INFO] command_relay: Command Relay started — bus polling active
+2026-05-09 17:34:41,511 [INFO] command_relay: relay/command:  →  [ls ~/nexus/] → {'error': 'unknown target: '}
+2026-05-09 20:01:07,188 [INFO] command_relay: relay/command:  → genesis [find ~/nexus -name "*thesis*" -o -name "*chroma*" 2>/dev/null | head -20] → {'routed': True, 'bus_status': 200, 'agent': 'genesis'}
+2026-05-09 20:18:20,093 [WARNING] command_relay: command_relay: unknown directive 'SOVEREIGN DIRECTIVE'
+2026-05-09 20:32:51,811 [INFO] command_relay: relay/command:  →  [ps aux | grep -i openclaw | grep -v grep; echo SEP; ps aux | grep -i vector | grep -v grep] → {'error': 'unknown target: '}
+2026-05-09 20:32:54,061 [WARNING] command_relay: command_relay: unknown directive 'STATUS_CHECK'
+2026-05-09 20:33:29,837 [INFO] command_relay: relay/command:  → vector [ps aux | grep -i openclaw | grep -v grep] → {'routed': True, 'bus_status': 200, 'agent': 'vector'}
+2026-05-09 20:33:30,320 [INFO] command_relay: relay/command:  →  [ps aux | grep -i openclaw | grep -v grep] → {'error': 'unknown target: '}
+2026-05-11 17:05:58,976 [INFO] command_relay: relay/command:  →  [echo CONNECTED && hostname && uptime] → {'error': 'unknown target: '}
+2026-05-11 17:06:03,647 [INFO] command_relay: relay/command:  →  [echo CONNECTED && hostname && uptime] → {'error': 'unknown target: '}
+2026-05-13 03:01:08,341 [WARNING] command_relay: command_relay: bus poll failed: HTTPConnectionPool(host='192.168.1.141', port=9999): Max retries exceeded with url: /inbox/command-relay (Caused by NewConnectionError("HTTPConnection(host='192.168.1.141', port=9999): Failed to establish a new connection: [Errno 51] Network is unreachable"))
+2026-05-15 12:11:47,511 [INFO] command_relay: Command Relay shutting down
+/Users/ahmedsadek/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-05-15 12:11:47,971 [INFO] command_relay: command_relay: bus poll loop started
+2026-05-15 12:11:47,973 [INFO] command_relay: Command Relay started — bus polling active
+2026-05-15 13:04:55,355 [INFO] command_relay: Command Relay shutting down
+/Users/ahmedsadek/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-05-15 13:04:55,858 [INFO] command_relay: command_relay: bus poll loop started
+2026-05-15 13:04:55,859 [INFO] command_relay: Command Relay started — bus polling active
