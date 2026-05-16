@@ -255,6 +255,35 @@ def run_preflight_endpoint(x_nexus_secret: str = Header(default="", alias="X-Nex
     }
 
 
+@app.get("/verdicts")
+def get_verdicts(
+    x_nexus_secret: str = Header(default="", alias="X-Nexus-Secret"),
+) -> JSONResponse:
+    """Get summary of recent verdicts/submissions. Used by OMNI for monitoring."""
+    _verify(x_nexus_secret)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        trades_rows = conn.execute("SELECT COUNT(*) as cnt FROM positions WHERE created_date = DATE('now')").fetchall()
+        trades_today = trades_rows[0][0] if trades_rows else 0
+        
+        open_rows = conn.execute("SELECT COUNT(*) as cnt FROM positions WHERE status IN ('open','pending')").fetchall()
+        open_count = open_rows[0][0] if open_rows else 0
+        conn.close()
+    except Exception as e:
+        logger.warning("Verdicts query failed: %s", e)
+        trades_today = 0
+        open_count = 0
+    
+    return JSONResponse({
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "trades_today": trades_today,
+        "open_positions": open_count,
+        "service": "nexus-v2-rebuild",
+        "version": VERSION,
+    })
+
+
 @app.post("/verdicts")
 def verdicts_endpoint(
     x_nexus_secret: str = Header(default="", alias="X-Nexus-Secret"),
