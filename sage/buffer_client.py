@@ -277,10 +277,13 @@ def submit_to_alpha(
     _price  = _resolve_stock_price(ticker)
     _strike_entry, _strike_target = _resolve_strikes(ticker, direction, _price)
 
+    # Map internal direction ('bullish'/'bearish') to Railway enum ('LONG'/'SHORT')
+    _railway_direction = "LONG" if direction == "bullish" else "SHORT"
+
     _submit_to_railway_async({
         "agent":         agent,
         "ticker":        ticker,
-        "direction":     direction,
+        "direction":     _railway_direction,
         "score":         score,
         "confidence":    int(score),
         "strategy":      _railway_strategy,

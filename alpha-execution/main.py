@@ -1234,6 +1234,46 @@ def health() -> JSONResponse:
     })
 
 
+@_protected.get("/verdicts")
+def verdicts(
+    x_nexus_secret: str = Header(default=""),
+) -> JSONResponse:
+    """
+    Return list of recent verdicts/submissions to this service.
+    
+    Used by OMNI to monitor what synthesis decisions are in flight.
+    Returns a summary of executions, 422 errors, and pending trades.
+    """
+    with _state_lock:
+        trades_today = app_state.get("trades_today", 0)
+        total_trades = app_state.get("total_trades", 0)
+        execution_paused = app_state.get("execution_paused", False)
+        last_exec_error = app_state.get("first_exec_failed", False)
+    
+    # Get open positions count
+    open_count = count_open_positions(settings.alpha_db_path)
+    pending_count = 0
+    try:
+        with sqlite3.connect(settings.alpha_db_path) as conn:
+            pending_rows = conn.execute(
+                "SELECT COUNT(*) as cnt FROM positions WHERE status='pending'"
+            ).fetchall()
+            pending_count = pending_rows[0][0] if pending_rows else 0
+    except Exception:
+        pass
+    
+    return JSONResponse({
+        "status": "ok",
+        "timestamp": datetime.now(ET).isoformat(),
+        "trades_today": trades_today,
+        "total_trades": total_trades,
+        "open_positions": open_count,
+        "pending_positions": pending_count,
+        "execution_paused": execution_paused,
+        "last_error": last_exec_error,
+    })
+
+
 @_protected.post("/execute")
 def execute(
     body: ExecuteRequest,
