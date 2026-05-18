@@ -378,21 +378,70 @@ def _send_telegram(message: str, tier: int = 2, dedup_key: Optional[str] = None)
 
 
 # ---------------------------------------------------------------------------
-# GENESIS notification
+# PRIMUS & CIPHER SQS Alert Routing (Ahmed Directive 2026-05-17)
+# ---------------------------------------------------------------------------
+
+def _notify_primus_sqs(component: str, failure_detail: str, log_tail: str = "") -> None:
+    """Route SQS service alerts to PRIMUS (primary), fallback to CIPHER.
+    
+    SQS alerts MUST go to Primus first. If Primus unresponsive after 30s,
+    escalate to Cipher. This ensures SQS issues are owned by the SQS engineer.
+    """
+    text = f"🚨 [GUARDIAN] SQS ALERT: {component}. {failure_detail}"
+    if log_tail:
+        text += f" | Log: {log_tail[:150]}"
+    
+    try:
+        # Primary: route to PRIMUS main session
+        subprocess.run(
+            ["openclaw", "sessions", "send", 
+             "--session-key", "agent:primus:main",
+             "--message", text],
+            capture_output=True, timeout=10,
+        )
+        log.info("SQS alert routed to PRIMUS: %s", component)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        log.warning("PRIMUS notify failed, escalating to CIPHER: %s", exc)
+        try:
+            # Fallback: route to CIPHER
+            subprocess.run(
+                ["openclaw", "sessions", "send",
+                 "--session-key", "agent:cipher:main",
+                 "--message", f"PRIMUS UNRESPONSIVE - {text}"],
+                capture_output=True, timeout=10,
+            )
+            log.info("SQS alert escalated to CIPHER (PRIMUS unresponsive)")
+        except Exception as cipher_exc:
+            log.error("Both PRIMUS and CIPHER notify failed: %s", cipher_exc)
+
+
+# ---------------------------------------------------------------------------
+# GENESIS notification (non-SQS services)
 # ---------------------------------------------------------------------------
 
 def _notify_genesis(component: str, failure_detail: str, log_tail: str = "") -> None:
-    """Fire an OpenClaw system event so GENESIS is notified on Tier 2+."""
-    text = f"GUARDIAN ANGEL ESCALATION: Fix {component}. {failure_detail}"
+    """Fire a direct message to GENESIS agent via OpenClaw sessions_send.
+    
+    This is CRITICAL — orphan positions and other Tier 2+ failures MUST reach
+    the GENESIS agent immediately so it can act. No fallback, no suppression.
+    """
+    text = f"🚨 [GUARDIAN ESCALATION] {component}\n\n{failure_detail}"
     if log_tail:
-        text += f". Log: {log_tail[:200]}"
+        text += f"\n\nContext: {log_tail[:200]}"
+    
     try:
-        subprocess.run(
-            ["openclaw", "system", "event", "--text", text, "--mode", "now"],
-            capture_output=True, timeout=10,
+        result = subprocess.run(
+            ["openclaw", "sessions", "send",
+             "--session-key", "agent:genesis:main",
+             "--message", text],
+            capture_output=True, timeout=30,
         )
+        if result.returncode == 0:
+            log.info("GENESIS notify succeeded for %s", component)
+        else:
+            log.error("GENESIS notify failed (exit %d): %s", result.returncode, result.stderr.decode('utf-8', errors='ignore'))
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        log.warning("GENESIS notify failed: %s", exc)
+        log.error("GENESIS notify exception: %s — this is CRITICAL, Guardian Angel escalation failed", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1288,14 @@ class CoherenceVerifier:
                         tier=4,
                         dedup_key="orphan-positions-alert",
                     )
+                    # CRITICAL: Also notify GENESIS immediately so it can act
+                    if failed_close:
+                        _notify_genesis(
+                            "orphan-positions",
+                            f"🚨 ORPHANED POSITIONS REQUIRE MANUAL CLOSE IN ALPACA: {failed_close}\n"
+                            f"Auto-close attempt FAILED. These must be manually closed immediately.",
+                            ""
+                        )
             return len(failed_close) == 0
 
         self._log_check("alpaca_db_agreement", True, "all positions reconciled")
@@ -1508,7 +1565,14 @@ class EscalationEngine:
             tier=4,
             dedup_key=dedup_key,
         )
-        _notify_genesis(component, detail)
+        # Route SQS alerts to PRIMUS, others to GENESIS (Ahmed Directive 2026-05-17)
+        is_sqs_service = any(sqs in component.lower() for sqs in 
+                            ["capital_router", "capital-router", "atm", "atg", 
+                             "multiweek", "0dte", "swing", "intraday"])
+        if is_sqs_service:
+            _notify_primus_sqs(component, detail)
+        else:
+            _notify_genesis(component, detail)
 
     def tick(self) -> None:
         """Advance escalation ladder for any unresolved failures. Call each main loop."""
@@ -1532,6 +1596,11 @@ class EscalationEngine:
             detail = state["detail"]
             log_tail = state.get("log_tail", "")
             elapsed_min = (now - state["first_seen"]) / 60.0
+            
+            # Determine if this is an SQS service (Ahmed Directive 2026-05-17)
+            is_sqs_service = any(sqs in component.lower() for sqs in 
+                                ["capital_router", "capital-router", "atm", "atg", 
+                                 "multiweek", "0dte", "swing", "intraday"])
 
             if new_tier == 2:
                 log.warning("EscalationEngine: → Tier 2 for %s (unresolved %.0fs)",
@@ -1544,7 +1613,11 @@ class EscalationEngine:
                     tier=2,
                     dedup_key=dedup_key,
                 )
-                _notify_genesis(component, detail, log_tail)
+                # Route SQS alerts to PRIMUS, others to GENESIS (Ahmed Directive)
+                if is_sqs_service:
+                    _notify_primus_sqs(component, detail, log_tail)
+                else:
+                    _notify_genesis(component, detail, log_tail)
 
             elif new_tier == 3:
                 log.error("EscalationEngine: → Tier 3 for %s (unresolved %.0f min)",

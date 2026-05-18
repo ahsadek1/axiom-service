@@ -367,3 +367,57 @@ def save_risk_assessment(
             ),
         )
         conn.commit()
+
+
+# ── Audit Log Queries ────────────────────────────────────────────────────────
+
+def get_agent_push_log_entries(
+    db_path: str,
+    limit: int = 100,
+    agent: Optional[str] = None,
+) -> list[dict]:
+    """
+    Fetch agent push log entries from the database.
+
+    Args:
+        db_path: Path to the SQLite database.
+        limit:   Maximum number of entries to return.
+        agent:   Optional agent name filter (e.g. 'Cipher').
+
+    Returns:
+        List of dicts with keys: window_id, agent, status, response_ms, created_at
+    """
+    with get_conn(db_path) as conn:
+        if agent:
+            rows = conn.execute(
+                "SELECT * FROM agent_push_log WHERE agent=? ORDER BY created_at DESC LIMIT ?",
+                (agent, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM agent_push_log ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_pool_snapshots(
+    db_path: str,
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Fetch recent pool snapshots from the database.
+
+    Args:
+        db_path: Path to the SQLite database.
+        limit:   Maximum number of snapshots to return.
+
+    Returns:
+        List of dicts with keys: window_id, tickers, regime, pool_size, created_at
+    """
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT window_id, tickers, regime, pool_size, created_at FROM pool_snapshots ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]

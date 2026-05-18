@@ -6163,3 +6163,468 @@ Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True
 2026-05-16 08:16:06,991 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
 Closed: [] | Failed: ['HWM260717P00200000']
 Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 09:16:13,553 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 09:50:17,129 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=428 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*PREDICTED FAILURE* — `sqs-atm-0dte`
+
+Signal: response_time_ title=*PREDICTED FAILURE* — `sqs-atm-0dte`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *14.6 minutes*
+Preemptive restart initiated.
+2026-05-16 09:50:17,132 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-0dte`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *14.6 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 10:16:20,797 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 11:16:27,165 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:16:33,970 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:26:39,250 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=429 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*MULTI-AI DIAGNOSIS — `sqs-atm-0dte`*
+
+*Claude:* # Nexus Tra title=*MULTI-AI DIAGNOSIS — `sqs-atm-0dte`*
+
+*Claude:* # Nexus Trading System Diagnosis
+
+The `sqs-atm-0dte` service is failing with a `CONNECTION_REFUSED` error and has been identified as the root cause wit
+2026-05-16 12:26:39,255 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*MULTI-AI DIAGNOSIS — `sqs-atm-0dte`*
+
+*Claude:* # Nexus Trading System Diagnosis
+
+The `sqs-atm-0dte` service is failing with a `CONNECTION_REFUSED` error and has been identified as the root cause wit' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:26:41,493 [WARNING] alert_broker.router: router: Telegram attempt 1 failed for 'nexus_health_group': ('Connection aborted.', ConnectionResetError(54, 'Connection reset by peer'))
+2026-05-16 12:26:43,333 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-0dte`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *14.5 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:26:52,650 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=430 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*UNRESOLVED — sqs-atm-0dte*
+
+CONNECTION_REFUSED — http://loc title=*UNRESOLVED — sqs-atm-0dte*
+
+CONNECTION_REFUSED — http://localhost:9005/health
+
+Duration: 1.1 min — auto-heal attempted, not recovered.
+2026-05-16 12:26:52,654 [INFO] alert_broker: alert_broker: sent [WARNING] '*UNRESOLVED — sqs-atm-0dte*
+
+CONNECTION_REFUSED — http://localhost:9005/health
+
+Duration: 1.1 min — auto-heal attempted, not recovered.' → {'nexus_health_group': True}
+2026-05-16 12:27:34,710 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=431 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*CRITICAL — sqs-atm-0dte*
+
+3+ crashes in 10 min. Auto-restar title=*CRITICAL — sqs-atm-0dte*
+
+3+ crashes in 10 min. Auto-restart SUSPENDED. Manual intervention required.
+
+Requires immediate manual intervention.
+2026-05-16 12:27:34,712 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*CRITICAL — sqs-atm-0dte*
+
+3+ crashes in 10 min. Auto-restart SUSPENDED. Manual intervention required.
+
+Requires immediate manual intervention.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:27:35,926 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-0dte`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.3 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:28:34,962 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-0dte`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *11.9 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:50:42,233 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*MULTI-AI DIAGNOSIS — `sqs-atm-multiweek`*
+
+*Claude:* # Diagnosis
+
+The **sqs-atm-multiweek** service is failing with a CONNECTION_REFUSED error and is identified as the root cause with no upstream dep' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:50:47,880 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=432 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*MULTI-AI DIAGNOSIS — `sqs-atg-intraday`*
+
+*Claude:* # Diagn title=*MULTI-AI DIAGNOSIS — `sqs-atg-intraday`*
+
+*Claude:* # Diagnosis
+
+The **sqs-atg-intraday** service cannot establish a network connection to its required dependency (likely an SQS queue or message brok
+2026-05-16 12:50:47,883 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*MULTI-AI DIAGNOSIS — `sqs-atg-intraday`*
+
+*Claude:* # Diagnosis
+
+The **sqs-atg-intraday** service cannot establish a network connection to its required dependency (likely an SQS queue or message brok' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:14,988 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=433 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*MULTI-AI DIAGNOSIS — `sqs-capital-router`*
+
+*Claude:* # Nex title=*MULTI-AI DIAGNOSIS — `sqs-capital-router`*
+
+*Claude:* # Nexus Trading System Failure Diagnosis
+
+The `sqs-capital-router` service has failed with a `CONNECTION_REFUSED` error and is identified as the 
+2026-05-16 12:51:14,990 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*MULTI-AI DIAGNOSIS — `sqs-capital-router`*
+
+*Claude:* # Nexus Trading System Failure Diagnosis
+
+The `sqs-capital-router` service has failed with a `CONNECTION_REFUSED` error and is identified as the ' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:18,319 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-multiweek`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.3 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:18,352 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=434 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*PREDICTED FAILURE* — `sqs-capital-router`
+
+Signal: response title=*PREDICTED FAILURE* — `sqs-capital-router`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.3 minutes*
+Preemptive restart initiated.
+2026-05-16 12:51:18,356 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-capital-router`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.3 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:18,418 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=435 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*PREDICTED FAILURE* — `sqs-atg-intraday`
+
+Signal: response_t title=*PREDICTED FAILURE* — `sqs-atg-intraday`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.3 minutes*
+Preemptive restart initiated.
+2026-05-16 12:51:18,423 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-intraday`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.3 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:29,653 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=436 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:[3 alerts] *UNRESOLVED — sqs-atm-multiweek*
+
+CONNECTION_REFU title=[3 alerts] *UNRESOLVED — sqs-atm-multiweek*
+
+CONNECTION_REFUSED — http://localhost:9004/health
+
+Duration: 1.6 min — auto-heal attempted, not recovered. | *UNRESOLVED — sqs-atg-intraday*
+
+CONNECTION_REFUSED — htt
+2026-05-16 12:51:29,656 [INFO] alert_broker: alert_broker: sent [WARNING] '[3 alerts] *UNRESOLVED — sqs-atm-multiweek*
+
+CONNECTION_REFUSED — http://localhost:9004/health
+
+Duration: 1.6 min — auto-heal attempted, not recovered. | *UNRESOLVED — sqs-atg-intraday*
+
+CONNECTION_REFUSED — htt' → {'nexus_health_group': True}
+2026-05-16 12:51:37,583 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*CRITICAL — sqs-atm-multiweek*
+
+3+ crashes in 10 min. Auto-restart SUSPENDED. Manual intervention required.
+
+Requires immediate manual intervention.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:38,679 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=437 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*CRITICAL — sqs-atg-intraday*
+
+3+ crashes in 10 min. Auto-re title=*CRITICAL — sqs-atg-intraday*
+
+3+ crashes in 10 min. Auto-restart SUSPENDED. Manual intervention required.
+
+Requires immediate manual intervention.
+2026-05-16 12:51:38,683 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*CRITICAL — sqs-atg-intraday*
+
+3+ crashes in 10 min. Auto-restart SUSPENDED. Manual intervention required.
+
+Requires immediate manual intervention.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:39,301 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:51:39,303 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:51:39,303 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-intraday`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *5.6 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:51:39,305 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:51:39,306 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:51:39,306 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-capital-router`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *5.6 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:51:39,642 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=438 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*CRITICAL — sqs-capital-router*
+
+3+ crashes in 10 min. Auto- title=*CRITICAL — sqs-capital-router*
+
+3+ crashes in 10 min. Auto-restart SUSPENDED. Manual intervention required.
+
+Requires immediate manual intervention.
+2026-05-16 12:51:39,646 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*CRITICAL — sqs-capital-router*
+
+3+ crashes in 10 min. Auto-restart SUSPENDED. Manual intervention required.
+
+Requires immediate manual intervention.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 12:51:39,964 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:51:39,971 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-multiweek`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *5.6 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': False}
+2026-05-16 12:52:37,567 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:52:37,568 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:52:37,568 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-multiweek`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *3.5 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:52:37,573 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:52:37,573 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:52:37,573 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-intraday`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *6.1 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:52:37,577 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:52:37,577 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:52:37,577 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-capital-router`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *6.1 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:53:00,077 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:53:00,078 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:53:00,078 [INFO] alert_broker: alert_broker: sent [WARNING] '🟡 NEXUS PULSE WARN: atm-multiweek' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:53:36,606 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:53:36,606 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:53:36,606 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-multiweek`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *2.6 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:53:36,614 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:53:36,615 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:53:36,615 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-intraday`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *8.2 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:53:36,621 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:53:36,622 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:53:36,622 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-capital-router`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *8.2 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:54:36,585 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:54:36,585 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:54:36,585 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-multiweek`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.6 minutes*
+Preemptive restart initiated.' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 12:55:46,196 [INFO] alert_broker.router: router: flushing 10 overflow alerts for target 'ahmed'
+2026-05-16 12:55:47,566 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,566 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,566 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,566 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,566 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,567 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,567 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,567 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:55:47,567 [INFO] alert_broker.router: router: flushing 11 overflow alerts for target 'nexus_health_group'
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:55:48,919 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:56:19,215 [INFO] alert_broker.router: router: flushing 8 overflow alerts for target 'ahmed'
+2026-05-16 12:56:21,934 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:56:21,934 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:56:21,934 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:56:21,935 [WARNING] alert_broker.router: router: rate cap hit for 'ahmed' — queuing overflow
+2026-05-16 12:56:21,935 [INFO] alert_broker.router: router: flushing 9 overflow alerts for target 'nexus_health_group'
+2026-05-16 12:56:25,083 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:56:25,083 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:56:25,083 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:56:25,083 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:56:25,083 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 12:56:40,231 [INFO] alert_broker.router: router: flushing 4 overflow alerts for target 'ahmed'
+2026-05-16 12:56:49,318 [WARNING] alert_broker.router: router: Telegram attempt 1 failed for 'ahmed': HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=8.0)
+2026-05-16 12:56:52,540 [INFO] alert_broker.router: router: flushing 5 overflow alerts for target 'nexus_health_group'
+2026-05-16 12:56:55,259 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-05-16 13:00:57,353 [INFO] alert_broker.router: router: flushing 1 overflow alerts for target 'nexus_health_group'
+2026-05-16 13:18:40,411 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 13:27:44,793 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*MULTI-AI DIAGNOSIS — `sqs-atg-swing`*
+
+*Claude:* # Nexus Trading System Diagnosis
+
+The `sqs-atg-swing` service is unable to establish a connection, indicating the service itself is either down, not l' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 13:28:09,858 [INFO] alert_broker: alert_broker: sent [WARNING] '*UNRESOLVED — sqs-atg-swing*
+
+CONNECTION_REFUSED — http://localhost:9006/health
+
+Duration: 1.1 min — auto-heal attempted, not recovered.' → {'nexus_health_group': True}
+2026-05-16 14:18:45,633 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 15:18:50,288 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 16:02:11,799 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'ahmed'
+2026-05-16 16:02:12,363 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'nexus_health_group'
+2026-05-16 16:02:12,365 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from axiom-inspector: critical' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 16:02:13,037 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'ahmed'
+2026-05-16 16:02:13,592 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'nexus_health_group'
+2026-05-16 16:02:13,594 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from axiom-inspector: critical' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 16:07:45,614 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'ahmed'
+2026-05-16 16:07:46,172 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'nexus_health_group'
+2026-05-16 16:07:46,174 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from axiom-inspector: critical' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 16:07:46,739 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'ahmed'
+2026-05-16 16:07:47,303 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'nexus_health_group'
+2026-05-16 16:07:47,305 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from axiom-inspector: critical' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 16:08:18,024 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'ahmed'
+2026-05-16 16:08:18,587 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'nexus_health_group'
+2026-05-16 16:08:18,589 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from axiom-inspector: critical' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 16:08:19,217 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'ahmed'
+2026-05-16 16:08:19,751 [WARNING] alert_broker.router: router: Telegram HTTP 400 for 'nexus_health_group'
+2026-05-16 16:08:19,757 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from axiom-inspector: critical' → {'ahmed': False, 'nexus_health_group': False}
+2026-05-16 16:18:54,957 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 17:16:59,002 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atm-multiweek`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *11.6 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 17:18:59,630 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 18:04:23,230 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=439 agent=bus/primus service=bus/primus key=bus/primus:P0 from primus: 🚨 p0 mandatory failure (6 title=P0 from primus: 🚨 p0 mandatory failure (6
+2026-05-16 18:04:23,235 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from primus: 🚨 p0 mandatory failure (6' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 18:19:04,101 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 19:19:08,986 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 20:20:13,132 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 21:20:17,498 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 22:21:21,887 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-16 23:21:26,097 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 00:21:31,047 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 01:21:35,774 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 02:21:40,800 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 03:21:46,067 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 04:21:51,853 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 05:21:56,502 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 06:22:01,854 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 07:22:06,988 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 08:18:13,043 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 08:30:14,604 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 08:52:40,386 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=440 agent=bus/primus service=bus/primus key=bus/primus:P0 from primus: p0 blocker title=P0 from primus: p0 blocker
+2026-05-17 08:52:40,392 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from primus: p0 blocker' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 09:06:42,810 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 10:07:47,132 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 10:23:50,145 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 11:24:54,446 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 12:24:58,684 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 13:25:02,923 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 14:25:08,155 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 15:25:12,948 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 16:25:17,251 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 17:25:22,142 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 18:25:27,096 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 19:25:31,234 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 20:25:36,041 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 21:25:39,975 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 22:25:44,535 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-17 23:25:49,361 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 00:25:53,488 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 01:25:58,050 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 02:26:02,516 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 03:26:07,703 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 04:26:11,836 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 05:27:16,444 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 06:27:21,100 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 07:27:26,466 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 08:27:32,286 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}
+2026-05-18 09:27:47,049 [WARNING] alert_broker.router: router: Telegram attempt 1 failed for 'nexus_health_group': HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=8.0)
+2026-05-18 09:27:48,883 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHAN POSITIONS — ACTION REQUIRED*
+Closed: [] | Failed: ['HWM260717P00200000']
+Manually close ['HWM260717P00200000'] in Alpaca immediately.' → {'ahmed': True, 'nexus_health_group': True}

@@ -30,11 +30,12 @@ from shared.sovereign_comms import get_instructions, report
 from shared.watchdog import Watchdog
 
 # ── Axiom 30% Resilience Layer ─────────────────────────────────────────────
-from resilience.state import make_vix_cache, make_regime_cache
-from resilience.db import assess_db_write
-from resilience.health import AxiomHealthReport
+from axiom.resilience.state import make_vix_cache, make_regime_cache
+from axiom.resilience.db import assess_db_write
+from axiom.resilience.health import AxiomHealthReport
 
-from config import load_settings, MAX_POSITIONS, MAX_RISK_PER_TRADE, MIN_DTE, MAX_DTE, VIX_PAUSE_THRESHOLD, MIN_IVR_CREDIT_SPREAD, MAX_IVR_DEBIT_SPREAD
+from axiom.config import load_settings, MAX_POSITIONS, MAX_RISK_PER_TRADE, MIN_DTE, MAX_DTE, VIX_PAUSE_THRESHOLD, MIN_IVR_CREDIT_SPREAD, MAX_IVR_DEBIT_SPREAD
+from axiom.inspector import AxiomInspector
 
 # P0-A: Stale deploy detection
 import hashlib as _hashlib
@@ -293,6 +294,61 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if _instr:
         logger.info("Axiom: %d instruction(s) from SOVEREIGN on startup", len(_instr))
     _nns_watchdog.start()
+
+    # ── Axiom Inspector General — Autonomous audit module ──────────────────────
+    inspector = AxiomInspector(app_state, settings, logger)
+    app_state["inspector"] = inspector
+
+    # Schedule inspector jobs
+    try:
+        # Pre-market sweep: 8:30 AM ET (before pool refresh)
+        scheduler.add_job(
+            inspector.run_pre_market_sweep,
+            "cron",
+            hour=8,
+            minute=30,
+            timezone="America/New_York",
+            id="axiom-inspector-pre-market",
+            replace_existing=True,
+        )
+
+        # Market-hours sweep: every 15 min from 9 AM to 4 PM ET
+        scheduler.add_job(
+            inspector.run_market_hours_sweep,
+            "cron",
+            hour="9-15",
+            minute="*/15",
+            timezone="America/New_York",
+            id="axiom-inspector-market-hours",
+            replace_existing=True,
+        )
+
+        # Post-market audit: 4:30 PM ET (after close)
+        scheduler.add_job(
+            inspector.run_post_market_audit,
+            "cron",
+            hour=16,
+            minute=30,
+            timezone="America/New_York",
+            id="axiom-inspector-post-market",
+            replace_existing=True,
+        )
+
+        # Weekly summary: Friday 5 PM ET
+        scheduler.add_job(
+            inspector.run_weekly_summary,
+            "cron",
+            day_of_week=4,  # Friday
+            hour=17,
+            minute=0,
+            timezone="America/New_York",
+            id="axiom-inspector-weekly",
+            replace_existing=True,
+        )
+
+        logger.info("Axiom Inspector General initialized — 4 audit jobs scheduled")
+    except Exception as e:
+        logger.error("Failed to schedule inspector jobs: %s", e)
 
     yield
 
