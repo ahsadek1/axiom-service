@@ -459,6 +459,40 @@ def health() -> JSONResponse:
     })
 
 
+@app.get("/verdicts")
+def get_verdicts(
+    x_nexus_secret: str = Header(default="", alias="X-Nexus-Secret"),
+) -> JSONResponse:
+    """Get summary of recent verdicts/submissions. Used by OMNI for monitoring."""
+    verify_secret(x_nexus_secret)
+    try:
+        conn = get_conn(settings.alpha_db_path)
+        # Submissions today
+        submissions_today = conn.execute(
+            "SELECT COUNT(*) as cnt FROM submissions WHERE DATE(created_at) = DATE('now')"
+        ).fetchone()[0]
+        # Open concordance results (not yet dispatched to OMNI)
+        undispatched = len(get_undispatched_concordances(settings.alpha_db_path))
+        # Circuit breaker status
+        cb = get_circuit_breaker_state(settings.alpha_db_path)
+        conn.close()
+    except Exception as e:
+        logger.warning("Verdicts query failed: %s", e)
+        submissions_today = 0
+        undispatched = 0
+        cb = {"status": "UNKNOWN"}
+    
+    return JSONResponse({
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "submissions_today": submissions_today,
+        "undispatched_concordances": undispatched,
+        "circuit_breaker": cb.get("status", "UNKNOWN"),
+        "service": "alpha-buffer",
+        "version": "3.0.0",
+    })
+
+
 @app.post("/submit")
 def submit_pick(
     body: SubmitRequest,
