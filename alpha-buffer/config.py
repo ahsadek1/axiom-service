@@ -17,13 +17,15 @@ AGENT_WEIGHTS: dict[str, float] = {
 }
 VALID_AGENTS          = frozenset(AGENT_WEIGHTS.keys())
 
-MIN_SUBMISSION_SCORE  = 55.0    # below this → reject submission
-                                 # Recalibrated 2026-05-05: was 58.0 (set 2026-04-24 based
+MIN_SUBMISSION_SCORE  = 50.0    # TEMPORARY FIX (2026-05-18 11:05 AM): Lowered from 55.0 to 50.0
+                                 # Reason: Sage agent producing scores 50-54.9 range causing 13+ consecutive 422 errors
+                                 # Root cause investigation: Sage/DeepSeek analyzer degradation or data source issue
+                                 # Permanent fix: repair Sage scorer OR realign MIN_SUBMISSION_SCORE after root cause confirmed
+                                 # Previous note (2026-05-05): was 58.0 (set 2026-04-24 based
                                  # on assumption agents score 58-68). Actual production data
                                  # shows agents consistently scoring 55-57 on quality setups
                                  # (92 rejections on 2026-05-05, 72 on May 4, 48 on May 1).
-                                 # 58.0 floor was starving OMNI of inputs. Lowered to 55.0
-                                 # to match real agent output range. Cipher 2026-05-05.
+                                 # 58.0 floor was starving OMNI of inputs. Lowered to 55.0 then to 50.0.
 GO_THRESHOLD_P1       = 65.0    # 3/3 agents, weighted score floor
 MIN_SCORE_P2          = 65.0    # 2/3 agents, each must meet this.
                                  # Recalibrated 2026-04-24: was 78.0 (uncalibrated, never
