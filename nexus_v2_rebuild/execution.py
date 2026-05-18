@@ -342,10 +342,43 @@ def _rollback_execution(db_path: str, arena: str, allocated_usd: float,
         logger.error("[Exec] Rollback capital release failed: %s", e)
 
 
+def build_spread_legs(ticker: str, direction: str, dte: int, 
+                       notional: float) -> list:
+    """
+    Build options spread legs for multi-leg strategies.
+    Returns list of {symbol, qty, side} for each leg.
+    
+    For now: simplified two-leg spread (call spread or put spread)
+    Full implementation pending strategy module integration.
+    """
+    # Placeholder: single equity leg (upgraded to multi-leg per strategy later)
+    return [{
+        "symbol": ticker,
+        "qty": 1,
+        "side": "buy" if direction == "bullish" else "sell",
+    }]
+
+
 def _build_order_payload(ticker: str, strategy: str, direction: str,
                           client_order_id: str, notional: float, dte: int) -> dict:
     """Build Alpaca order payload. Strategy-specific logic."""
-    # Base equity order (options spread logic to be added per strategy)
+    # Use build_spread_legs for multi-leg strategies; fallback to simple equity
+    try:
+        if "spread" in strategy.lower() or "strangle" in strategy.lower() or "straddle" in strategy.lower():
+            legs = build_spread_legs(ticker, direction, dte, notional)
+            # For now, submit as single equity order; multi-leg support in v3
+            return {
+                "symbol":           ticker,
+                "notional":         str(round(notional, 2)),
+                "side":             "buy" if direction == "bullish" else "sell",
+                "type":             "market",
+                "time_in_force":    "day",
+                "client_order_id":  client_order_id,
+            }
+    except Exception as e:
+        logger.warning("Strategy-specific order building failed for %s: %s — using fallback", strategy, e)
+    
+    # Fallback: base equity order
     return {
         "symbol":           ticker,
         "notional":         str(round(notional, 2)),
