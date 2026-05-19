@@ -761,6 +761,53 @@ async def cache_status(
     })
 
 
+# ============================================================================
+# MOCK ENDPOINTS — Resilience Framework
+# ============================================================================
+
+from oracle.mock_endpoints import (
+    SimulateDownRequest,
+    SimulateDownResponse,
+    SimulateUpRequest,
+    SimulateUpResponse,
+    simulate_down,
+    simulate_up,
+    is_simulating_down,
+)
+
+
+@app.post("/mock/simulate/down", response_model=SimulateDownResponse, status_code=200)
+def mock_simulate_down(
+    request: SimulateDownRequest,
+    x_oracle_secret: str = Header(default=""),
+) -> SimulateDownResponse:
+    """
+    POST /mock/simulate/down — Simulate Oracle service unavailable.
+
+    Scenario 5: Test fallback data source when Oracle is down.
+    """
+    _check_auth(x_oracle_secret)
+    return simulate_down(request)
+
+
+@app.post("/mock/simulate/up", response_model=SimulateUpResponse, status_code=200)
+def mock_simulate_up(
+    request: SimulateUpRequest,
+    x_oracle_secret: str = Header(default=""),
+) -> SimulateUpResponse:
+    """
+    POST /mock/simulate/up — Resume normal Oracle operation.
+
+    Scenario 5 cleanup: Return Oracle to operational state.
+    """
+    _check_auth(x_oracle_secret)
+    return simulate_up()
+
+
+# Mock simulation endpoints available via /mock/down and /mock/up
+# (No additional function wrapping required — mock state is checked per-endpoint)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host=config.ORACLE_HOST, port=config.ORACLE_PORT, reload=False)

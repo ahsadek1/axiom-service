@@ -385,6 +385,29 @@ class AssessRequest(BaseModel):
     sizing: Optional[float] = None       # Sizing multiplier
 
 
+class PendingPick(BaseModel):
+    """A pending pick from a screening agent, awaiting Axiom risk assessment + OMNI synthesis."""
+    pick_id: str                    # Unique pick identifier (candidate_id)
+    ticker: str                     # Ticker symbol (e.g., "SPY")
+    strike: float                   # Strike price
+    dte: Optional[int] = None       # Days to expiration (computed from expiration date)
+    direction: str                  # "call" or "put"
+    thesis: str                     # Trade thesis from screening agent
+    confidence: float               # Confidence score (0–100) from screening agent
+    screening_agent: str            # Source agent ("ARGUS" | "APEX" | "TRIDENT")
+    risk_flags: list[str]           # Risk flags from Axiom assessment (empty if not yet assessed)
+    risk_score: Optional[float] = None  # Risk score (0–10) from Axiom (None if not assessed)
+    submitted_at: str               # ISO timestamp when pick was submitted
+    assessed_at: Optional[str] = None  # ISO timestamp when Axiom assessed it
+
+
+class PicsResponse(BaseModel):
+    """Response: List of pending picks awaiting OMNI synthesis."""
+    pending_picks: list[PendingPick]
+    count: int                      # Total count of pending picks
+    timestamp: str                  # Response timestamp (ISO)
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -721,6 +744,92 @@ def oracle_status(request: Request) -> JSONResponse:
     })
 
 
+@app.get("/picks")
+def get_pending_picks(request: Request) -> PicsResponse:
+    """
+    GET /picks — Retrieve pending picks awaiting OMNI synthesis.
+
+    OMNI polls this endpoint every ~30 seconds during market hours.
+    Returns all pending picks that have passed Axiom gate checks but
+    not yet been synthesized by OMNI.
+
+    Response (200):
+      {
+        "pending_picks": [
+          {
+            "pick_id": "MOCK_SPY_20260620_CALL_500",
+            "ticker": "SPY",
+            "strike": 500.0,
+            "dte": 14,
+            "direction": "call",
+            "thesis": "breakdown below 200-SMA, oversold",
+            "confidence": 8.5,
+            "screening_agent": "ARGUS",
+            "risk_flags": ["concentration_risk", "vix_elevated"],
+            "risk_score": 6.2,
+            "submitted_at": "2026-05-19T14:35:22Z",
+            "assessed_at": "2026-05-19T14:35:45Z"
+          }
+        ],
+        "count": 1,
+        "timestamp": "2026-05-19T14:36:00Z"
+      }
+
+    Contract:
+      - Returns empty array if no pending picks
+      - Includes risk assessment (if completed) for OMNI's reference
+      - OMNI uses pick_id for correlation after GO/NO-GO decision
+      - Does NOT remove picks from queue (executor handles that)
+    """
+    verify_secret(request)
+
+    try:
+        from axiom.mock_endpoints import _mock_state
+        from datetime import datetime
+
+        now = datetime.now(ET).isoformat()
+        pending_candidates = _mock_state.get("pending_candidates", [])
+
+        # Convert candidates to PendingPick format
+        picks: list[PendingPick] = []
+        for candidate in pending_candidates:
+            # Compute DTE from expiration date
+            from dateutil.parser import parse as parse_date
+            try:
+                exp_date = parse_date(candidate["expiration"]).date()
+                today = datetime.now(ET).date()
+                dte = (exp_date - today).days
+            except Exception:
+                dte = None
+
+            # Build PendingPick
+            pick = PendingPick(
+                pick_id=candidate["candidate_id"],
+                ticker=candidate["symbol"],
+                strike=candidate["strike"],
+                dte=dte,
+                direction=candidate["option_type"].lower(),
+                thesis="",  # Not yet available in candidate (populated by screening agent)
+                confidence=float(candidate.get("conviction", 50)) / 100.0 * 10.0,  # Scale 0-100 to 0-10
+                screening_agent=candidate.get("source", "UNKNOWN").upper(),
+                risk_flags=[],  # Will be populated after Axiom assessment
+                risk_score=None,  # Will be populated after Axiom assessment
+                submitted_at=candidate["submitted_at"],
+                assessed_at=None,  # Mark as not yet assessed
+            )
+            picks.append(pick)
+
+        return PicsResponse(
+            pending_picks=picks,
+            count=len(picks),
+            timestamp=now
+        )
+
+    except Exception as e:
+        logger.error("Error retrieving pending picks: %s", e)
+        raise HTTPException(status_code=500, detail={"error": "failed_to_retrieve_picks", "message": str(e)})
+
+
 @app.post("/trigger-tier1")
 def trigger_tier1(request: Request) -> JSONResponse:
     """
@@ -913,3 +1022,177 @@ def trace_headers(request: Request) -> JSONResponse:
         "headers": dict(request.headers),
         "version": "4.0.0",
     })
+
+
+# ── MOCK ENDPOINTS for Resilience Testing ─────────────────────────────────────
+# All /mock/* routes are available at all times (not restricted by mode).
+# Used by daily resilience rehearsal (RESILIENCE_FRAMEWORK).
+
+from axiom.mock_endpoints import (
+    ClearPendingRequest,
+    ClearPendingResponse,
+    SubmitCandidateRequest,
+    SubmitCandidateResponse,
+    GateBlockedResponse,
+    SetVixRequest,
+    SetVixResponse,
+    SetEarningsRequest,
+    SetEarningsResponse,
+    SetOptionParamsRequest,
+    SetOptionParamsResponse,
+    SetPositionLimitRequest,
+    SetPositionLimitResponse,
+    clear_pending_candidates,
+    submit_candidate,
+    set_vix_mock,
+    set_earnings_calendar,
+    set_option_params,
+    set_position_limit,
+    reset_mock_state,
+)
+
+
+@app.post("/mock/clear_pending", response_model=ClearPendingResponse, status_code=200)
+def handle_clear_pending(request: ClearPendingRequest) -> ClearPendingResponse:
+    """
+    POST /mock/clear_pending — Clear all pending candidates.
+
+    Request:
+      {"symbol": null}  // optional: clear only this symbol, null = clear all
+
+    Response (200):
+      {"status": "cleared", "count": 5, "timestamp": "..."}
+
+    Contract:
+      - Idempotent (safe to call multiple times)
+      - Does NOT trigger any buffer submissions
+      - Returns actual count deleted
+      - If symbol specified and not found: returns count=0, status=cleared
+    """
+    try:
+        return clear_pending_candidates(settings.axiom_db_path, request)
+    except RuntimeError as e:
+        logger.error("Error clearing pending candidates: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mock/submit_candidate", status_code=201)
+def handle_submit_candidate(request: SubmitCandidateRequest):
+    """
+    POST /mock/submit_candidate — Submit a mock candidate trade.
+
+    Response (201):
+      {"status": "submitted", "candidate_id": "MOCK_SPY_170620_CALL_500", "timestamp": "..."}
+
+    Response (400): Validation failed
+      {"error": "validation_failed", "message": "..."}
+
+    Response (403): Gate blocked (intended)
+      {"error": "gate_blocked", "gate": "vix_brake", "reason": "...", "timestamp": "..."}
+
+    Contract:
+      - Validates all fields before accepting
+      - Returns which gate (if any) rejects the candidate
+      - Duplicate detection: if identical symbol+strike+expiration+type exists → reject
+      - Generates deterministic candidate_id
+      - Does NOT submit to buffer directly
+    """
+    try:
+        result = submit_candidate(settings.axiom_db_path, request, vix_current=app_state.get("last_vix"))
+
+        if "error" in result:
+            if result["error"] == "gate_blocked":
+                logger.info("Gate blocked: %s", result.get("gate"))
+                raise HTTPException(
+                    status_code=403,
+                    detail=result
+                )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=result
+                )
+
+        # Return 201 on success
+        return JSONResponse(
+            status_code=201,
+            content=result
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": "validation_failed", "message": str(e)})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error submitting candidate: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mock/set_vix", response_model=SetVixResponse, status_code=200)
+def handle_set_vix(request: SetVixRequest) -> SetVixResponse:
+    """
+    POST /mock/set_vix — Set mock VIX for scenario testing.
+
+    Contract:
+      - Affects all subsequent Axiom gate checks
+      - Brake threshold is configurable
+      - If VIX >= threshold, ALL new submissions blocked immediately
+    """
+    try:
+        response = set_vix_mock(settings.axiom_db_path, request)
+        # Update app state for gate checks
+        app_state["last_vix"] = request.value
+        return response
+    except RuntimeError as e:
+        logger.error("Error setting VIX: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mock/set_earnings_calendar", response_model=SetEarningsResponse, status_code=200)
+def handle_set_earnings(request: SetEarningsRequest) -> SetEarningsResponse:
+    """
+    POST /mock/set_earnings_calendar — Mock earnings events for symbol.
+
+    Contract:
+      - Affects gate checks: if symbol has earnings today, blocks all new picks
+      - Persists until explicitly cleared
+      - Multiple symbols can have earnings simultaneously
+    """
+    try:
+        return set_earnings_calendar(settings.axiom_db_path, request)
+    except RuntimeError as e:
+        logger.error("Error setting earnings calendar: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mock/set_option_params", response_model=SetOptionParamsResponse, status_code=200)
+def handle_set_option_params(request: SetOptionParamsRequest) -> SetOptionParamsResponse:
+    """
+    POST /mock/set_option_params — Override option metadata for testing.
+
+    Contract:
+      - Overrides live option data for this specific strike
+      - Scope: this symbol+strike+expiration only
+      - Used by Axiom gates (DTE < 7 blocks)
+    """
+    try:
+        return set_option_params(settings.axiom_db_path, request)
+    except RuntimeError as e:
+        logger.error("Error setting option params: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mock/set_position_limit", response_model=SetPositionLimitResponse, status_code=200)
+def handle_set_position_limit(request: SetPositionLimitRequest) -> SetPositionLimitResponse:
+    """
+    POST /mock/set_position_limit — Configure max concurrent positions.
+
+    Contract:
+      - Applies immediately to next submission
+      - Returns current count so caller knows how many positions are open
+      - Rejecting new candidate returns error="position_limit_exceeded"
+    """
+    try:
+        return set_position_limit(settings.axiom_db_path, request)
+    except RuntimeError as e:
+        logger.error("Error setting position limit: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

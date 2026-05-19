@@ -248,11 +248,12 @@ def submit_to_alpha(
         except Exception:
             pass
 
-        # 4. Last resort: $100 placeholder (Railway auto-resolver corrects at execution)
+        # 4. Cannot resolve price — skip this ticker instead of using bogus fallback
+        #    610 422 errors on May 18 were caused by $100 fallback sending invalid strikes.
         logger.warning(
-            "[Railway] Cannot resolve price for %s — using $100 fallback for strike calc", sym
+            "[Railway] Cannot resolve price for %s — returning None (submission will be skipped)", sym
         )
-        return 100.0
+        return None
 
     def _resolve_strikes(sym: str, dir_: str, price: float) -> tuple:
         """
@@ -275,6 +276,9 @@ def submit_to_alpha(
 
     _expiry = _nearest_friday_expiry()
     _price  = _resolve_stock_price(ticker)
+    if _price is None or _price <= 0:
+        logger.warning("Skipping %s/%s — cannot resolve stock price", ticker, direction)
+        return False  # skip submission; 422 prevention
     _strike_entry, _strike_target = _resolve_strikes(ticker, direction, _price)
 
     # Map internal direction ('bullish'/'bearish') to Railway enum ('LONG'/'SHORT')

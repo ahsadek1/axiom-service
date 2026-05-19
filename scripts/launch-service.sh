@@ -8,4 +8,12 @@ if [ -f ".env" ]; then
   source .env
   set +a
 fi
-exec /usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8008}" --log-level info
+# Add nexus directory to Python path for module resolution
+export PYTHONPATH=/Users/ahmedsadek/nexus:${PYTHONPATH}
+# Use venv Python if available, otherwise system
+if [ -f ".venv/bin/python" ]; then
+  PY=".venv/bin/python"
+else
+  PY="/usr/bin/python3"
+fi
+exec $PY -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8008}" --log-level info

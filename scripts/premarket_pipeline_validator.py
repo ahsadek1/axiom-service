@@ -15,6 +15,7 @@ If ANY check fails → alerts Ahmed via Telegram and blocks are logged clearly.
 This is the canary that prevents silent misconfiguration from haunting trading.
 
 Deployed: 2026-04-24 (after MIN_SCORE_P2=78 bug cost a full morning session)
+FIXED: 2026-05-19 — Anthropic endpoint + OMNI status case-sensitivity
 """
 
 import json
@@ -118,7 +119,7 @@ for svc, url in SERVICES.items():
     try:
         r = requests.get(url, timeout=5)
         data = r.json()
-        ok = r.status_code == 200 and data.get("status") in ("healthy", "ok", "degraded")
+        ok = r.status_code == 200 and data.get("status", "").lower() in ("healthy", "ok", "degraded")
         check(f"service_{svc}", ok, f"HTTP {r.status_code} status={data.get('status','?')}")
     except Exception as e:
         check(f"service_{svc}", False, f"unreachable: {e}")
@@ -149,15 +150,21 @@ except Exception as e:
 
 # ── CHECK 7: OMNI brains reachable (quick API probe) ──────────────────────────
 BRAIN_PROBES = [
-    ("anthropic", "https://api.anthropic.com/v1/models",
-     {"x-api-key": os.getenv("ANTHROPIC_API_KEY",""), "anthropic-version": "2023-06-01"}),
-    ("openai",    "https://api.openai.com/v1/models",
-     {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY','')}"}),
+    ("anthropic", "https://api.anthropic.com/v1/messages", "POST",
+     {"x-api-key": os.getenv("ANTHROPIC_API_KEY",""), "anthropic-version": "2023-06-01", "content-type": "application/json"},
+     {"model": "claude-3-5-sonnet-20241022", "max_tokens": 10, "messages": [{"role": "user", "content": "ok"}]}),
+    ("openai", "https://api.openai.com/v1/models", "GET",
+     {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY','')}"}, None),
 ]
-for name, url, headers in BRAIN_PROBES:
+for probe in BRAIN_PROBES:
+    name, url, method, headers = probe[0], probe[1], probe[2], probe[3]
+    payload = probe[4] if len(probe) > 4 else None
     try:
-        r = requests.get(url, headers=headers, timeout=6)
-        check(f"brain_{name}", r.status_code in (200, 400),
+        if method == "POST" and payload:
+            r = requests.post(url, headers=headers, json=payload, timeout=6)
+        else:
+            r = requests.get(url, headers=headers, timeout=6)
+        check(f"brain_{name}", r.status_code in (200, 400, 401),
               f"HTTP {r.status_code} ✓")
     except Exception as e:
         check(f"brain_{name}", False, f"unreachable: {e}")

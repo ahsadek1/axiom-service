@@ -136,6 +136,18 @@ def init_db(db_path: str) -> None:
             conn.commit()
             logger.info("Migrated Prime Buffer concordance_results: added dispatch_attempts column")
 
+    # GENESIS H3 fix: add echo_chamber and notes columns to existing Prime Buffer DBs (migration-safe)
+    with sqlite3.connect(db_path) as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(concordance_results)")}
+        if "echo_chamber" not in cols:
+            conn.execute("ALTER TABLE concordance_results ADD COLUMN echo_chamber INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+            logger.info("Migrated Prime Buffer concordance_results: added echo_chamber column")
+        if "notes" not in cols:
+            conn.execute("ALTER TABLE concordance_results ADD COLUMN notes TEXT")
+            conn.commit()
+            logger.info("Migrated Prime Buffer concordance_results: added notes column")
+
     logger.info("Prime Buffer database initialized at %s", db_path)
 
 
@@ -251,6 +263,8 @@ def save_concordance_result(
     verdict:        str,
     agents_involved: list[str],
     scores:         dict[str, float],
+    echo_chamber:   bool = False,
+    notes:          Optional[list[str]] = None,
 ) -> int:
     """
     Persist a concordance result. Upserts on duplicate (window, ticker, direction).
@@ -267,18 +281,21 @@ def save_concordance_result(
         verdict:         'GO' or 'STRONG_GO'.
         agents_involved: List of agent names.
         scores:          Dict mapping agent name to score.
+        echo_chamber:    Whether echo chamber was detected.
+        notes:           Audit notes about the decision.
 
     Returns:
         Row ID of the inserted/updated row.
     """
     now = datetime.now(timezone.utc).isoformat()
+    _notes = json.dumps(notes or [])
     with get_conn(db_path) as conn:
         cursor = conn.execute(
             """
             INSERT INTO concordance_results
                 (window_id, ticker, direction, pathway, agent_count, weighted_score,
-                 sizing_mult, verdict, agents_involved, scores, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 sizing_mult, verdict, agents_involved, scores, echo_chamber, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(window_id, ticker, direction)
             DO UPDATE SET
                 pathway         = excluded.pathway,
@@ -288,12 +305,14 @@ def save_concordance_result(
                 verdict         = excluded.verdict,
                 agents_involved = excluded.agents_involved,
                 scores          = excluded.scores,
+                echo_chamber    = excluded.echo_chamber,
+                notes           = excluded.notes,
                 created_at      = excluded.created_at
             """,
             (
                 window_id, ticker, direction, pathway, agent_count, weighted_score,
                 sizing_mult, verdict,
-                json.dumps(agents_involved), json.dumps(scores), now,
+                json.dumps(agents_involved), json.dumps(scores), int(echo_chamber), _notes, now,
             ),
         )
         return cursor.lastrowid

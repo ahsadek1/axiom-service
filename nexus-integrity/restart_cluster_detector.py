@@ -52,6 +52,7 @@ MONITORED_SERVICES: Dict[str, str] = {
     "sage":             "http://localhost:9003/health",
     "atlas":            "http://localhost:9002/health",
     "cipher":           "http://localhost:9001/health",
+    "vector":           "http://localhost:8030/vector/health",
 }
 
 

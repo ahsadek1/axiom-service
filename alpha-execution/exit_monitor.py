@@ -360,9 +360,10 @@ def _get_pnl_from_closed_orders(pos: dict, alpaca_client) -> Optional[float]:
         size_usd       = pos.get("position_size_usd") or 0
         if not short_order_id or size_usd <= 0:
             return None
-        # Fetch recent closed orders (last 50) and find matching ones
+        # Fetch recent closed orders (limited to 100 by alpaca_client wrapper)
+        # Note: alpaca_client.get_orders() only accepts 'status' parameter
         closed_orders = alpaca_client.get_orders(
-            status="closed", limit=50, direction="desc"
+            status="closed"
         ) if hasattr(alpaca_client, "get_orders") else []
         if not closed_orders:
             return None

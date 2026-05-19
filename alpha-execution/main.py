@@ -9,7 +9,6 @@ Port: 8005 (local), $PORT (Railway).
 """
 
 import asyncio
-from typing import Optional, List, Dict, Any, AsyncGenerator
 import glob as _glob
 import hashlib as _hashlib
 import logging
@@ -19,8 +18,12 @@ import re as _re
 import secrets
 import sys
 import threading
+from typing import Optional, List, Dict, Any, AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime
+
+# CRITICAL: Set sys.path BEFORE any local imports (mock_endpoints, etc.)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # G7 NOTE (2026-05-03): canonical implementation lives in shared/module_hash.py.
@@ -64,7 +67,6 @@ def _get_cached_module_hash() -> str:
             _cached_module_hash_ts = _time_hash.monotonic()
     return _cached_module_hash
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.sovereign_comms import EscalationLevel, get_instructions, report
 from shared.watchdog import Watchdog
 from shared.service_state import ServiceStateWriter as _StateWriter
@@ -2639,6 +2641,40 @@ def greeks_endpoint():
     if _greeks_tracker is None:
         return {"error": "Greeks tracker not initialized", "stale": True}
     return _greeks_tracker.get()
+
+
+# ============================================================================
+# MOCK ENDPOINTS — Resilience Framework
+# ============================================================================
+
+from mock_endpoints import (
+    ExecuteRequest,
+    ExecuteResponse,
+    ExitRequest,
+    ExitResponse,
+    execute_trade,
+    exit_trade,
+)
+
+
+@_protected.post("/mock/execute", response_model=ExecuteResponse, status_code=201)
+def mock_execute(request: ExecuteRequest) -> ExecuteResponse:
+    """
+    POST /mock/execute — Simulate trade execution.
+
+    Scenario 10: Test full lifecycle from entry to exit.
+    """
+    return execute_trade(request)
+
+
+@_protected.post("/mock/exit", response_model=ExitResponse, status_code=200)
+def mock_exit(request: ExitRequest) -> ExitResponse:
+    """
+    POST /mock/exit — Simulate trade exit.
+
+    Scenario 10 continued: Test exit and PnL calculation.
+    """
+    return exit_trade(request)
 
 
 app.include_router(_protected)

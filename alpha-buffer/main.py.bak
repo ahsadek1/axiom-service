@@ -16,16 +16,10 @@ Endpoints:
 import logging
 import os
 import secrets
-import sys as _sys_early
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional
-
-# ─── Setup Python path for local imports ───────────────────────────────────
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in _sys_early.path:
-    _sys_early.path.insert(0, _current_dir)
 
 import pytz
 from fastapi import FastAPI, Header, HTTPException
@@ -1087,18 +1081,11 @@ def sovereign_directive(
 # MOCK ENDPOINTS — Resilience Framework
 # ============================================================================
 
-try:
-    from mock_endpoints import (
-        ClearPendingRequest,
-        ClearPendingResponse,
-        clear_pending_picks,
-    )
-except ImportError:
-    # Fallback for direct module loading
-    import mock_endpoints
-    ClearPendingRequest = mock_endpoints.ClearPendingRequest
-    ClearPendingResponse = mock_endpoints.ClearPendingResponse
-    clear_pending_picks = mock_endpoints.clear_pending_picks
+from .mock_endpoints import (
+    ClearPendingRequest,
+    ClearPendingResponse,
+    clear_pending_picks,
+)
 
 
 @app.post("/mock/clear_pending", response_model=ClearPendingResponse, status_code=200)

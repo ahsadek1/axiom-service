@@ -13,6 +13,9 @@ Key differences from Alpha Buffer:
   - DB: PRIME_DB_PATH env var
 """
 
+import sys as _sys_wd
+_sys_wd.path.insert(0, "/Users/ahmedsadek/nexus")
+
 import logging
 import os
 import secrets
@@ -46,8 +49,6 @@ from database import (
     save_concordance_result,
 )
 from omni_client import dispatch_to_omni
-import sys as _sys_wd
-_sys_wd.path.insert(0, "/Users/ahmedsadek/nexus")
 from shared.watchdog import Watchdog
 
 logging.basicConfig(
@@ -444,6 +445,8 @@ def submit_pick(
         verdict         = concordance.verdict,
         agents_involved = concordance.agents_involved,
         scores          = concordance.scores,
+        echo_chamber    = concordance.echo_chamber,
+        notes           = concordance.notes,
     )
 
     logger.info(
@@ -592,3 +595,31 @@ def circuit_breaker_reset(
         "status":  "NORMAL",
         "message": "Prime circuit breaker reset to NORMAL. All counters cleared.",
     })
+
+
+# ============================================================================
+# MOCK ENDPOINTS — Resilience Framework
+# ============================================================================
+
+from prime_buffer.mock_endpoints import (
+    ClearPendingRequest,
+    ClearPendingResponse,
+    clear_pending_picks,
+)
+
+
+@app.post("/mock/clear_pending", response_model=ClearPendingResponse, status_code=200)
+def mock_clear_pending(
+    request: ClearPendingRequest,
+    x_nexus_prime_secret: str = Header(default=""),
+) -> ClearPendingResponse:
+    """
+    POST /mock/clear_pending — Clear all pending picks.
+
+    Scenario 1 setup: Clear buffer before concordance baseline test.
+    """
+    verify_secret(x_nexus_prime_secret)
+
+    with get_conn(settings.prime_db_path) as conn:
+        response = clear_pending_picks(conn, request)
+    return response
