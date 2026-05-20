@@ -21,6 +21,13 @@ import threading
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime
+import sys as _sys_capital
+_sys_capital.path.insert(0, '/Users/ahmedsadek/.openclaw/workspace-omni')
+try:
+    from capital_gate_logic import CapitalGate
+    CAPITAL_GATE_AVAILABLE = True
+except ImportError:
+    CAPITAL_GATE_AVAILABLE = False
 
 # CRITICAL: Set sys.path BEFORE any local imports (mock_endpoints, etc.)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1840,6 +1847,37 @@ def execute(
             )
             order = _existing_order
         else:
+            # ── Capital Gate (OMNI May 20, 2026): Cross-system position + allocation checks ──
+            # Prevents: (1) doubled positions on same ticker (Alpha + Prime race)
+            #           (2) capital double-allocation after position rotation
+            _capital_gate = None
+            _allocation_id = None
+            if CAPITAL_GATE_AVAILABLE:
+                try:
+                    _capital_gate = CapitalGate(router_url="http://localhost:9100", timeout_sec=3)
+                    _gate_allowed, _gate_result = _capital_gate.pre_execution_check(
+                        ticker=body.ticker,
+                        system="alpha",
+                        amount_usd=_position_size_usd
+                    )
+                    logger.info(
+                        "Capital gate result for %s: allowed=%s blocked_by=%s",
+                        body.ticker, _gate_allowed, _gate_result.get("blocked_by", "none")
+                    )
+                    if not _gate_allowed:
+                        logger.warning("Capital gate blocked execution: %s", _gate_result.get("blocked_by"))
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "executed": False,
+                                "reason": _gate_result.get("blocked_by", "capital_gate_blocked"),
+                                "gate_details": _gate_result
+                            }
+                        )
+                    _allocation_id = _gate_result.get("allocation_id")
+                except Exception as e:
+                    logger.warning("Capital gate check failed: %s — continuing with caution", str(e))
+            
             order = alpaca.place_spread_order(
                 legs             = legs,
                 qty              = contracts,
@@ -2128,6 +2166,17 @@ def execute(
         long_contract_symbol  = long_symbol or "",
         entry_price           = _confirmed_price,
     )
+    
+    # ── Release Capital Gate Allocation (OMNI May 20, 2026) ──
+    # Order is now confirmed on Alpaca. Release the capital allocation lock
+    # so other systems can claim the allocated capital if needed.
+    if _allocation_id and _capital_gate:
+        try:
+            _capital_gate.release_allocation(_allocation_id)
+            logger.info("Capital allocation released: %s for %s", _allocation_id, body.ticker)
+        except Exception as e:
+            logger.warning("Failed to release capital allocation %s: %s", _allocation_id, str(e))
+    
     # GAP-6: Release per-ticker lock — position is now durable in DB
     _safe_lock_release()  # BUG-FIX RE-002: use safe release to set _ticker_lock_released=True
     position_id = pending_id
