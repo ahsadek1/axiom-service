@@ -784,11 +784,17 @@ def get_pending_picks(request: Request) -> PicsResponse:
     verify_secret(request)
 
     try:
-        from axiom.mock_endpoints import _mock_state
+        import sqlite3 as _sqlite3, json as _json
         from datetime import datetime
 
         now = datetime.now(ET).isoformat()
-        pending_candidates = _mock_state.get("pending_candidates", [])
+        _conn = _sqlite3.connect(settings.axiom_db_path)
+        _conn.row_factory = _sqlite3.Row
+        _rows = _conn.execute(
+            "SELECT * FROM candidates WHERE status = \'pending\' ORDER BY submitted_at ASC"
+        ).fetchall()
+        _conn.close()
+        pending_candidates = [dict(r) for r in _rows]
 
         # Convert candidates to PendingPick format
         picks: list[PendingPick] = []

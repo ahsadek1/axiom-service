@@ -274,8 +274,10 @@ def _analyze_pool(payload: dict) -> None:
         _trace_hop = None  # type: ignore[assignment]
 
     try:
-        # --- Phase 1: Fetch Oracle context concurrently, then score ---
-        # Check BOTH in-memory (session) and persistent database (restart-safe) dedup
+        # --- Deterministic scoring via sage_scorer (replaces DeepSeek LLM) ---
+        from sage_scorer import score_pool as _sage_score_pool
+
+        # Dedup: skip tickers already submitted today (in-memory + DB)
         valid_tickers = [
             t for t in pool
             if isinstance(t, str)
@@ -284,115 +286,65 @@ def _analyze_pool(payload: dict) -> None:
             and not has_submitted_today(_settings.db_path, t, "bearish")
         ]
 
-        def _fetch_ticker(ticker: str):
-            """Fetch Oracle context for one ticker. Called concurrently."""
-            ctx = fetch_context(ticker, _settings.oracle_url, _settings.oracle_headers())
-            return ticker, ctx
-
-        contexts: dict = {}
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(_fetch_ticker, t): t for t in valid_tickers}
-            for future in as_completed(futures):
-                try:
-                    ticker, ctx = future.result()
-                    contexts[ticker] = ctx
-                except Exception as e:
-                    ticker = futures[future]
-                    logger.warning("Oracle fetch error for %s: %s", ticker, e)
-                    contexts[ticker] = None
-
-        logger.info("Window %s — Oracle fetch complete: %d/%d contexts retrieved",
-                    window_id, sum(1 for c in contexts.values() if c), len(valid_tickers))
-
-        for ticker in valid_tickers:
-            if _trace_hop:
-                _trace_hop(f"{window_id}:{ticker}", "agent_received", "sage", ticker, "alpha")
-
-            context = contexts.get(ticker)
-            if context is None:
-                logger.warning("Skipping %s — ORACLE context unavailable", ticker)
-                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, ORACLE_MISS)
-                analyzed += 1
-                continue
-
-            result = analyze(
-                ticker, context, regime,
-                _settings.deepseek_api_key, _settings.deepseek_base_url,
-            )
-            analyzed += 1
-
-            if result is None:
-                _consecutive_brain_failures += 1
-                logger.warning(
-                    "Brain failure for %s (consecutive: %d) — skipping submission",
-                    ticker, _consecutive_brain_failures,
-                )
-                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, BRAIN_FAIL)
-                if _consecutive_brain_failures >= BRAIN_ALERT_THRESHOLD:
-                    alert_brain_down(_settings.telegram_bot_token, _settings.telegram_chat_id, _consecutive_brain_failures)
-                    report("sage", "alert", {"event": "brain_down", "consecutive_failures": _consecutive_brain_failures}, escalation=EscalationLevel.CRITICAL)
-                    _consecutive_brain_failures = 0
-                continue
-
-            _consecutive_brain_failures = 0
-            candidates.append((result["score"], ticker, result["direction"], result["reasoning"]))
-
-        # --- Phase 2: Select top MAX_PICKS_PER_WINDOW by score ---
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        top_picks = candidates[:MAX_PICKS_PER_WINDOW]
-
-        if len(candidates) > MAX_PICKS_PER_WINDOW:
-            logger.info(
-                "Window %s: %d candidates scored, capping to top %d (scores: %s)",
-                window_id, len(candidates), MAX_PICKS_PER_WINDOW,
-                [round(c[0], 1) for c in top_picks],
-            )
+        scored_results = _sage_score_pool(valid_tickers, window_id=window_id)
 
         import json as _json
         _regime_json = _json.dumps(regime) if regime else None
 
-        # Log candidates that were scored but didn't make the top-N cut (REJECTED by cap)
-        top_tickers = {c[1] for c in top_picks}
-        for score, ticker, direction, reasoning in candidates:
-            if ticker not in top_tickers:
+        # No MAX_PICKS_PER_WINDOW cap in POC — every qualifying signal fires
+        for result in scored_results:
+            ticker = result.ticker
+            analyzed += 1
+
+            if _trace_hop:
+                _trace_hop(f"{window_id}:{ticker}", "agent_received", "sage", ticker, "alpha")
+
+            if result.hard_block:
+                logger.info("BLOCKED %s: %s", ticker, result.block_reason)
                 log_decision(
                     _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
-                    direction=direction, score=score, threshold=58.0,
-                    reasoning=reasoning, regime=_regime_json,
+                    direction="N/A", score=0.0, threshold=45.0,
+                    reasoning=result.block_reason,
                 )
+                continue
 
-        # --- Phase 3: Submit top picks ---
-        for score, ticker, direction, reasoning in top_picks:
+            direction = result.direction
+            reasoning = result.reasoning
+
+            if result.llm_flag:
+                logger.info("LLM review flagged %s: triggers=%s", ticker, result.llm_triggers)
+
             alpha_ok = submit_to_alpha(
-                ticker, AGENT_NAME, direction, score, reasoning,
+                ticker, AGENT_NAME, direction, result.alpha_score, reasoning,
                 _settings.alpha_buffer_url, _settings.alpha_headers(),
+                window_id=window_id,
             )
             prime_ok = submit_to_prime(
-                ticker, AGENT_NAME, direction, score, reasoning,
+                ticker, AGENT_NAME, direction, result.prime_score, reasoning,
                 _settings.prime_buffer_url, _settings.prime_headers(),
+                window_id=window_id,
             )
 
             if alpha_ok or prime_ok:
                 submitted += 1
-                _submitted_today.add(ticker)  # Mark as submitted for today
-                record_pick(_settings.db_path, window_id, ticker, direction, score, reasoning, alpha_ok, prime_ok)
+                _submitted_today.add(ticker)
+                record_pick(
+                    _settings.db_path, window_id, ticker, direction,
+                    result.alpha_score, reasoning, alpha_ok, prime_ok,
+                )
                 log_decision(
                     _settings.db_path, AGENT_NAME, window_id, ticker, SUBMITTED,
-                    direction=direction, score=score, threshold=58.0,
-                    reasoning=reasoning, alpha_submitted=alpha_ok,
-                    prime_submitted=prime_ok, regime=_regime_json,
+                    direction=direction, score=result.alpha_score,
+                    threshold=45.0, reasoning=reasoning,
+                    alpha_submitted=alpha_ok, prime_submitted=prime_ok,
+                    regime=_regime_json,
                 )
             else:
                 log_decision(
                     _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
-                    direction=direction, score=score, threshold=58.0,
-                    reasoning=reasoning, regime=_regime_json,
+                    direction=direction, score=result.alpha_score,
+                    threshold=45.0, reasoning=reasoning, regime=_regime_json,
                 )
-
-            if score >= 58 and not alpha_ok:
-                alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Alpha")
-            if score >= 63 and not prime_ok:
-                alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Prime")
 
     except Exception as e:
         logger.error("_analyze_pool crashed for window %s at analyzed=%d: %s", window_id, analyzed, e)

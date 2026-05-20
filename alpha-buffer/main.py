@@ -200,7 +200,7 @@ async def _omni_retry_loop() -> None:
     """
     import asyncio as _asyncio
     import json as _json
-    MAX_ATTEMPTS = 3
+    MAX_ATTEMPTS = 9
     POLL_INTERVAL = 60
 
     while True:

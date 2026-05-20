@@ -25,7 +25,7 @@ from datetime import datetime
 
 # Configuration
 RAILWAY_TOKEN = "26fd3a51-5484-466e-8df5-01af6de9f0c1"
-RAILWAY_API = "https://api.railway.app/graphql"
+RAILWAY_API = "https://api.railway.app/graphql/v2"
 USER_AGENT = "Nexus-Revive-Services/1.0 (+http://nexus.trade)"
 
 SERVICES = {

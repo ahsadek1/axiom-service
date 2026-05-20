@@ -1,11 +1,11 @@
 """
-main.py — Atlas Agent Service
+main.py — Sage Agent Service
 
 FastAPI service that receives ticker pools from Axiom, analyzes each ticker
-for technical trade quality using Gemini, and submits qualifying picks to
-Alpha Buffer and Prime Buffer.
+for fundamental and macro trade quality using DeepSeek, and submits qualifying
+picks to Alpha Buffer and Prime Buffer.
 
-Port: 9002
+Port: 9003
 Auth: X-Nexus-Secret header on inbound requests
 """
 
@@ -17,6 +17,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from typing import Any, Optional, Union
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,13 +50,17 @@ from database import (
 from oracle_client import fetch_context
 from telegram import alert_brain_down, alert_submission_failed
 
-configure_service_logging("atlas")
-logger = logging.getLogger("atlas.main")
+configure_service_logging("sage")
+logger = logging.getLogger("sage.main")
 ET = pytz.timezone("America/New_York")
 
 _settings: Optional[Settings] = None
 _consecutive_brain_failures: int = 0
 BRAIN_ALERT_THRESHOLD = 3
+MAX_PICKS_PER_WINDOW = 5          # Top N picks per window — prevents firehose behavior
+_submitted_today: set = set()     # Daily dedup: ticker → submitted this session
+_restart_count: int = 0           # Track restarts to detect crash loops
+MAX_RESTART_CYCLES = 5            # Slow down after 5 rapid restarts
 
 # ── SOVEREIGN Directive State ─────────────────────────────────────────────────
 _sovereign_halted: bool = False
@@ -64,7 +69,7 @@ _score_threshold_override: Optional[float] = None
 
 def _dispatch_sovereign_instruction(instr: dict) -> None:
     """Execute a SOVEREIGN instruction. Supported: HALT, RESUME, STATUS, SET_THRESHOLD, FLUSH."""
-    global _sovereign_halted, _score_threshold_override, _consecutive_brain_failures
+    global _sovereign_halted, _score_threshold_override, _consecutive_brain_failures, _submitted_today
 
     raw = instr.get("message", "").strip()
     directive = raw.split(":", 1)[0].strip().upper() if ":" in raw else raw.upper()
@@ -75,42 +80,58 @@ def _dispatch_sovereign_instruction(instr: dict) -> None:
     if directive == "HALT":
         _sovereign_halted = True
         logger.warning("SOVEREIGN DIRECTIVE: HALT — pool analysis suspended")
-        report("atlas", "ack", {"directive": "HALT", "status": "applied", "halted": True})
+        report("sage", "ack", {"directive": "HALT", "status": "applied", "halted": True})
     elif directive == "RESUME":
         _sovereign_halted = False
         logger.info("SOVEREIGN DIRECTIVE: RESUME — pool analysis resumed")
-        report("atlas", "ack", {"directive": "RESUME", "status": "applied", "halted": False})
+        report("sage", "ack", {"directive": "RESUME", "status": "applied", "halted": False})
     elif directive == "STATUS":
         stats = get_stats(_settings.db_path) if _settings else {}
-        report("atlas", "status", {"directive": "STATUS", "halted": _sovereign_halted,
-                                    "brain_failures": _consecutive_brain_failures,
-                                    "threshold_override": _score_threshold_override, **stats})
+        report("sage", "status", {"directive": "STATUS", "halted": _sovereign_halted,
+                                   "brain_failures": _consecutive_brain_failures,
+                                   "submitted_today": len(_submitted_today), **stats})
         logger.info("SOVEREIGN DIRECTIVE: STATUS — reported back")
     elif directive == "SET_THRESHOLD":
         try:
             val = float(rest)
             _score_threshold_override = val
             logger.info("SOVEREIGN DIRECTIVE: SET_THRESHOLD — threshold set to %.1f", val)
-            report("atlas", "ack", {"directive": "SET_THRESHOLD", "value": val, "status": "applied"})
+            report("sage", "ack", {"directive": "SET_THRESHOLD", "value": val, "status": "applied"})
         except ValueError:
-            report("atlas", "ack", {"directive": "SET_THRESHOLD", "value": rest, "status": "invalid"})
+            report("sage", "ack", {"directive": "SET_THRESHOLD", "value": rest, "status": "invalid"})
     elif directive == "FLUSH":
         _consecutive_brain_failures = 0
-        logger.info("SOVEREIGN DIRECTIVE: FLUSH — brain failure counter reset")
-        report("atlas", "ack", {"directive": "FLUSH", "status": "applied"})
+        _submitted_today = set()
+        logger.info("SOVEREIGN DIRECTIVE: FLUSH — counters and daily dedup reset")
+        report("sage", "ack", {"directive": "FLUSH", "status": "applied"})
     else:
         logger.warning("SOVEREIGN DIRECTIVE: unrecognized '%s'", directive[:100])
-        report("atlas", "ack", {"directive": directive[:100], "status": "unrecognized"})
+        report("sage", "ack", {"directive": directive[:100], "status": "unrecognized"})
+
+
+def _midnight_reset() -> None:
+    """Reset daily dedup set at midnight ET. Runs as a daemon thread."""
+    import time as _time
+    while True:
+        now_et = datetime.now(ET)
+        # Calculate seconds until next midnight ET
+        next_midnight = (now_et + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        sleep_seconds = (next_midnight - now_et).total_seconds()
+        _time.sleep(sleep_seconds)
+        global _submitted_today
+        prev_count = len(_submitted_today)
+        _submitted_today = set()
+        logger.info("Daily dedup reset — cleared %d tickers", prev_count)
 
 
 
 # ── SOVEREIGN Continuous Comms Loop ──────────────────────────────────────────
-_comms_stop_atlas = threading.Event()
+_comms_stop_sage = threading.Event()
 SOVEREIGN_POLL_INTERVAL_S      = 30   # Poll SOVEREIGN inbox every 30 seconds
 SOVEREIGN_HEARTBEAT_INTERVAL_S = 300  # Push heartbeat every 5 minutes
 
 
-def _sovereign_comms_loop_atlas() -> None:
+def _sovereign_comms_loop_sage() -> None:
     """
     Daemon thread: polls SOVEREIGN inbox every 30s and pushes a heartbeat
     every 5 minutes, independent of any pool cycle. Never raises.
@@ -118,17 +139,17 @@ def _sovereign_comms_loop_atlas() -> None:
     last_heartbeat: float = 0.0
     logger.info("SOVEREIGN comms loop started (poll=%ds heartbeat=%ds)",
                 SOVEREIGN_POLL_INTERVAL_S, SOVEREIGN_HEARTBEAT_INTERVAL_S)
-    while not _comms_stop_atlas.is_set():
+    while not _comms_stop_sage.is_set():
         now = time.monotonic()
         try:
-            instructions = get_instructions("atlas")
+            instructions = get_instructions("sage")
             if instructions:
                 logger.info("SOVEREIGN comms: %d directive(s) received", len(instructions))
                 for instr in instructions:
                     _dispatch_sovereign_instruction(instr)
             if now - last_heartbeat >= SOVEREIGN_HEARTBEAT_INTERVAL_S:
                 stats = get_stats(_settings.db_path) if _settings else {}
-                report("atlas", "AUTONOMOUS", {
+                report("sage", "AUTONOMOUS", {
                     "event":              "heartbeat",
                     "halted":             _sovereign_halted,
                     "brain_failures":     _consecutive_brain_failures,
@@ -138,42 +159,56 @@ def _sovereign_comms_loop_atlas() -> None:
                 last_heartbeat = now
         except Exception as exc:  # noqa: BLE001
             logger.warning("SOVEREIGN comms loop error: %s", exc)
-        _comms_stop_atlas.wait(SOVEREIGN_POLL_INTERVAL_S)
+        _comms_stop_sage.wait(SOVEREIGN_POLL_INTERVAL_S)
     logger.info("SOVEREIGN comms loop stopped")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings
+    global _settings, _submitted_today, _restart_count
     _settings = load_settings()
     from shared.db_guard import assert_unique_db_path  # G4: collision guard
-    assert_unique_db_path("atlas", _settings.db_path)
+    assert_unique_db_path("sage", _settings.db_path)
     init_db(_settings.db_path)
-    prime_secret = getattr(_settings, "nexus_prime_secret", None) or ""
-    if not prime_secret or len(prime_secret) < 32:
-        logger.critical("NEXUS_PRIME_SECRET invalid at startup (len=%d). Prime submissions will 403.", len(prime_secret))
-    else:
-        logger.info("Atlas NEXUS_PRIME_SECRET validated at startup (len=%d)", len(prime_secret))
-    logger.info("Atlas agent started on port %d", _settings.port)
-    report("atlas", "status", {"event": "started", "port": _settings.port})
+    
+    # Increment restart counter and warn if crash loop detected
+    _restart_count += 1
+    if _restart_count > MAX_RESTART_CYCLES:
+        logger.critical("Sage: %d rapid restarts detected — possible crash loop. Slowing startup." % _restart_count)
+        time.sleep(5)  # Back off on startup to avoid tight restart loop
+    
+    # Rebuild in-memory submitted_today from database (restart-safe)
+    try:
+        today_picks = get_today_picks(_settings.db_path)
+        _submitted_today = set((p["ticker"] for p in today_picks))
+        logger.info("In-memory dedup rebuilt from DB: %d tickers marked as submitted today", len(_submitted_today))
+    except Exception as e:
+        logger.warning("Failed to rebuild in-memory dedup: %s", e)
+        _submitted_today = set()
+    
+    # Start midnight reset thread
+    reset_thread = threading.Thread(target=_midnight_reset, daemon=True, name="sage-midnight-reset")
+    reset_thread.start()
+    logger.info("Sage agent started on port %d [restart #%d]", _settings.port, _restart_count)
+    report("sage", "status", {"event": "started", "port": _settings.port, "restart_count": _restart_count})
     # Drain queued directives from before this startup
-    _startup_instr = get_instructions("atlas")
+    _startup_instr = get_instructions("sage")
     if _startup_instr:
-        logger.info("Atlas: %d instruction(s) from SOVEREIGN on startup", len(_startup_instr))
+        logger.info("Sage: %d instruction(s) from SOVEREIGN on startup", len(_startup_instr))
         for _i in _startup_instr:
             _dispatch_sovereign_instruction(_i)
 
     # Launch continuous comms loop (polls every 30s, heartbeat every 5min)
-    _comms_stop_atlas.clear()
-    threading.Thread(target=_sovereign_comms_loop_atlas, daemon=True, name="atlas-sovereign-comms").start()
+    _comms_stop_sage.clear()
+    threading.Thread(target=_sovereign_comms_loop_sage, daemon=True, name="sage-sovereign-comms").start()
 
     yield
 
-    _comms_stop_atlas.set()
-    report("atlas", "status", {"event": "stopped"})
-    logger.info("Atlas agent shutting down")
+    _comms_stop_sage.set()
+    report("sage", "status", {"event": "stopped"})
+    logger.info("Sage agent shutting down")
 
 
-app = FastAPI(title="Atlas Agent", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Sage Agent", version="1.0.0", lifespan=lifespan)
 
 
 class PoolPayload(BaseModel):
@@ -200,30 +235,38 @@ def _check_auth(provided: Optional[str]) -> None:
 
 
 def _analyze_pool(payload: dict) -> None:
-    """Analyze all tickers in the pool. Runs in background thread."""
-    global _consecutive_brain_failures
+    """
+    Analyze all tickers in the pool. Runs in background thread.
+
+    Behavior:
+      - Scores all tickers via DeepSeek
+      - Deduplicates: skips any ticker already submitted today (_submitted_today)
+      - Caps submissions at MAX_PICKS_PER_WINDOW (top scorers only)
+      - Submits top picks to Alpha Buffer and Prime Buffer
+    """
+    global _consecutive_brain_failures, _submitted_today
 
     window_id: str = payload["window_id"]
     pool: list = payload["pool"]
     regime: dict = payload.get("regime", {})
-    echo_chamber_risk: list = payload.get("echo_chamber_risk", [])
 
     # Poll SOVEREIGN for any mid-session instructions (deduped via watermark)
-    _instr = get_instructions("atlas")
+    _instr = get_instructions("sage")
     if _instr:
-        logger.info("Atlas: %d instruction(s) from SOVEREIGN this cycle", len(_instr))
+        logger.info("Sage: %d instruction(s) from SOVEREIGN this cycle", len(_instr))
         for _i in _instr:
             _dispatch_sovereign_instruction(_i)
 
     # Halt gate
     if _sovereign_halted:
-        logger.warning("Atlas: SOVEREIGN HALT active — skipping window %s", window_id)
-        report("atlas", "status", {"event": "pool_skipped", "reason": "sovereign_halt", "window_id": window_id})
+        logger.warning("Sage: SOVEREIGN HALT active — skipping window %s", window_id)
+        report("sage", "status", {"event": "pool_skipped", "reason": "sovereign_halt", "window_id": window_id})
         complete_window(_settings.db_path, window_id, 0, 0)
         return
 
     analyzed = 0
     submitted = 0
+    candidates: list = []  # [(score, ticker, direction, reasoning)]
 
     try:
         from pipeline_client import trace_hop as _trace_hop
@@ -231,75 +274,134 @@ def _analyze_pool(payload: dict) -> None:
         _trace_hop = None  # type: ignore[assignment]
 
     try:
-        # --- Deterministic scoring via atlas_scorer (replaces Gemini LLM) ---
-        from atlas_scorer import score_pool as _atlas_score_pool
+        # --- Phase 1: Fetch Oracle context concurrently, then score ---
+        # Check BOTH in-memory (session) and persistent database (restart-safe) dedup
+        valid_tickers = [
+            t for t in pool
+            if isinstance(t, str)
+            and t not in _submitted_today
+            and not has_submitted_today(_settings.db_path, t, "bullish")
+            and not has_submitted_today(_settings.db_path, t, "bearish")
+        ]
 
-        valid_tickers = [t for t in pool if isinstance(t, str)]
-        scored_results = _atlas_score_pool(valid_tickers, window_id=window_id)
+        def _fetch_ticker(ticker: str):
+            """Fetch Oracle context for one ticker. Called concurrently."""
+            ctx = fetch_context(ticker, _settings.oracle_url, _settings.oracle_headers())
+            return ticker, ctx
+
+        contexts: dict = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_fetch_ticker, t): t for t in valid_tickers}
+            for future in as_completed(futures):
+                try:
+                    ticker, ctx = future.result()
+                    contexts[ticker] = ctx
+                except Exception as e:
+                    ticker = futures[future]
+                    logger.warning("Oracle fetch error for %s: %s", ticker, e)
+                    contexts[ticker] = None
+
+        logger.info("Window %s — Oracle fetch complete: %d/%d contexts retrieved",
+                    window_id, sum(1 for c in contexts.values() if c), len(valid_tickers))
+
+        for ticker in valid_tickers:
+            if _trace_hop:
+                _trace_hop(f"{window_id}:{ticker}", "agent_received", "sage", ticker, "alpha")
+
+            context = contexts.get(ticker)
+            if context is None:
+                logger.warning("Skipping %s — ORACLE context unavailable", ticker)
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, ORACLE_MISS)
+                analyzed += 1
+                continue
+
+            result = analyze(
+                ticker, context, regime,
+                _settings.deepseek_api_key, _settings.deepseek_base_url,
+            )
+            analyzed += 1
+
+            if result is None:
+                _consecutive_brain_failures += 1
+                logger.warning(
+                    "Brain failure for %s (consecutive: %d) — skipping submission",
+                    ticker, _consecutive_brain_failures,
+                )
+                log_decision(_settings.db_path, AGENT_NAME, window_id, ticker, BRAIN_FAIL)
+                if _consecutive_brain_failures >= BRAIN_ALERT_THRESHOLD:
+                    alert_brain_down(_settings.telegram_bot_token, _settings.telegram_chat_id, _consecutive_brain_failures)
+                    report("sage", "alert", {"event": "brain_down", "consecutive_failures": _consecutive_brain_failures}, escalation=EscalationLevel.CRITICAL)
+                    _consecutive_brain_failures = 0
+                continue
+
+            _consecutive_brain_failures = 0
+            candidates.append((result["score"], ticker, result["direction"], result["reasoning"]))
+
+        # --- Phase 2: Select top MAX_PICKS_PER_WINDOW by score ---
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top_picks = candidates[:MAX_PICKS_PER_WINDOW]
+
+        if len(candidates) > MAX_PICKS_PER_WINDOW:
+            logger.info(
+                "Window %s: %d candidates scored, capping to top %d (scores: %s)",
+                window_id, len(candidates), MAX_PICKS_PER_WINDOW,
+                [round(c[0], 1) for c in top_picks],
+            )
 
         import json as _json
         _regime_json = _json.dumps(regime) if regime else None
 
-        for result in scored_results:
-            ticker = result.ticker
-            analyzed += 1
-
-            if _trace_hop:
-                _trace_hop(f"{window_id}:{ticker}", "agent_received", "atlas", ticker, "alpha")
-
-            if result.hard_block:
-                logger.info("BLOCKED %s: %s", ticker, result.block_reason)
+        # Log candidates that were scored but didn't make the top-N cut (REJECTED by cap)
+        top_tickers = {c[1] for c in top_picks}
+        for score, ticker, direction, reasoning in candidates:
+            if ticker not in top_tickers:
                 log_decision(
                     _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
-                    direction="N/A", score=0.0, threshold=45.0,
-                    reasoning=result.block_reason,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, regime=_regime_json,
                 )
-                continue
 
-            direction = result.direction
-            reasoning = result.reasoning
-
-            if result.llm_flag:
-                logger.info("LLM review flagged %s: triggers=%s", ticker, result.llm_triggers)
-
+        # --- Phase 3: Submit top picks ---
+        for score, ticker, direction, reasoning in top_picks:
             alpha_ok = submit_to_alpha(
-                ticker, AGENT_NAME, direction, result.alpha_score, reasoning,
+                ticker, AGENT_NAME, direction, score, reasoning,
                 _settings.alpha_buffer_url, _settings.alpha_headers(),
-                window_id=window_id,
             )
             prime_ok = submit_to_prime(
-                ticker, AGENT_NAME, direction, result.prime_score, reasoning,
+                ticker, AGENT_NAME, direction, score, reasoning,
                 _settings.prime_buffer_url, _settings.prime_headers(),
-                window_id=window_id,
             )
 
             if alpha_ok or prime_ok:
                 submitted += 1
-                record_pick(
-                    _settings.db_path, window_id, ticker, direction,
-                    result.alpha_score, reasoning, alpha_ok, prime_ok,
-                )
+                _submitted_today.add(ticker)  # Mark as submitted for today
+                record_pick(_settings.db_path, window_id, ticker, direction, score, reasoning, alpha_ok, prime_ok)
                 log_decision(
                     _settings.db_path, AGENT_NAME, window_id, ticker, SUBMITTED,
-                    direction=direction, score=result.alpha_score,
-                    threshold=45.0, reasoning=reasoning,
-                    alpha_submitted=alpha_ok, prime_submitted=prime_ok,
-                    regime=_regime_json,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, alpha_submitted=alpha_ok,
+                    prime_submitted=prime_ok, regime=_regime_json,
                 )
             else:
                 log_decision(
                     _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
-                    direction=direction, score=result.alpha_score,
-                    threshold=45.0, reasoning=reasoning, regime=_regime_json,
+                    direction=direction, score=score, threshold=58.0,
+                    reasoning=reasoning, regime=_regime_json,
                 )
+
+            if score >= 58 and not alpha_ok:
+                alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Alpha")
+            if score >= 63 and not prime_ok:
+                alert_submission_failed(_settings.telegram_bot_token, _settings.telegram_chat_id, ticker, "Prime")
 
     except Exception as e:
         logger.error("_analyze_pool crashed for window %s at analyzed=%d: %s", window_id, analyzed, e)
-        report("atlas", "incident", {"event": "pool_crash", "window_id": window_id, "error": str(e)[:200]}, escalation=EscalationLevel.CRITICAL)
+        report("sage", "incident", {"event": "pool_crash", "window_id": window_id, "error": str(e)[:200]}, escalation=EscalationLevel.CRITICAL)
     finally:
         complete_window(_settings.db_path, window_id, analyzed, submitted)
-        logger.info("Window %s complete — analyzed=%d submitted=%d", window_id, analyzed, submitted)
-        report("atlas", "status", {"event": "window_complete", "window_id": window_id, "analyzed": analyzed, "submitted": submitted}, escalation=EscalationLevel.INFO)
+        logger.info("Window %s complete — analyzed=%d candidates=%d submitted=%d",
+                    window_id, analyzed, len(candidates), submitted)
+        report("sage", "status", {"event": "window_complete", "window_id": window_id, "analyzed": analyzed, "submitted": submitted}, escalation=EscalationLevel.INFO)
 
 
 @app.post("/receive-pool", status_code=200)
@@ -320,7 +422,7 @@ async def receive_pool(
         target=_analyze_pool,
         args=(payload.model_dump(),),
         daemon=True,
-        name=f"atlas-{window_id}",
+        name=f"sage-{window_id}",
     )
     thread.start()
 
@@ -332,7 +434,7 @@ async def receive_pool(
 @app.get("/health")
 async def health() -> JSONResponse:
     stats = get_stats(_settings.db_path) if _settings else {}
-    return JSONResponse({"status": "ok", "agent": AGENT_NAME, "port": _settings.port if _settings else 9002,
+    return JSONResponse({"status": "ok", "agent": AGENT_NAME, "port": _settings.port if _settings else 9003,
                          "brain_failures": _consecutive_brain_failures, **stats})
 
 
@@ -364,7 +466,7 @@ async def sovereign_directive(
 ) -> JSONResponse:
     """SOVEREIGN pushes a directive directly. Zero polling lag."""
     _check_auth(x_nexus_secret)
-    global _consecutive_brain_failures, _score_threshold_override, _sovereign_halted
+    global _consecutive_brain_failures, _score_threshold_override, _sovereign_halted, _submitted_today
 
     d = body.directive.strip().upper()
     logger.info("SOVEREIGN direct push: %s", d)
@@ -382,8 +484,9 @@ async def sovereign_directive(
         return JSONResponse({"ok": True, "directive": "RESUME", "halted": False})
     elif d in ("FLUSH", "RESET_DAY"):
         _consecutive_brain_failures = 0
-        report(AGENT_NAME, "ack", {"directive": d, "status": "applied"})
-        return JSONResponse({"ok": True, "directive": d, "brain_failures": 0})
+        _submitted_today = set()
+        report(AGENT_NAME, "ack", {"directive": d, "status": "applied", "submitted_today_cleared": True})
+        return JSONResponse({"ok": True, "directive": d})
     elif d == "SET_THRESHOLD":
         try:
             val = float(body.data.get("value", ""))
@@ -396,6 +499,7 @@ async def sovereign_directive(
         stats = get_stats(_settings.db_path) if _settings else {}
         payload = {"directive": "STATUS", "agent": AGENT_NAME,
                    "halted": _sovereign_halted, "brain_failures": _consecutive_brain_failures,
+                   "submitted_today": len(_submitted_today),
                    "threshold_override": _score_threshold_override, **stats}
         report(AGENT_NAME, "status", payload)
         return JSONResponse({"ok": True, **payload})
@@ -415,8 +519,9 @@ async def sovereign_status(
         "ok": True, "agent": AGENT_NAME,
         "halted": _sovereign_halted,
         "brain_failures": _consecutive_brain_failures,
+        "submitted_today": len(_submitted_today),
         "threshold_override": _score_threshold_override,
-        "port": _settings.port if _settings else 9002,
+        "port": _settings.port if _settings else 9003,
         **stats,
     })
 

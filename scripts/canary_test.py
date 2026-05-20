@@ -124,9 +124,10 @@ def get_health(url: str, timeout: int = 5) -> Optional[dict]:
         r = requests.get(f"{url}/health", timeout=timeout)
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
-    return None
+        else:
+            return None
+    except Exception as e:
+        return None
 
 
 def submit_pick(agent: str, window_id: str) -> dict:
@@ -215,7 +216,7 @@ def run_canary(force: bool = False, intraday: bool = False) -> int:
     all_healthy = True
     for name, url in services.items():
         h = get_health(url)
-        ok = h is not None and h.get("status") in ("healthy", "ok", "running")
+        ok = h is not None and h.get("status", "").lower() in ("healthy", "ok", "running")
         health_results[name] = {"ok": ok, "detail": str(h)[:100] if h else "UNREACHABLE"}
         status_icon = "OK" if ok else "FAIL"
         log(f"  {name:15s}: {'healthy' if ok else 'UNREACHABLE'}", status_icon)
