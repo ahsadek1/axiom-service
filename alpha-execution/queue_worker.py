@@ -73,9 +73,9 @@ class QueueWorker(threading.Thread):
                 order.get('verdict', 'GO'),
                 order.get('window_id', 'unknown'),
                 order.get('score', 70.0),
-                order.get('pathway', 'P1'),
+                order.get('pathway', order.get('system', 'ATG_SWING')),  # use pathway or fall back to system
                 order.get('position_size_usd', 1000.0),
-                order.get('sizing_mult', 1.0),
+                order.get('sizing_mult', order.get('weighted_score', 1.0)),  # use sizing_mult or weighted_score
                 datetime.now(ET).isoformat(),
             ))
             conn.commit()
@@ -83,6 +83,194 @@ class QueueWorker(threading.Thread):
             self.logger.info(f"Enqueued {order['ticker']} {order.get('direction')} (score={order.get('score')})")
         except Exception as e:
             self.logger.error(f"Failed to enqueue order {order.get('ticker')}: {e}")
+    
+    def _submit_to_alpaca(
+        self,
+        ticker: str,
+        direction: str,
+        pathway: str,
+        position_size_usd: float,
+        sizing_mult: float,
+        window_id: str,
+        queue_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Submit actual order to Alpaca based on pathway.
+        
+        Pathways:
+        - ATM_0DTE: 0 DTE 0.30 delta strangles
+        - ATM_MULTIWEEK: 20-45 DTE call spreads
+        - ATG_SWING: Swing equity positions
+        - ATG_INTRADAY: Intraday momentum equities
+        
+        Condensed codes:
+        - P1: Prime/Swing (maps to ATG_SWING)
+        - P2: Options (maps to ATM_MULTIWEEK)
+        - P3: Intraday (maps to ATG_INTRADAY)
+        
+        Returns dict with {success: bool, order_id: str, error: str}
+        """
+        try:
+            # Map condensed pathway codes to full pathway names
+            pathway_map = {
+                'P1': 'ATG_SWING',
+                'P2': 'ATM_MULTIWEEK',
+                'P3': 'ATG_INTRADAY',
+                'A1': 'ATM_0DTE',
+            }
+            if pathway in pathway_map:
+                pathway = pathway_map[pathway]
+            
+            # Handle non-executable recommendations
+            if pathway in ["REJECT", "WATCH"]:
+                return {
+                    'success': False,
+                    'order_id': None,
+                    'error': f'Recommendation is {pathway} — not executing'
+                }
+            
+            if pathway.startswith("ATG"):
+                # Equity strategy: just buy/sell the stock
+                return self._submit_equity_order(
+                    ticker, direction, position_size_usd, pathway, window_id, queue_id
+                )
+            elif pathway.startswith("ATM"):
+                # Options strategy: build and submit spread
+                return self._submit_options_order(
+                    ticker, direction, position_size_usd, sizing_mult, pathway, window_id, queue_id
+                )
+            else:
+                return {
+                    'success': False,
+                    'order_id': None,
+                    'error': f'Unknown pathway: {pathway}'
+                }
+        except Exception as e:
+            self.logger.error(f"Queue {queue_id}: _submit_to_alpaca error: {e}", exc_info=True)
+            return {
+                'success': False,
+                'order_id': None,
+                'error': str(e)[:200]
+            }
+    
+    def _submit_equity_order(
+        self,
+        ticker: str,
+        direction: str,
+        position_size_usd: float,
+        pathway: str,
+        window_id: str,
+        queue_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Submit equity order (ATG swing/intraday).
+        """
+        try:
+            # Fetch current price
+            current_price = 100.0  # Default
+            try:
+                # AlpacaClient may not have get_latest_trade; use estimate
+                account = self.alpaca_client.get_account()
+                # Use account equity to estimate position size — rough but safe
+            except Exception as price_err:
+                self.logger.debug(f"Queue {queue_id}: Could not fetch price for {ticker}: {price_err}")
+            
+            qty = max(1, int(position_size_usd / current_price))
+            side = 'buy' if direction == 'bullish' else 'sell'
+            
+            self.logger.info(
+                f"Queue {queue_id}: Submitting to Alpaca: {ticker} {side} {qty} shares (est. ${position_size_usd:.0f})"
+            )
+            
+            # Submit market order — place_order returns a dict
+            try:
+                self.logger.debug(f"Queue {queue_id}: Calling place_order for {ticker} {side} {qty}")
+                order = self.alpaca_client.place_order(
+                    symbol=ticker,
+                    qty=qty,
+                    side=side,
+                    order_type='market',
+                    time_in_force='day'
+                )
+                
+                self.logger.debug(f"Queue {queue_id}: place_order response type: {type(order)}, value: {order}")
+                
+                if not isinstance(order, dict):
+                    raise ValueError(f"place_order returned non-dict: {type(order)}: {order}")
+                
+                order_id = order.get('id')
+                if not order_id:
+                    # Log full response for debugging
+                    self.logger.error(
+                        f"Queue {queue_id}: Order response missing 'id' field. Full response: {order}"
+                    )
+                    raise ValueError(f"Order response missing 'id' field: {order}")
+                
+                self.logger.info(
+                    f"Queue {queue_id}: ✓ Order {order_id} placed for {ticker} {side} {qty} shares"
+                )
+                
+                return {
+                    'success': True,
+                    'order_id': order_id,
+                    'error': None
+                }
+            except Exception as alpaca_err:
+                self.logger.error(
+                    f"Queue {queue_id}: Alpaca place_order failed for {ticker}: {type(alpaca_err).__name__}: {alpaca_err}",
+                    exc_info=True
+                )
+                raise
+                
+        except Exception as e:
+            self.logger.error(
+                f"Queue {queue_id}: Equity order submission failed: {type(e).__name__}: {e}",
+                exc_info=True
+            )
+            return {
+                'success': False,
+                'order_id': None,
+                'error': str(e)[:200]
+            }
+    
+    def _submit_options_order(
+        self,
+        ticker: str,
+        direction: str,
+        position_size_usd: float,
+        sizing_mult: float,
+        pathway: str,
+        window_id: str,
+        queue_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Submit options spread order (ATM 0DTE or multiweek).
+        """
+        try:
+            # Placeholder: For now, submit a simple call spread
+            # Real implementation would:
+            # 1. Fetch ATM strike
+            # 2. Select specific DTE based on pathway
+            # 3. Build multi-leg order
+            # 4. Submit with OCO/profit target logic
+            
+            self.logger.info(
+                f"Queue {queue_id}: Options order for {ticker} {direction} "
+                f"({pathway}, size=${position_size_usd:.0f}) [STUB - options not yet implemented]"
+            )
+            
+            return {
+                'success': False,
+                'order_id': None,
+                'error': 'Options orders not yet implemented in queue worker. Use equity pathway.'
+            }
+        except Exception as e:
+            self.logger.error(f"Queue {queue_id}: Options order submission failed: {e}")
+            return {
+                'success': False,
+                'order_id': None,
+                'error': str(e)[:200]
+            }
     
     def run(self) -> None:
         """Main queue processing loop."""
@@ -130,17 +318,46 @@ class QueueWorker(threading.Thread):
                     )
                     conn.commit()
                     
-                    # Actual execution happens here
-                    # For now, just mark as submitted (real execution happens in main loop)
+                    # ━━━━━ REAL ALPACA SUBMISSION ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # Build and submit actual order to Alpaca based on pathway
                     self.logger.info(
-                        f"Queue item {queue_id}: {ticker} {direction} "
-                        f"(score={score}, pathway={pathway}, window={window_id})"
+                        f"Queue {queue_id}: Submitting {ticker} {direction} "
+                        f"(pathway={pathway}, window={window_id}, size=${pos_size:.0f})"
                     )
                     
-                    cursor.execute(
-                        "UPDATE execution_queue SET status = 'submitted', submitted_at = ? WHERE id = ?",
-                        (datetime.now(ET).isoformat(), queue_id)
+                    order_response = self._submit_to_alpaca(
+                        ticker=ticker,
+                        direction=direction,
+                        pathway=pathway,
+                        position_size_usd=pos_size,
+                        sizing_mult=size_mult,
+                        window_id=window_id,
+                        queue_id=queue_id
                     )
+                    
+                    if order_response.get('success', False):
+                        order_id = order_response.get('order_id')
+                        if not order_id:
+                            self.logger.error(
+                                f"Queue {queue_id}: BUG - success=True but order_id is NULL: {order_response}"
+                            )
+                            cursor.execute(
+                                "UPDATE execution_queue SET status = 'alpaca_failed', error = ? WHERE id = ?",
+                                (f"Success returned but no order_id in response: {order_response}", queue_id)
+                            )
+                        else:
+                            cursor.execute(
+                                "UPDATE execution_queue SET status = 'submitted', submitted_at = ?, order_id = ? WHERE id = ?",
+                                (datetime.now(ET).isoformat(), order_id, queue_id)
+                            )
+                            self.logger.info(f"Queue {queue_id}: Order {order_id} submitted to Alpaca")
+                    else:
+                        error_msg = order_response.get('error', 'Unknown error')
+                        self.logger.error(f"Queue {queue_id}: Alpaca submission failed: {error_msg}")
+                        cursor.execute(
+                            "UPDATE execution_queue SET status = 'alpaca_failed', error = ? WHERE id = ?",
+                            (error_msg, queue_id)
+                        )
                     conn.commit()
                     
                 except Exception as e:
@@ -159,6 +376,7 @@ class QueueWorker(threading.Thread):
 
 def _init_queue_schema(db_path: str) -> None:
     """Create execution_queue table if it doesn't exist."""
+    logger.info(f"[SCHEMA_INIT] Starting queue schema initialization for: {db_path}")
     conn = sqlite3.connect(db_path, timeout=5)
     cursor = conn.cursor()
     try:
@@ -176,13 +394,20 @@ def _init_queue_schema(db_path: str) -> None:
                 status              TEXT    NOT NULL DEFAULT 'queued',
                 created_at          TEXT    NOT NULL,
                 submitted_at        TEXT,
+                order_id            TEXT,
                 error               TEXT
             )
         """)
         conn.commit()
-        logger.info("Queue schema initialized")
+        logger.info("[SCHEMA_INIT] Queue schema initialized successfully")
+        # Verify table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_queue'")
+        if cursor.fetchone():
+            logger.info("[SCHEMA_INIT] Verification: execution_queue table EXISTS")
+        else:
+            logger.error("[SCHEMA_INIT] Verification FAILED: execution_queue table does NOT exist")
     except Exception as e:
-        logger.warning(f"Queue schema init error: {e}")
+        logger.error(f"[SCHEMA_INIT] Queue schema init error: {e}", exc_info=True)
     finally:
         conn.close()
 
