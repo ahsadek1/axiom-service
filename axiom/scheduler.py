@@ -34,6 +34,7 @@ def create_scheduler(app_state: dict) -> BackgroundScheduler:
       - 9:15 AM ET:   First Tier 2 run (opens pool)
       - Every 15 min, 9:15–3:30 PM ET: Tier 2 live pool refresh
       - 1:00 PM ET:   Tier 1 mid-day refresh
+      - 2:15 PM ET:   Tier 1 afternoon refresh (maintains pool freshness)
       - 3:30 PM ET:   Submission window close (stops Tier 2)
 
     Args:
@@ -68,6 +69,15 @@ def create_scheduler(app_state: dict) -> BackgroundScheduler:
         trigger = CronTrigger(hour=13, minute=0, timezone=ET),
         id      = "tier1_midday",
         name    = "Tier 1 mid-day refresh",
+        replace_existing=True,
+    )
+
+    # 2:15 PM — Tier 1 late afternoon refresh (maintains freshness until close)
+    scheduler.add_job(
+        func    = lambda: _run_tier1(app_state, run_type="afternoon"),
+        trigger = CronTrigger(hour=14, minute=15, timezone=ET),
+        id      = "tier1_afternoon",
+        name    = "Tier 1 afternoon refresh",
         replace_existing=True,
     )
 
