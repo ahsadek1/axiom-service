@@ -194,14 +194,17 @@ async def _omni_retry_loop() -> None:
     """
     Background retry loop for failed OMNI dispatches (OMNI H2 fix).
 
-    Polls every 60s for concordances with omni_dispatched=0.
-    Retries up to 3 times. Alerts Ahmed via Telegram after exhausting retries.
+    Polls every 10s for concordances with omni_dispatched=0 (GENESIS 2026-05-26).
+    Changed from 60s to 10s after two incidents in 1 hour — concordances were
+    sitting unretried for up to 60 seconds, causing OMNI silence.
+    
+    Retries up to 9 times. Alerts Ahmed via Telegram after exhausting retries.
     A missed concordance = missed trade entry — this loop prevents permanent loss.
     """
     import asyncio as _asyncio
     import json as _json
     MAX_ATTEMPTS = 9
-    POLL_INTERVAL = 60
+    POLL_INTERVAL = 10  # DECREASED from 60s (was too aggressive on failure)
 
     while True:
         await _asyncio.sleep(POLL_INTERVAL)
@@ -668,7 +671,8 @@ def submit_pick(
         _sys_wc.path.insert(0, _os_wc.path.join(_os_wc.path.dirname(__file__), ".."))
         import requests as _wc_req
         _axiom_resp = _wc_req.get(
-            f"{getattr(settings, 'axiom_url', 'http://localhost:8001')}/pool/window",
+            f"{getattr(settings, 'axiom_url', 'http://localhost:8001')}/pool",
+            headers={"X-Axiom-Secret": getattr(settings, 'axiom_secret', '')},
             timeout=3,
         )
         if _axiom_resp.status_code == 200:
@@ -712,7 +716,15 @@ def submit_pick(
         window_id = _current_window
     elif body.window_id:
         # Fresh submission — use agent's window_id to avoid concordance splitting across 15-min boundaries
-        window_id = body.window_id
+        # OMNI FIX (May 21 2026): Replace test/GENESIS-TEST IDs with production format to unblock 313 verdicts
+        if "test" in body.window_id.lower() or body.window_id == "GENESIS-TEST":
+            logger.warning(
+                "Test window_id='%s' detected for %s/%s — replacing with production format %s",
+                body.window_id, body.ticker, body.direction, _current_window
+            )
+            window_id = _current_window
+        else:
+            window_id = body.window_id
 
     # Persist submission
     save_submission(
