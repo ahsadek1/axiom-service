@@ -273,6 +273,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             e,
         )
 
+    # ── Startup Tier 1 load: Initialize anchor stocks before scheduler starts ─────
+    # Ensures pool is ready if service starts/restarts during market hours.
+    # Without this, Tier 1 jobs may not fire until tomorrow if startup is post-1PM ET.
+    try:
+        from tier1_filter import run_tier1_filter
+        from database import save_anchor_stocks
+        from datetime import date
+        
+        logger.info("Startup: Running Tier 1 filter to initialize anchor stocks...")
+        anchors = run_tier1_filter(
+            universe          = settings.stock_universe,
+            polygon_api_key   = settings.polygon_api_key,
+            alpha_vantage_key = settings.alpha_vantage_key,
+        )
+        app_state["anchor_stocks"] = anchors
+        save_anchor_stocks(settings.axiom_db_path, anchors, date.today().isoformat(), "startup")
+        logger.info("Startup Tier 1 complete — %d anchor stocks loaded", len(anchors))
+    except Exception as e:
+        logger.warning("Startup Tier 1 load failed: %s — scheduler will retry at 9 AM", e)
+
     # Start scheduler
     scheduler = create_scheduler(app_state)
     scheduler.start()
@@ -1201,4 +1221,23 @@ def handle_set_position_limit(request: SetPositionLimitRequest) -> SetPositionLi
         return set_position_limit(settings.axiom_db_path, request)
     except RuntimeError as e:
         logger.error("Error setting position limit: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mock/reset")
+def handle_mock_reset():
+    """
+    POST /mock/reset — Reset all mock state to defaults.
+    
+    Used between test scenarios to clear pending candidates, earnings calendar, etc.
+    """
+    try:
+        reset_mock_state()
+        return {
+            "status": "reset",
+            "message": "All mock state cleared",
+            "timestamp": datetime.now(ET).isoformat()
+        }
+    except Exception as e:
+        logger.error("Error resetting mock state: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
