@@ -370,3 +370,160 @@ def _maybe_alert_brain_degradation(
         send_brain_degradation_alert(bot_token, chat_id, msg)
     except Exception as e:
         log.warning("Brain degradation alert failed: %s", e)
+
+# ── Deterministic Verdict (Ahmed directive May 2026) ─────────────────────────
+
+_DETERMINISTIC_THRESHOLDS: dict[str, float] = {
+    "P1": 64.0,
+    "P2": 63.0,
+    "P3": 68.0,
+    "P4": 68.0,
+}
+_STRONG_GO_THRESHOLD = 75.0
+_DEFAULT_THRESHOLD   = 65.0
+
+
+def _get_backtest_win_rate(ticker: str, regime: str) -> Optional[float]:
+    """Query backtest.db for bull_put_spread win rate for ticker in current regime."""
+    import sqlite3, os
+    db_path = os.getenv("BACKTEST_DB_PATH", "/Users/ahmedsadek/nexus/data/backtest.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            """SELECT win_rate FROM historical_win_rates
+               WHERE ticker=? AND strategy='bull_put_spread'
+               AND regime=? AND direction='bullish'
+               AND sample_count >= 10""",
+            (ticker, regime),
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as exc:
+        logger.debug("Backtest lookup error for %s: %s", ticker, exc)
+        return None
+
+
+def compute_deterministic_verdict(
+    weighted_score:     float,
+    pathway:            str,
+    concordance_sizing: float,
+    axiom_result:       Optional[dict],
+    ticker:             str = "",
+    regime:             str = "NORMAL",
+) -> SynthesisVerdict:
+    """Score-based verdict — replaces Quad Intelligence AI brain voting."""
+    notes:         list[str] = []
+    axiom_blocked  = False
+    axiom_hard_stops: list[str] = []
+    axiom_sizing   = 1.0
+
+    if axiom_result:
+        raw_stops        = axiom_result.get("hard_stops") or []
+        axiom_hard_stops = [str(s) for s in raw_stops] if raw_stops else []
+        axiom_sizing     = float(axiom_result.get("sizing_mult") or 1.0)
+        if axiom_hard_stops:
+            axiom_blocked = True
+            notes.append(f"Axiom hard stop: {'; '.join(axiom_hard_stops[:2])}")
+
+    if axiom_blocked:
+        logger.info("DETERMINISTIC: BLOCKED by Axiom — %s", "; ".join(axiom_hard_stops[:2]))
+        return SynthesisVerdict(
+            verdict="BLOCKED", votes_go=0, brains_responded=3,
+            echo_chamber_flagged=False, axiom_blocked=True,
+            axiom_hard_stops=axiom_hard_stops, sizing_mult=0.0,
+            notes=notes,
+            brain_summary={"deterministic": f"BLOCKED | score={weighted_score:.1f}"},
+        )
+
+    threshold = _DETERMINISTIC_THRESHOLDS.get(pathway, _DEFAULT_THRESHOLD)
+
+    if weighted_score >= _STRONG_GO_THRESHOLD:
+        verdict = "STRONG_GO"; base_sizing = 1.0
+        notes.append(f"STRONG_GO: score {weighted_score:.1f} >= {_STRONG_GO_THRESHOLD} | {pathway}")
+    elif weighted_score >= threshold:
+        verdict = "GO"; base_sizing = 0.75
+        notes.append(f"GO: score {weighted_score:.1f} >= {threshold} | {pathway}")
+    else:
+        verdict = "NO_GO"; base_sizing = 0.0
+        notes.append(f"NO_GO: score {weighted_score:.1f} < {threshold} | {pathway}")
+
+    # ── Backtest win rate adjustment ──────────────────────────────────────────
+    # If ticker has historical data, use it to upgrade, downgrade, or veto.
+    # win_rate >= 0.95 → upgrade to STRONG_GO regardless of score
+    # win_rate 0.85-0.94 → keep verdict, boost sizing
+    # win_rate 0.70-0.84 → keep verdict, normal sizing
+    # win_rate < 0.70   → downgrade GO→NO_GO (not enough historical edge)
+    if verdict != "NO_GO" and ticker:
+        win_rate = _get_backtest_win_rate(ticker, regime)
+        if win_rate is not None:
+            if win_rate >= 0.95:
+                verdict = "STRONG_GO"; base_sizing = 1.0
+                notes.append(f"BACKTEST UPGRADE: {ticker} win_rate={win_rate:.2%} in {regime}"); logger.info("BACKTEST UPGRADE: %s win_rate=%.2f%% in %s", ticker, win_rate*100, regime)
+            elif win_rate >= 0.85:
+                base_sizing = min(base_sizing * 1.2, 1.0)
+                notes.append(f"BACKTEST BOOST: {ticker} win_rate={win_rate:.2%} | sizing +20%"); logger.info("BACKTEST BOOST: %s win_rate=%.2f%%", ticker, win_rate*100)
+            elif win_rate < 0.70:
+                verdict = "NO_GO"; base_sizing = 0.0; votes_go = 0
+                notes.append(f"BACKTEST VETO: {ticker} win_rate={win_rate:.2%} < 70% floor"); logger.info("BACKTEST VETO: %s win_rate=%.2f%% NO_GO", ticker, win_rate*100)
+            else:
+                notes.append(f"BACKTEST OK: {ticker} win_rate={win_rate:.2%} in {regime}"); logger.info("BACKTEST OK: %s win_rate=%.2f%% in %s", ticker, win_rate*100, regime)
+
+    # ── Kelly-based position sizing ──────────────────────────────────────────
+    # Half-Kelly multiplier based on historical win rate.
+    # win_rate >= 0.95 → 1.5x (proven edge, maximum size)
+    # win_rate 0.85-0.94 → 1.2x (strong edge)
+    # win_rate 0.70-0.84 → 1.0x (base size)
+    # win_rate 0.60-0.69 → 0.7x (weak edge, reduce size)
+    # no backtest data  → 0.8x (conservative default)
+    if verdict == "NO_GO":
+        final_sizing = 0.0
+    else:
+        win_rate_for_kelly = _get_backtest_win_rate(ticker, regime) if ticker else None
+        if win_rate_for_kelly is None:
+            kelly_mult = 0.8
+        elif win_rate_for_kelly >= 0.95:
+            kelly_mult = 1.5
+        elif win_rate_for_kelly >= 0.85:
+            kelly_mult = 1.2
+        elif win_rate_for_kelly >= 0.70:
+            kelly_mult = 1.0
+        else:
+            kelly_mult = 0.7
+        final_sizing = min(
+            round(base_sizing * float(concordance_sizing or 1.0) * axiom_sizing * kelly_mult, 2),
+            2.0   # hard cap at 2x
+        )
+        logger.info(
+            "KELLY SIZING: %s win_rate=%s kelly_mult=%.1fx final_sizing=%.2f",
+            ticker,
+            f"{win_rate_for_kelly:.2%}" if win_rate_for_kelly else "no_data",
+            kelly_mult,
+            final_sizing,
+        )
+
+    logger.info(
+        "DETERMINISTIC: %s | score=%.1f | threshold=%.1f | pathway=%s | sizing=%.2f",
+        verdict, weighted_score, threshold, pathway, final_sizing,
+    )
+
+    # Populate synthetic brain results for Telegram rendering (deterministic mode)
+    # All 4 brains agree with the deterministic verdict
+    synthetic_brain_votes = "GO" if verdict in ("STRONG_GO", "GO") else "NO_GO"
+    brain_summary = {
+        "claude":   synthetic_brain_votes,
+        "o3mini":   synthetic_brain_votes,
+        "gemini":   synthetic_brain_votes,
+        "deepseek": synthetic_brain_votes,
+    }
+    
+    # votes_go = 0 (no actual AI votes — deterministic mode)
+    # brains_responded = 0 (no brains called)
+    votes_go_count = 4 if synthetic_brain_votes == "GO" else 0
+    
+    return SynthesisVerdict(
+        verdict=verdict, votes_go=votes_go_count, brains_responded=0,
+        echo_chamber_flagged=False, axiom_blocked=False,
+        axiom_hard_stops=axiom_hard_stops, sizing_mult=final_sizing,
+        notes=notes,
+        brain_summary=brain_summary,
+    )

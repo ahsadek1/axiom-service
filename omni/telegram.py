@@ -58,20 +58,38 @@ def send_synthesis_card(
     system_label = "ALPHA (Options)" if system == "ALPHA" else "PRIME (Swing)"
 
     # Brain vote lines
+    # Source: prefer verdict.brain_summary (deterministic mode) OR brain_results (Quad Intelligence mode)
     brain_lines = []
+    brain_data = verdict.brain_summary or {}  # verdict.brain_summary has priority
+    
     for brain_name in ("claude", "o3mini", "gemini", "deepseek"):
-        result = brain_results.get(brain_name, {})
-        if result.get("error"):
-            line = f"  ⚠️ {brain_name.upper():<9}: ERROR — {result['error'][:40]}"
+        # Deterministic mode: brain_summary[brain_name] is "GO" or "NO_GO" (string)
+        # Quad Intelligence mode: brain_results[brain_name] is full dict with vote/confidence/concerns
+        
+        if brain_name in brain_data:
+            value = brain_data[brain_name]
+            if isinstance(value, dict):
+                # Quad Intelligence mode: full result dict
+                if value.get("error"):
+                    line = f"  ⚠️ {brain_name.upper():<9}: ERROR — {value['error'][:40]}"
+                else:
+                    vote       = value.get("vote", "?")
+                    confidence = value.get("confidence", "?")
+                    concern    = value.get("concern_1") or "—"
+                    vote_emoji = "✅" if vote == "GO" else ("⛔" if vote == "NO_GO" else "🟡")
+                    line = (
+                        f"  {vote_emoji} {brain_name.upper():<9}: "
+                        f"{vote} ({confidence}) — {concern[:50]}"
+                    )
+            else:
+                # Deterministic mode: brain_summary[brain_name] is "GO" or "NO_GO" (string)
+                vote = str(value)
+                vote_emoji = "✅" if vote == "GO" else ("⛔" if vote == "NO_GO" else "🟡")
+                line = f"  {vote_emoji} {brain_name.upper():<9}: {vote} (synth) — deterministic"
         else:
-            vote       = result.get("vote", "?")
-            confidence = result.get("confidence", "?")
-            concern    = result.get("concern_1") or "—"
-            vote_emoji = "✅" if vote == "GO" else ("⛔" if vote == "NO_GO" else "🟡")
-            line = (
-                f"  {vote_emoji} {brain_name.upper():<9}: "
-                f"{vote} ({confidence}) — {concern[:50]}"
-            )
+            # Fallback: neither brain_summary nor brain_results has this brain
+            line = f"  🟡 {brain_name.upper():<9}: ? (?) — —"
+        
         brain_lines.append(line)
 
     # Echo chamber warning
