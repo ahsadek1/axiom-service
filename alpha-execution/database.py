@@ -369,10 +369,15 @@ def _DEPRECATED_save_position_DO_NOT_USE(
 
 
 def get_open_positions(db_path: str) -> list[dict]:
-    """Return all open positions."""
+    """Return all open or pending positions (for confirmation polling).
+    
+    FIX-EXEC-CONFIRM-PENDING (May 28, 2026): Include status='pending' so OMNI's
+    confirmation polling can find orders before they're marked 'open' in Alpaca.
+    Without this, confirmation times out even though the order was accepted.
+    """
     with get_conn(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM positions WHERE status='open' ORDER BY opened_at ASC"
+            "SELECT * FROM positions WHERE status IN ('pending', 'open') ORDER BY opened_at ASC"
         ).fetchall()
     return [dict(r) for r in rows]
 
