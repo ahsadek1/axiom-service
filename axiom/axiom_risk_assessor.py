@@ -101,7 +101,7 @@ L9_MIN_SCORE       = 40.0       # Minimum technical score to proceed
 
 # Layer 10: Circuit Breaker
 L10_DAILY_LOSS_PCT = 0.05       # Halt if daily portfolio loss > 5%
-L10_MAX_POSITIONS  = 20         # Flag if open positions ≥ 20
+L10_MAX_POSITIONS  = 3          # Hard stop if open positions ≥ 3 (Ahmed mandate)
 
 
 # ── Sector Map ─────────────────────────────────────────────────────────────────
@@ -807,12 +807,12 @@ def _layer10_circuit_breaker(positions: list, account: Optional[dict]) -> LayerR
             return layer
 
         if n_positions >= L10_MAX_POSITIONS:
-            layer.flag       = "POSITION_CAP_APPROACHING"
-            layer.risk_delta = 8.0
-            layer.size_delta = 0.25
+            layer.hard_stop  = True
+            layer.flag       = "POSITION_CAP_EXCEEDED"
+            layer.risk_delta = 50.0
             layer.detail     = (
-                f"{n_positions} open positions — at capacity "
-                f"(max {L10_MAX_POSITIONS})"
+                f"{n_positions} open positions exceeds cap "
+                f"(max {L10_MAX_POSITIONS}) — HARD STOP"
             )
         else:
             layer.detail = (
