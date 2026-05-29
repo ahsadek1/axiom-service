@@ -58,6 +58,12 @@ ALPACA_H      = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SE
 ORATS_TOKEN   = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY")
 DEEPSEEK_KEY  = os.getenv("DEEPSEEK_KEY") or os.getenv("DEEPSEEK_API_KEY") or ""
 
+# ── ORATS Quota Exhaustion Flag ───────────────────────────────────────────────
+# Set to True when ORATS returns 429 quota exceeded.
+# When True, all _get_orats* functions skip calls and return empty dicts.
+# This allows graceful fallback to Polygon/cached data for the rest of month.
+ORATS_QUOTA_EXHAUSTED = False  # Fixed 2026-05-29 14:30 ET — ORATS monthly quota hit
+
 TOTAL_CAPITAL   = float(os.getenv("NEXUS_TOTAL_CAPITAL", "25000"))
 MAX_POSITIONS   = int(os.getenv("NEXUS_MAX_POSITIONS",   "3"))  # HARD CAP per NEXUS_ARCHITECTURE.md + HARD_RULES.md
 MAX_TICKER_PCT  = 0.05    # 5% per ticker
@@ -195,9 +201,20 @@ def _get_vix() -> Optional[float]:
 
 
 def _get_orats_summary(ticker: str) -> dict:
+    global ORATS_QUOTA_EXHAUSTED
+    if ORATS_QUOTA_EXHAUSTED:
+        return {}  # Skip ORATS call if quota exhausted
     try:
         r = requests.get("https://api.orats.io/datav2/summaries",
                         params={"token": ORATS_TOKEN, "ticker": ticker}, timeout=8)
+        if r.status_code == 429:
+            # Quota exhausted — set flag to skip all future calls
+            msg = r.json().get("message", "")
+            if "quota exceeded" in msg.lower():
+                ORATS_QUOTA_EXHAUSTED = True
+                import logging
+                logging.error(f"🔴 ORATS QUOTA EXHAUSTED — falling back to Polygon/cached data")
+            return {}
         data = r.json().get("data", [])
         return data[0] if data else {}
     except Exception:
@@ -205,9 +222,15 @@ def _get_orats_summary(ticker: str) -> dict:
 
 
 def _get_orats_earnings(ticker: str) -> dict:
+    global ORATS_QUOTA_EXHAUSTED
+    if ORATS_QUOTA_EXHAUSTED:
+        return {}  # Skip ORATS call if quota exhausted
     try:
         r = requests.get("https://api.orats.io/datav2/earnings",
                         params={"token": ORATS_TOKEN, "ticker": ticker}, timeout=8)
+        if r.status_code == 429:
+            ORATS_QUOTA_EXHAUSTED = True
+            return {}
         data = r.json().get("data", [])
         return data[0] if data else {}
     except Exception:
@@ -217,9 +240,15 @@ def _get_orats_earnings(ticker: str) -> dict:
 def _get_orats_strike_data(ticker: str, strike: Optional[float],
                             dte_target: int) -> dict:
     """Fetch IV, OI, volume, Greeks for a specific strike/expiry."""
+    global ORATS_QUOTA_EXHAUSTED
+    if ORATS_QUOTA_EXHAUSTED:
+        return {}  # Skip ORATS call if quota exhausted
     try:
         r = requests.get("https://api.orats.io/datav2/strikes",
                         params={"token": ORATS_TOKEN, "ticker": ticker}, timeout=10)
+        if r.status_code == 429:
+            ORATS_QUOTA_EXHAUSTED = True
+            return {}
         data = r.json().get("data", [])
         if not data:
             return {}
