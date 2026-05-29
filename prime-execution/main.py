@@ -1106,7 +1106,7 @@ def execute(
             _gate_allowed, _gate_result = _capital_gate.pre_execution_check(
                 ticker=body.ticker,
                 system="prime",
-                amount_usd=position_size_usd
+                amount_usd=body.position_size_usd
             )
             logger.info(
                 "Capital gate result for %s: allowed=%s blocked_by=%s",
