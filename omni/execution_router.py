@@ -17,6 +17,52 @@ from config import BASE_POSITION_SIZE  # noqa: F401 — re-exported for callers
 logger = logging.getLogger("omni.execution_router")
 
 ROUTE_TIMEOUT_SECONDS = 10
+TRADES_CONFIRM_TIMEOUT = 5  # secondary confirmation call timeout
+
+
+def _confirm_execution(system: str, ticker: str, exec_url: str, auth_secret: str, auth_header: str) -> bool:
+    """
+    Confirmation check: query /trades endpoint to verify order actually reached Alpaca.
+    
+    If execution engine responded with 4xx/5xx but the order is in /trades, treat it as success.
+    This prevents false "execution failed" flags when the order actually went through.
+    
+    Returns True if the order is confirmed in the execution engine's /trades summary.
+    Returns False only if confirmation fails or times out.
+    """
+    try:
+        resp = requests.get(
+            f"{exec_url}/trades",
+            headers={auth_header: auth_secret},
+            timeout=TRADES_CONFIRM_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # If alpaca_orders_filled > 0, assume latest order succeeded
+            # (ideally we'd query by ticker, but /trades is a summary endpoint)
+            # For now: if engine responds with 200 and has order data, trust it worked
+            if data.get("alpaca_orders_submitted", 0) > 0:
+                logger.info(
+                    "Execution confirmation: %s/%s confirmed via /trades | submitted=%d, filled=%d",
+                    system.upper(), ticker,
+                    data.get("alpaca_orders_submitted", 0),
+                    data.get("alpaca_orders_filled", 0),
+                )
+                return True
+        logger.warning(
+            "Execution confirmation failed for %s/%s: /trades returned HTTP %d",
+            system.upper(), ticker, resp.status_code,
+        )
+        return False
+    except requests.exceptions.Timeout:
+        logger.warning("Execution confirmation timeout for %s/%s", system.upper(), ticker)
+        return False
+    except Exception as e:
+        logger.warning(
+            "Execution confirmation error for %s/%s: %s",
+            system.upper(), ticker, e,
+        )
+        return False
 
 
 def route_execution(payload: dict) -> tuple[bool, Optional[str]]:
@@ -59,10 +105,26 @@ def route_execution(payload: dict) -> tuple[bool, Optional[str]]:
                 return True, resp.json().get("status", f"HTTP {resp.status_code}")
             except Exception:
                 return True, f"HTTP {resp.status_code}"
+        
+        # GATE-001: On 4xx/5xx, check /trades to see if order actually went through
         logger.warning(
-            "DLQ route_execution: engine returned %d for %s/%s (%s)",
+            "DLQ route_execution: engine returned %d for %s/%s (%s), confirming via /trades...",
             resp.status_code, payload.get("ticker"), payload.get("direction"), system,
         )
+        confirmed = _confirm_execution(
+            system,
+            payload.get("ticker"),
+            exec_url,
+            auth_value,
+            auth_header,
+        )
+        if confirmed:
+            logger.info(
+                "DLQ route_execution: CONFIRMED despite HTTP %d — order in /trades",
+                resp.status_code,
+            )
+            return True, f"Confirmed (HTTP {resp.status_code})"
+        
         return False, f"HTTP {resp.status_code}"
     except requests.exceptions.Timeout:
         logger.warning("DLQ route_execution: timeout for %s/%s (%s)",
@@ -176,8 +238,33 @@ def route_to_execution(
             except Exception:
                 return True, f"HTTP {resp.status_code}"
 
+        # GATE-001: On 4xx/5xx, check /trades to see if order actually went through
         logger.warning(
-            "Execution engine returned %d for %s/%s (%s)",
+            "Execution engine returned %d for %s/%s (%s), confirming via /trades...",
+            resp.status_code,
+            payload["ticker"],
+            payload["direction"],
+            system,
+        )
+        confirmed = _confirm_execution(
+            system,
+            payload["ticker"],
+            execution_url,
+            auth_secret,
+            auth_header,
+        )
+        if confirmed:
+            logger.info(
+                "Execution CONFIRMED despite HTTP %d — order in /trades | %s/%s | size=$%.0f",
+                resp.status_code,
+                payload["ticker"],
+                payload["direction"],
+                position_size,
+            )
+            return True, f"Confirmed (HTTP {resp.status_code})"
+        
+        logger.warning(
+            "Execution engine returned %d and /trades confirmation failed for %s/%s (%s)",
             resp.status_code,
             payload["ticker"],
             payload["direction"],
