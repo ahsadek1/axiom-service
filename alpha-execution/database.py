@@ -374,12 +374,36 @@ def get_open_positions(db_path: str) -> list[dict]:
     FIX-EXEC-CONFIRM-PENDING (May 28, 2026): Include status='pending' so OMNI's
     confirmation polling can find orders before they're marked 'open' in Alpaca.
     Without this, confirmation times out even though the order was accepted.
+    
+    FIX-EXEC-CONFIRM-V2 (May 29, 2026): Query BOTH positions (legacy options)
+    AND active_positions_v2 (modern equity + new orders) tables. This ensures
+    that new orders created by queue_worker.py (inserted into active_positions_v2)
+    are visible to OMNI's confirmation polling.
     """
     with get_conn(db_path) as conn:
-        rows = conn.execute(
+        # Legacy positions table (options)
+        legacy_rows = conn.execute(
             "SELECT * FROM positions WHERE status IN ('pending', 'open') ORDER BY opened_at ASC"
         ).fetchall()
-    return [dict(r) for r in rows]
+        legacy_positions = [dict(r) for r in legacy_rows]
+        
+        # Modern active_positions_v2 table (equity + new orders)
+        try:
+            modern_rows = conn.execute(
+                "SELECT id, ticker, direction, status, alpaca_order_id, pathway, window_id, opened_at "
+                "FROM active_positions_v2 WHERE status IN ('pending', 'open') ORDER BY opened_at ASC"
+            ).fetchall()
+            modern_positions = [dict(r) for r in modern_rows]
+        except Exception as e:
+            import logging
+            logging.getLogger("alpha_exec.database").warning(
+                f"Could not query active_positions_v2: {e}. Returning only legacy positions."
+            )
+            modern_positions = []
+        
+        # Combine both lists, dedup by ticker+status
+        combined = legacy_positions + modern_positions
+        return combined
 
 
 def get_position_by_id(db_path: str, position_id: int) -> Optional[dict]:

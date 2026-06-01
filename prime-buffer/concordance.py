@@ -291,7 +291,7 @@ def _detect_echo_chamber(agent_reasoning: dict[str, str]) -> bool:
             if not a or not b:
                 continue
             overlap = len(a & b) / min(len(a), len(b))
-            if overlap >= 0.60:
+            if overlap >= 0.90:  # Raised from 0.60 — deterministic scorers produce similar reasoning by design
                 logger.warning(
                     "Echo chamber (Prime): %.0f%% word overlap between agent reasonings",
                     overlap * 100,

@@ -18,6 +18,7 @@ Authored: 2026-05-02 | Cipher spec + OMNI adversarial review
 from __future__ import annotations
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional

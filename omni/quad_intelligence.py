@@ -254,7 +254,10 @@ def run_all_brains(
     # for all threads — defeating the deadline entirely if brains are stuck in
     # requests.post(). Instead, call shutdown(wait=False): hung threads eventually
     # exit on their own via the per-request timeout (BRAIN_TIMEOUT_SECONDS).
-    _HARD_DEADLINE = BRAIN_TIMEOUT_SECONDS + 30  # 30s grace over per-request timeout
+    # FIX-CLAUDE-TIMEOUT (2026-06-01): Updated grace period from 30s to 15s (tighter deadline).
+    # With 45s per-brain timeout, 4 brains in parallel complete in ~45s max.
+    # Hard deadline of 60s allows for overhead + thread pool scheduling.
+    _HARD_DEADLINE = min(BRAIN_TIMEOUT_SECONDS * 4 // 3, 60)  # 60s hard stop (was 150s)
 
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omni-brain")
     futures = {

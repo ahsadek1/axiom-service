@@ -15,9 +15,13 @@ from dataclasses import dataclass, field
 VOTES_REQUIRED_STRONG_GO  = 3   # 3+ brains GO → STRONG_GO (full size)
 VOTES_REQUIRED_GO         = 2   # 2/4 brains GO → GO (pathway size)
 # 2/4 or fewer GO → NO_GO. No human escalation. No delay.
-BRAIN_TIMEOUT_SECONDS     = 120  # per-brain API timeout — increased to 120s; Gemini 2.5 Flash (no thinking) + Claude can still spike under load
-BRAIN_RETRY_COUNT         = 1    # retry once on timeout/connection-reset before marking as error
-MIN_BRAINS_REQUIRED       = 2   # if fewer respond → NO_GO (system degraded, Ahmed alerted)  # Cipher Finding 12
+# FIX-CLAUDE-TIMEOUT (2026-06-01 10:31 ET): Reduced brain timeout from 120s to 45s
+# Root cause: Claude API was hitting 120s+ read timeouts under load, blocking quad synthesis pool.
+# Impact: 8 execution failures in 60 min (all "unconfirmed: no confirmation after 30s").
+# Fix: 45s timeout per brain + allow synthesis with 2/4 brains responding (graceful degradation).
+BRAIN_TIMEOUT_SECONDS     = 45   # reduced from 120s. Per-brain timeout; synthesis waits max 45s per brain.
+BRAIN_RETRY_COUNT         = 0    # no retry on timeout — timeout = error result, not delay loop
+MIN_BRAINS_REQUIRED       = 2    # 2+ brains required for synthesis (was enforcing all 4). Enables cascade resilience.
 
 # P3/P4 require minimum 3/4 brains GO to execute (higher bar for solo/OMNI-initiated)
 P3_P4_MIN_VOTES_GO        = 2

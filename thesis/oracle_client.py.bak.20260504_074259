@@ -1,0 +1,122 @@
+"""
+OracleClient — HTTP client for the ORACLE intelligence hub (port 8007).
+
+Fetches current market data and converts it into an OracleData snapshot.
+All methods catch exceptions and return safe defaults — callers never
+need to handle OracleClient errors.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Dict
+
+import httpx
+
+from models import OracleData
+
+logger = logging.getLogger(__name__)
+
+_TIMEOUT = 10.0  # seconds
+
+
+class OracleClient:
+    """Async HTTP client for ORACLE market data fetching.
+
+    Args:
+        base_url: Base URL of the ORACLE service (e.g. http://192.168.1.146:8007).
+        auth_token: Value for the X-Oracle-Secret header.
+    """
+
+    def __init__(self, base_url: str, auth_token: str) -> None:
+        """Store connection parameters; no connection opened yet."""
+        self._base_url = base_url.rstrip("/")
+        self._headers = {"X-Oracle-Secret": auth_token}
+
+    async def fetch_market_data(self) -> OracleData:
+        """Fetch current market snapshot from ORACLE.
+
+        Tries GET /oracle/market_data first, falls back to /oracle/health.
+        On any network or parsing error, returns an empty OracleData() so
+        callers always receive a valid object.
+
+        Returns:
+            OracleData populated with whatever ORACLE provides, or empty on error.
+        """
+        for path in ["/oracle/market_data", "/oracle/health"]:
+            try:
+                async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                    resp = await client.get(
+                        f"{self._base_url}{path}",
+                        headers=self._headers,
+                    )
+                    if resp.status_code == 200:
+                        return self._parse_response(resp.json())
+            except Exception as exc:
+                logger.warning(
+                    "OracleClient.fetch_market_data() %s failed: %s", path, exc
+                )
+                continue
+
+        logger.error(
+            "OracleClient: all endpoints unreachable — returning empty OracleData"
+        )
+        return OracleData()
+
+    async def check_health(self) -> bool:
+        """Ping ORACLE health endpoint.
+
+        Returns:
+            True if ORACLE responds with 200, False otherwise.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    f"{self._base_url}/oracle/health",
+                    headers=self._headers,
+                )
+                return resp.status_code == 200
+        except Exception as exc:
+            logger.warning("OracleClient.check_health() failed: %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _parse_response(self, data: Dict[str, Any]) -> OracleData:
+        """Map ORACLE response dict to OracleData model.
+
+        Tolerates missing or extra fields gracefully.
+
+        Args:
+            data: JSON dict from ORACLE response.
+
+        Returns:
+            OracleData with whatever fields are present.
+        """
+        try:
+            return OracleData(
+                spy_price=data.get("spy_price") or data.get("price"),
+                spy_change_pct=data.get("spy_change_pct") or data.get("change_pct"),
+                vix_level=data.get("vix") or data.get("vix_level"),
+                vix_change=data.get("vix_change"),
+                ten_year_yield=data.get("ten_year_yield") or data.get("yield_10y"),
+                two_year_yield=data.get("two_year_yield") or data.get("yield_2y"),
+                yield_curve_spread=data.get("yield_curve_spread"),
+                hy_spread=data.get("hy_spread"),
+                dxy=data.get("dxy"),
+                fed_funds_rate=data.get("fed_funds_rate"),
+                sp500_pe=data.get("sp500_pe") or data.get("pe_ratio"),
+                put_call_ratio=data.get("put_call_ratio"),
+                aaii_bull_pct=data.get("aaii_bull_pct") or data.get("aaii_bullish"),
+                timestamp=str(data.get("timestamp", "")),
+            )
+        except Exception as exc:
+            logger.error(
+                "OracleClient._parse_response() failed: %s — returning empty OracleData",
+                exc,
+                exc_info=True,
+            )
+            return OracleData()

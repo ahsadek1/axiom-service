@@ -106,16 +106,41 @@ _axiom_mode_lock = threading.Lock()
 
 # ── Helper ────────────────────────────────────────────────────────────────────
 
+# ── Window ID generation (G15: Tier 2 retry dedup) ─────────────────────────────
+_window_run_counter: int = 0
+_window_id_cache: str = ""
+_window_id_cache_ts: float = 0.0
+
 def current_window_id() -> str:
     """
-    Generate the current 15-minute window ID in format 'YYYY-MM-DD-HHMM'.
+    Generate the current 15-minute window ID in format 'YYYY-MM-DD-HHMM-NN'.
+    
+    Appends a 2-digit run counter (00-99) to distinguish Tier 2 retries/refreshes
+    within the same 15-minute boundary. This prevents duplicate window IDs when
+    Tier 2 runs multiple times in a single 15-min window (e.g., retries due to
+    ORATS circuit breaker opening, then closing).
+    
+    Counter resets at the start of each new 15-minute window.
 
     Returns:
-        Window ID string rounded to the current 15-minute boundary.
+        Window ID string in format 'YYYY-MM-DD-HHMM-NN' (NN = run counter 00-99).
     """
+    global _window_run_counter, _window_id_cache, _window_id_cache_ts
+    
     now  = datetime.now(ET)
     mins = (now.minute // 15) * 15
-    return now.strftime(f"%Y-%m-%d-%H{mins:02d}")
+    base_id = now.strftime(f"%Y-%m-%d-%H{mins:02d}")
+    
+    # Reset counter if we've entered a new 15-minute window
+    current_ts = now.timestamp()
+    if base_id != _window_id_cache or (current_ts - _window_id_cache_ts) >= 900:  # 900s = 15min
+        _window_run_counter = 0
+        _window_id_cache = base_id
+        _window_id_cache_ts = current_ts
+    else:
+        _window_run_counter = (_window_run_counter + 1) % 100  # 00-99, then wrap
+    
+    return f"{base_id}-{_window_run_counter:02d}"
 
 
 def verify_secret(request: Request) -> None:

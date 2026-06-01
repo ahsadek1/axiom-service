@@ -261,3 +261,63 @@ def run_full_check() -> dict:
         "summary":   summary,
         "timestamp": now_str,
     }
+
+
+def check_backtest_db() -> tuple[bool, str]:
+    """
+    Verify backtest DB is accessible and populated.
+    OMNI's deterministic Kelly sizing depends on this.
+    """
+    import sqlite3
+    db_path = "/Users/ahmedsadek/nexus/data/backtest.db"
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        count = conn.execute("SELECT COUNT(*) FROM historical_win_rates").fetchone()[0]
+        conn.close()
+        if count < 1000:
+            return False, f"Backtest DB underpopulated: {count} rows (expected 10,000+)"
+        return True, f"Backtest DB healthy: {count} rows"
+    except Exception as exc:
+        return False, f"Backtest DB error: {exc}"
+
+
+def check_omni_deterministic_mode() -> tuple[bool, str]:
+    """
+    Verify OMNI is running in deterministic mode.
+    Checks recent synthesis log for DETERMINISTIC keyword.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["grep", "-c", "DETERMINISTIC", "/Users/ahmedsadek/nexus/logs/omni/stderr.log"],
+            capture_output=True, text=True, timeout=5
+        )
+        count = int(result.stdout.strip()) if result.returncode == 0 else 0
+        if count == 0:
+            return False, "No DETERMINISTIC verdicts found in OMNI logs — may be running old quad intelligence"
+        return True, f"OMNI deterministic mode confirmed ({count} verdicts in log)"
+    except Exception as exc:
+        return False, f"Deterministic check error: {exc}"
+
+
+def check_circuit_breaker_state() -> tuple[bool, str]:
+    """
+    Check alpha-buffer circuit breaker state.
+    STOP during off-hours in paper mode is auto-healable.
+    """
+    import sqlite3
+    db_path = "/Users/ahmedsadek/nexus/data/alpha_buffer.db"
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        row = conn.execute("SELECT status, manual_override FROM circuit_breaker_state LIMIT 1").fetchone()
+        conn.close()
+        if not row:
+            return True, "CB state not found — assuming NORMAL"
+        status, manual = row
+        if status == "STOP":
+            return False, f"Circuit breaker STOP (manual_override={manual})"
+        if status in ("RED", "AMBER"):
+            return False, f"Circuit breaker {status}"
+        return True, f"Circuit breaker {status}"
+    except Exception as exc:
+        return False, f"CB check error: {exc}"

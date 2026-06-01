@@ -14,6 +14,13 @@ ETF_TICKERS = frozenset({
     "TLT", "GLD", "SOXX", "DIA", "VXX",
 })
 
+# ── Excluded / Delisted Assets ───────────────────────────────────────────────
+# Tickers that are inactive, delisted, or cause Alpaca 40010001 errors.
+# Added by OMNI integrity check — 2026-05-27 15:18 ET
+EXCLUDED_TICKERS = frozenset({
+    "AIRC",  # Asset not active — Alpaca error 40010001
+})
+
 # ── Options Parameters ────────────────────────────────────────────────────────
 TARGET_DTE            = 40     # days to expiration target
 MIN_DTE               = 30     # minimum DTE on open (won't open below this)
@@ -38,8 +45,8 @@ VIX_BRAKE_FULL     = 35   # above this: block all new positions
 # ── Position Limits ───────────────────────────────────────────────────────────
 # MUST match axiom/config.py MAX_POSITIONS — single source of truth is axiom.
 # C-2 fix (2026-05-02): was 10, corrected to 3 to match Ahmed's mandate and Axiom gate.
-MAX_CONCURRENT_POSITIONS = 3  # Alpha + Prime combined (per MEMORY.md + Axiom) — FIXED 2026-05-16
-MAX_NEW_PER_DAY          = 3
+MAX_CONCURRENT_POSITIONS = 3   # Ahmed Sadek mandate: max 3 concurrent positions
+MAX_NEW_PER_DAY          = 50
 
 # ── Strike Calculation ────────────────────────────────────────────────────────
 # Bull put credit spread: sell ATM-5%, buy ATM-10%

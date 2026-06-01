@@ -56,7 +56,7 @@ KNOWN_DELISTED: frozenset[str] = frozenset({
 # ── System Limits (Circuit Breaker Config) ──────────────────────────────────
 # These are the canonical values that Axiom exposes via /limits.
 # All services (Alpha, Prime, Guardian Angel) should read from here.
-MAX_POSITIONS          = 3       # Max concurrent positions across all systems
+MAX_POSITIONS          = 3        # Max concurrent positions across all systems (Ahmed Sadek mandate)
 MAX_RISK_PER_TRADE     = 1000.0  # Max $ risk per trade
 MIN_DTE                = 21      # Minimum days to expiration for options
 MAX_DTE                = 60      # Maximum days to expiration for options

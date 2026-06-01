@@ -34,7 +34,7 @@ class RailwayTokenManager:
     def __init__(
         self,
         env_var_name: str = "RAILWAY_TOKEN",
-        default_token: str = "08612a1a-4bb4-4ccb-9c75-6ef9277d74db",
+        default_token: str = "26fd3a51-5484-466e-8df5-01af6de9f0c1",
         cache_path: str = "/Users/ahmedsadek/nexus/data/railway_token_cache.json",
         check_interval_sec: int = 3600,  # Check every hour
         preemptive_refresh_hours: int = 24,  # Refresh 24h before expiration

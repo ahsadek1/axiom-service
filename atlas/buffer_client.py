@@ -74,9 +74,12 @@ RAILWAY_SECRET = os.getenv(
     "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2",
 )
 
-# Score thresholds (mirrors buffer validator config)
-ALPHA_MIN_SCORE = 55.0  # Lowered from 58 — Atlas rates tech stocks 55-57; allows cross-agent concordance with Cipher
-PRIME_MIN_SCORE = 63.0
+# Score thresholds (must match atlas_scorer.py ALPHA_FLOOR / PRIME_FLOOR)
+# atlas_scorer.py: ALPHA_FLOOR = 45.0, PRIME_FLOOR = 45.0
+# These scores represent submission readiness from atlas_scorer decision logic.
+# Buffer validators apply their own C-01/C-02/C-03 gates; agent gates should not be duplicative.
+ALPHA_MIN_SCORE = 45.0  # Matches atlas_scorer.py ALPHA_FLOOR
+PRIME_MIN_SCORE = 45.0  # Matches atlas_scorer.py PRIME_FLOOR
 
 
 def _submit_to_railway_async(payload: dict) -> None:

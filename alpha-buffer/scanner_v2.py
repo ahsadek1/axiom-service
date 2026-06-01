@@ -14,11 +14,20 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone, date, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Optional
+
+# ── Setup Python path for module imports (launchd venv doesn't inherit PYTHONPATH)
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+nexus_dir = os.path.dirname(_current_dir)
+if nexus_dir not in sys.path:
+    sys.path.insert(0, nexus_dir)
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -459,3 +468,99 @@ def create_scheduler(
     )
 
     return scheduler
+
+
+# ── Standalone entry point ────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    """
+    Runs the scanner as a standalone daemon process.
+    Called by ai.nexus.alpha-scanner LaunchAgent.
+    """
+    import asyncio
+    import requests as _requests
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    )
+    log = logging.getLogger("scanner.main")
+
+    AXIOM_URL    = os.getenv("AXIOM_URL", "http://localhost:8001")
+    NEXUS_SECRET = os.getenv("NEXUS_SECRET", os.getenv("NEXUS_WEBHOOK_SECRET", ""))
+    DB_PATH      = os.getenv("ALPHA_DB_PATH", "/Users/ahmedsadek/nexus/data/alpha_buffer.db")
+    OMNI_URL     = os.getenv("OMNI_WEBHOOK_URL", "http://localhost:8004/concordance")
+    OMNI_SECRET  = os.getenv("OMNI_SECRET", NEXUS_SECRET)
+    TG_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TG_CHAT      = os.getenv("AHMED_CHAT_ID", "")
+
+    def alert_fn(msg: str) -> None:
+        if TG_TOKEN and TG_CHAT:
+            try:
+                _requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+    def omni_dispatch_fn(ticker, ctx, axiom, score_result) -> None:
+        try:
+            window_id = f"{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d-%H%M')}"
+            _requests.post(
+                OMNI_URL,
+                json={
+                    "ticker":         ticker,
+                    "direction":      "bullish",
+                    "system":         "alpha",
+                    "pathway":        str(getattr(score_result, "recommendation", "P2")),
+                    "window_id":      window_id,
+                    "weighted_score": float(getattr(score_result, "score", 65.0)),
+                    "sizing_mult":    1.0,
+                    "scores":         {"Scanner": float(getattr(score_result, "score", 65.0))},
+                    "agents_involved": ["Scanner"],
+                    "verdict":        "GO",
+                    "echo_chamber":   False,
+                    "notes":          [],
+                },
+                headers={"X-Nexus-Secret": OMNI_SECRET},
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.warning("[Scanner] OMNI dispatch failed for %s: %s", ticker, exc)
+
+    async def main_loop():
+        from market_state import build_market_state
+        # Build initial market state
+        ms = build_market_state(AXIOM_URL, NEXUS_SECRET)
+        log.info("Scanner starting — scanning_allowed=%s reason=%s", ms.scanning_allowed, ms.pause_reason)
+
+        scheduler = create_scheduler(
+            db_path       = DB_PATH,
+            axiom_url     = AXIOM_URL,
+            nexus_secret  = NEXUS_SECRET,
+            market_state  = ms,
+            alert_fn      = alert_fn,
+            omni_dispatch_fn = omni_dispatch_fn,
+        )
+        scheduler.start()
+        log.info("Scanner scheduler started — interval=%d min", SCAN_INTERVAL_MINUTES)
+
+        # Refresh market state every 5 minutes
+        while True:
+            await asyncio.sleep(300)
+            try:
+                ms_new = build_market_state(AXIOM_URL, NEXUS_SECRET)
+                # Update the running scheduler's job with fresh market state
+                ms.scanning_allowed = ms_new.scanning_allowed
+                ms.pause_reason     = ms_new.pause_reason
+                ms.vix              = ms_new.vix
+                ms.regime           = ms_new.regime
+                ms.submissions_open = ms_new.submissions_open
+                ms.is_market_hours  = ms_new.is_market_hours
+                log.debug("Market state refreshed: allowed=%s", ms.scanning_allowed)
+            except Exception as exc:
+                log.warning("Market state refresh failed: %s", exc)
+
+    asyncio.run(main_loop())

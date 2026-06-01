@@ -425,7 +425,7 @@ def run_full_check(app_state: dict) -> dict:
     all_errors: list[str] = []
 
     if not os.getenv("RAILWAY_TOKEN"):
-        RAILWAY_TOKEN = "08612a1a-4bb4-4ccb-9c75-6ef9277d74db"
+        RAILWAY_TOKEN = "26fd3a51-5484-466e-8df5-01af6de9f0c1"
 
     # ── Check 1: Axiom /limits ──────────────────────────────────────────
     logger.info("Health check: Axiom /limits...")

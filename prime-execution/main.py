@@ -1571,18 +1571,19 @@ def sovereign_status(
 
 
 def _notify_entry(bot_token, chat_id, body, position_id, shares, price, order_id):
+    """Notify Ahmed of every trade execution via Telegram + Discord."""
     emoji = "📈" if body.direction == "bullish" else "📉"
     try:
-        from shared.notification_router import notify_info as _ni
-        _ni(
+        from shared.notification_router import notify_escalate as _notify_escalate
+        _notify_escalate(
             "prime-execution",
             f"{emoji} PRIME TRADE OPENED — {body.ticker}",
             (
                 f"Direction: {body.direction.upper()} | {shares:.0f} shares @ ${price:.2f}\n"
                 f"Size: ${body.position_size_usd:,.0f} | Pathway: {body.pathway}\n"
-                f"Score: {body.weighted_score:.1f} | Position #{position_id}"
+                f"Score: {body.weighted_score:.1f} | Position #{position_id} | Order: {order_id[:12]}"
             ),
             ticker=body.ticker,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to send trade notification: %s", e)

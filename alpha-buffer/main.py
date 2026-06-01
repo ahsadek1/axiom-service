@@ -637,7 +637,7 @@ def submit_pick(
                 )
             elif _universe and len(_universe) < 50:
                 logger.debug(
-                    "C-01: Axiom pool too small (%d tickers) — failing open for %s (checkpoint: C-01-FAIl-OPEN-V2)",
+                    "C-01: Axiom pool too small (%d tickers) — failing open for %s (checkpoint: C-01-FAIL-OPEN-V2)",
                     len(_universe), body.ticker,
                 )
     except Exception as _ae:
@@ -759,6 +759,11 @@ def submit_pick(
         body.direction,
     )
 
+    logger.debug(
+        "CONCORDANCE_EVAL_START: %s/%s | agents=%d | solo_enabled=%s",
+        body.ticker, body.direction, len(all_subs), settings.solo_entries_enabled,
+    )
+
     concordance = evaluate_concordance(
         window_id            = window_id,
         ticker               = body.ticker,
@@ -768,6 +773,7 @@ def submit_pick(
     )
 
     if concordance is None:
+        logger.debug("CONCORDANCE_EVAL_RESULT: %s/%s → None", body.ticker, body.direction)
         return JSONResponse({
             "accepted":     True,
             "window_id":    window_id,

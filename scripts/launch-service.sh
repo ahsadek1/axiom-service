@@ -16,4 +16,9 @@ if [ -f ".venv/bin/python" ]; then
 else
   PY="/usr/bin/python3"
 fi
-exec $PY -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8008}" --log-level info
+$PY -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8008}" --log-level info
+EXIT_CODE=$?
+# Exit with the same code Uvicorn returned
+# Exit 0 = graceful shutdown (normal exit — do NOT restart)
+# Exit 1+ = error (restart via LaunchAgent KeepAlive)
+exit $EXIT_CODE

@@ -261,29 +261,26 @@ def is_already_submitted_today(
     et_date:   Optional[str] = None,
 ) -> bool:
     """
-    Check if the same agent already submitted this ticker+direction today (any window).
+    Check if the same agent already submitted this ticker+direction in the last 30 minutes.
 
-    Prevents the same agent from submitting TSLA bullish 7 times in 7 different windows
-    and flooding the concordance system with duplicate weight.
-
-    Uses the window_id date (YYYY-MM-DD prefix, ET-based) as the day boundary — NOT the
-    UTC timestamp. This prevents false deduplication when a late-night window (e.g.
-    2026-04-14-2215 at 10:15 PM ET) rolls past midnight UTC and creates a UTC April 15
-    record that would block the real April 15 ET trading session.
+    UPDATED 2026-05-27 14:42 UTC — Changed from 24-hour day-level dedup to 30-minute
+    sliding window. Allows agents to reanalyze and resubmit as market conditions change,
+    while preventing rapid duplicate flooding (same submission multiple times in quick succession).
 
     Args:
         db_path:   Path to database.
         agent:     Agent name (Cipher/Atlas/Sage).
         ticker:    Stock ticker symbol.
         direction: 'bullish' or 'bearish'.
-        et_date:   Optional YYYY-MM-DD ET date override (for testing). Defaults to today in ET.
+        et_date:   Ignored (legacy parameter, kept for API compatibility).
 
     Returns:
-        True if a submission already exists today for this agent+ticker+direction.
+        True if a submission exists in the last 30 minutes for this agent+ticker+direction.
     """
-    from zoneinfo import ZoneInfo
-    if et_date is None:
-        et_date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    from datetime import timedelta
+    
+    # Look-back: last 30 minutes
+    cutoff_time = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
 
     with get_conn(db_path) as conn:
         row = conn.execute(
@@ -292,10 +289,10 @@ def is_already_submitted_today(
             WHERE agent = ?
               AND ticker = ?
               AND direction = ?
-              AND SUBSTR(window_id, 1, 10) = ?
+              AND received_at > ?
             LIMIT 1
             """,
-            (agent, ticker, direction, et_date),
+            (agent, ticker, direction, cutoff_time),
         ).fetchone()
     return row is not None
 

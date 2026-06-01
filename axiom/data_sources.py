@@ -66,32 +66,41 @@ def polygon_get_iv_rank(ticker: str, api_key: str) -> Optional[float]:
     ORATS `rip` = IV rank percentile (0-100). This is the same source
     Oracle/scorer uses — ensures Tier 2 filter and scorer agree on IVR.
 
-    Previously used Polygon implied_volatility * 100 which is NOT IV rank
-    and caused the filter to pass low-IVR tickers that the scorer rejected.
+    Uses oracle.clients.orats_client._orats_get() for proper retry logic and
+    circuit breaker (G13), not raw requests. This ensures Tier 2 filter doesn't
+    silently fail when ORATS is rate-limited.
 
     Args:
         ticker:  Stock ticker symbol.
         api_key: Unused (kept for signature compatibility). Uses ORATS key.
 
     Returns:
-        IV rank percentile as float 0-100, or None if unavailable.
+        IV rank percentile as float 0-100, or None if unavailable/circuit-open.
     """
     try:
-        ORATS_TOKEN = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY")
-        resp = requests.get(
-            "https://api.orats.io/datav2/summaries",
-            params={"token": ORATS_TOKEN, "ticker": ticker},
-            timeout=8,
-        )
-        resp.raise_for_status()
-        rows = resp.json().get("data", [])
+        # Import here to avoid circular dependencies
+        import sys
+        oracle_path = os.path.join(os.path.dirname(__file__), "..", "oracle")
+        if oracle_path not in sys.path:
+            sys.path.insert(0, oracle_path)
+        from clients.orats_client import _orats_get
+        
+        result = _orats_get("/summaries", {"ticker": ticker})
+        
+        # result format: {"data": [{...}], "error": None} on success
+        #                {"data": [], "error": "reason"} on failure
+        if result.get("error"):
+            logger.debug("ORATS IV rank unavailable for %s: %s", ticker, result["error"])
+            return None
+        
+        rows = result.get("data", [])
         if rows:
             rip = rows[0].get("rip")
             if rip is not None:
                 return float(rip)
         return None
     except Exception as e:
-        logger.debug("ORATS IV rank unavailable for %s: %s", ticker, e)
+        logger.debug("ORATS IV rank lookup failed for %s: %s", ticker, e)
         return None
 
 

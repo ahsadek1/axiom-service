@@ -16,6 +16,7 @@ This is the canary that prevents silent misconfiguration from haunting trading.
 
 Deployed: 2026-04-24 (after MIN_SCORE_P2=78 bug cost a full morning session)
 FIXED: 2026-05-19 — Anthropic endpoint + OMNI status case-sensitivity
+FIXED: 2026-05-28 — PYTHONPATH auto-setup for cron jobs
 """
 
 import json
@@ -23,6 +24,12 @@ import os
 import sys
 import requests
 from datetime import datetime
+
+# ── PYTHONPATH Setup (required for cron jobs) ────────────────────────────────
+NEXUS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for path in [NEXUS_ROOT, os.path.join(NEXUS_ROOT, "alpha-buffer"), os.path.join(NEXUS_ROOT, "prime-buffer")]:
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 def _require(var: str) -> str:
@@ -38,15 +45,13 @@ NEXUS_SECRET       = _require("NEXUS_SECRET")
 ALPACA_KEY         = _require("ALPACA_API_KEY")
 ALPACA_SECRET      = _require("ALPACA_SECRET_KEY")
 
-SERVICES = {
+SERVICES = {  # (PYTHONPATH already set above)
     "axiom":           "http://localhost:8001/health",
     "alpha-buffer":    "http://localhost:8002/health",
     "omni":            "http://localhost:8004/health",
     "alpha-execution": "http://localhost:8005/health",
     "prime-execution": "http://localhost:8006/health",
 }
-
-NEXUS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 results = []
 failures = []
@@ -152,7 +157,7 @@ except Exception as e:
 BRAIN_PROBES = [
     ("anthropic", "https://api.anthropic.com/v1/messages", "POST",
      {"x-api-key": os.getenv("ANTHROPIC_API_KEY",""), "anthropic-version": "2023-06-01", "content-type": "application/json"},
-     {"model": "claude-3-5-sonnet-20241022", "max_tokens": 10, "messages": [{"role": "user", "content": "ok"}]}),
+     {"model": "claude-opus-4-1", "max_tokens": 10, "messages": [{"role": "user", "content": "ok"}]}),
     ("openai", "https://api.openai.com/v1/models", "GET",
      {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY','')}"}, None),
 ]

@@ -88,6 +88,17 @@ def evaluate_exits(
     )
     if _is_eod:
         for pos in positions:
+            # CREDIT SPREAD GUARD: Never EOD-close a credit spread with DTE > 7.
+            # Bull put spreads need 21-40 days to decay — EOD closing locks in losses.
+            # Ahmed directive May 2026.
+            _pos_dte = calculate_dte(pos.get("expiration_date", ""))
+            _is_spread = bool(pos.get("short_contract_symbol") and pos.get("long_contract_symbol"))
+            if _is_spread and _pos_dte > DTE_CLOSE_THRESHOLD:
+                logger.info(
+                    "EOD_SKIP_CREDIT_SPREAD: %s DTE=%d — holding for theta decay",
+                    pos["ticker"], _pos_dte,
+                )
+                continue
             logger.warning(
                 "EOD_FORCE_CLOSE: position %d (%s) -- forcing close at %s ET",
                 pos["id"], pos["ticker"], now_et.strftime("%H:%M")
@@ -235,12 +246,38 @@ def _evaluate_position(
     """
     ticker     = pos["ticker"]
     pos_id     = pos["id"]
-    expiry     = pos["expiration_date"]
+    # BUG-FIX (EXIT-001): expiration_date only exists on options, not equity positions.
+    # Equity positions (DELL, AIG, etc.) have no expiration, so skip DTE-based logic.
+    expiry     = pos.get("expiration_date")
+    if not expiry:
+        # Equity position — skip all DTE-based exit logic. Return None (no exit needed).
+        logger.debug("Skipping DTE evaluation for equity position %d (%s) — no expiration_date", pos_id, ticker)
+        return None
     dte        = calculate_dte(expiry)
     partial    = bool(pos["partial_closed"])
     trail_pct  = pos["trailing_stop_pct"]
     trail_high = pos["trailing_stop_high"]
     entry_px   = pos["entry_price"] or 0
+
+    # ── Minimum hold period for credit spreads (3 days) ─────────────────────
+    # Bull put spreads need time to decay — never exit within 3 days of entry.
+    # Only DTE_EMERGENCY_CLOSE (≤5 DTE) overrides this. Ahmed directive May 2026.
+    _is_spread = bool(pos.get("short_contract_symbol") and pos.get("long_contract_symbol"))
+    if _is_spread and dte > DTE_EMERGENCY_CLOSE:
+        try:
+            from datetime import datetime, timezone
+            _opened_at = pos.get("opened_at") or ""
+            if _opened_at:
+                _open_dt = datetime.fromisoformat(_opened_at.replace("Z", "+00:00"))
+                _hold_days = (datetime.now(timezone.utc) - _open_dt).days
+                if _hold_days < 3:
+                    logger.info(
+                        "MIN_HOLD: skipping exit for %s (held %d days, min 3)",
+                        ticker, _hold_days,
+                    )
+                    return None
+        except Exception as _hold_err:
+            logger.debug("MIN_HOLD check error for %s: %s", ticker, _hold_err)
 
     # ── Get current position value from Alpaca ────────────────────────────────
     current_pnl_pct = _get_current_pnl(pos, alpaca_client)

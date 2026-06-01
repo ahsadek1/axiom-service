@@ -54,10 +54,38 @@ def _record_canary_result(passed: bool) -> None:
 
 def get_recent_canary_results() -> List[bool]:
     """Return recent canary pass/fail results (last N runs).
+    
+    Falls back to reading today's canary_status.json from disk if in-memory
+    list is empty (handles canary runs outside TRS service process).
 
     Returns:
         List of bool (True=pass), most recent last.
     """
+    if _recent_canary_results:
+        return list(_recent_canary_results)
+    
+    # Fallback: check disk-based canary status file
+    try:
+        import json
+        from pathlib import Path
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        
+        canary_file = Path("/Users/ahmedsadek/nexus/data/canary_status.json")
+        if canary_file.exists():
+            with open(canary_file) as f:
+                data = json.load(f)
+            
+            # Check if file is from today
+            today_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+            if data.get("date") == today_et:
+                # Return PASS as True, FAIL as False
+                status = data.get("status") == "PASS"
+                # Return list with today's result
+                return [status]
+    except Exception as e:
+        logger.warning("Failed to read disk canary status: %s", e)
+    
     return list(_recent_canary_results)
 
 

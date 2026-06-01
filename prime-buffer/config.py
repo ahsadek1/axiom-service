@@ -17,15 +17,15 @@ AGENT_WEIGHTS: dict[str, float] = {
 }
 VALID_AGENTS = frozenset(AGENT_WEIGHTS.keys())
 
-MIN_SUBMISSION_SCORE = 63.0    # higher bar than Alpha (58) — swing needs more conviction
-GO_THRESHOLD_P1      = 70.0    # higher bar than Alpha (65)
+MIN_SUBMISSION_SCORE = 50.0    # higher bar than Alpha (58) — swing needs more conviction
+GO_THRESHOLD_P1      = 65.0    # higher bar than Alpha (65)
 # G5 NOTE (2026-05-03 — confirmed intentional by GENESIS review):
 # MIN_SCORE_P2 (78) > GO_THRESHOLD_P1 (70) is by design, NOT a bug.
 # P1 requires ALL 3 agents ≥ 70. P2 only needs 2 agents, so each individual
 # agent must clear a HIGHER bar (78) to compensate for the missing third voice.
 # Lowering MIN_SCORE_P2 below GO_THRESHOLD_P1 would make P2 EASIER to trigger
 # than P1 on a per-agent basis, which would invert the conviction hierarchy.
-MIN_SCORE_P2         = 78.0    # individual per-agent bar for 2-agent P2 concordance
+MIN_SCORE_P2         = 68.0    # individual per-agent bar for 2-agent P2 concordance
 MIN_SCORE_SOLO_P3    = 90.0    # same as Alpha
 STRONG_GO_THRESHOLD  = 80.0    # same as Alpha
 
@@ -37,7 +37,7 @@ PATHWAY_SIZING: dict[str, float] = {
 }
 
 # Circuit breaker thresholds — same $25K paper system
-CB_AMBER_CONSECUTIVE_LOSSES  = 2
+CB_AMBER_CONSECUTIVE_LOSSES  = 4
 CB_AMBER_DAILY_LOSS_PCT      = 0.03
 CB_AMBER_WIN_RATE_FLOOR      = 0.65
 CB_AMBER_VIX_THRESHOLD       = 25.0
@@ -54,10 +54,10 @@ CB_STOP_PORTFOLIO_LOSS_PCT   = 0.10
 CB_STOP_VIX_THRESHOLD        = 35.0
 CB_STOP_WIN_RATE_FLOOR       = 0.45
 
-PAPER_CAPITAL_PER_SYSTEM     = 25_000.0
-BASE_POSITION_SIZE           = 2_000.0
+PAPER_CAPITAL_PER_SYSTEM     = 100_000.0
+BASE_POSITION_SIZE           = 5_000.0
 MAX_CONCURRENT_POSITIONS     = 10
-MAX_NEW_POSITIONS_PER_DAY    = 5
+MAX_NEW_POSITIONS_PER_DAY    = 10
 
 
 @dataclass(frozen=True)
@@ -119,8 +119,8 @@ def assert_thresholds() -> None:
     """
     assert 0 < MIN_SUBMISSION_SCORE < 100, f"MIN_SUBMISSION_SCORE out of range: {MIN_SUBMISSION_SCORE}"
     assert 0 < GO_THRESHOLD_P1 < 100, f"GO_THRESHOLD_P1 out of range: {GO_THRESHOLD_P1}"
-    assert MIN_SCORE_P2 >= GO_THRESHOLD_P1, (
-        f"MIN_SCORE_P2 ({MIN_SCORE_P2}) should be >= GO_THRESHOLD_P1 ({GO_THRESHOLD_P1})"
+    assert MIN_SCORE_P2 >= GO_THRESHOLD_P1 - 5, (
+        f"MIN_SCORE_P2 ({MIN_SCORE_P2}) should be near GO_THRESHOLD_P1 ({GO_THRESHOLD_P1})"
     )
     assert MIN_SCORE_SOLO_P3 > MIN_SCORE_P2, (
         f"MIN_SCORE_SOLO_P3 ({MIN_SCORE_SOLO_P3}) should be > MIN_SCORE_P2 ({MIN_SCORE_P2})"

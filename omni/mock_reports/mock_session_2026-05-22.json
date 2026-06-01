@@ -1,0 +1,59 @@
+{
+  "session_id": "MOCK-20260522-183657",
+  "started_at": "2026-05-22T18:36:57.247289-04:00",
+  "finished_at": "2026-05-22T18:38:51.051373-04:00",
+  "duration_s": 113.804084,
+  "passed": 4,
+  "total": 7,
+  "cycles": [
+    {
+      "number": 1,
+      "name": "Clean P1 Concordance",
+      "passed": false,
+      "details": "No Alpaca order submitted within 60s. exec_health=0/True",
+      "elapsed_s": 63.471009254455566
+    },
+    {
+      "number": 2,
+      "name": "P2 Concordance",
+      "passed": true,
+      "details": "P2 GO issued with 2 agents (Sage absent) | elapsed=3.3s",
+      "elapsed_s": 3.269751787185669
+    },
+    {
+      "number": 3,
+      "name": "Score Rejection Gate",
+      "passed": false,
+      "details": "Expected all 422, got: [200, 200, 200]",
+      "elapsed_s": 0.09631085395812988
+    },
+    {
+      "number": 4,
+      "name": "Invalid Ticker Injection",
+      "passed": false,
+      "details": "BADTICKER=HTTP 200 UNEXPECTED | MSFT=accepted | elapsed=0.1s",
+      "elapsed_s": 0.10235977172851562
+    },
+    {
+      "number": 7,
+      "name": "Idempotency",
+      "passed": true,
+      "details": "First=accepted | Second=409 deduped | gap=19ms | elapsed=0.1s",
+      "elapsed_s": 0.05957913398742676
+    },
+    {
+      "number": 10,
+      "name": "Bearish Direction",
+      "passed": true,
+      "details": "Bearish TSLA P1 \u2192 OMNI GO | elapsed=3.3s",
+      "elapsed_s": 3.3087637424468994
+    },
+    {
+      "number": 13,
+      "name": "Malformed Payload",
+      "passed": true,
+      "details": "All 5 payloads rejected | elapsed=0.0s",
+      "elapsed_s": 0.027062177658081055
+    }
+  ]
+}

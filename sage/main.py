@@ -176,14 +176,13 @@ async def lifespan(app: FastAPI):
         logger.critical("Sage: %d rapid restarts detected — possible crash loop. Slowing startup." % _restart_count)
         time.sleep(5)  # Back off on startup to avoid tight restart loop
     
-    # Rebuild in-memory submitted_today from database (restart-safe)
-    try:
-        today_picks = get_today_picks(_settings.db_path)
-        _submitted_today = set((p["ticker"] for p in today_picks))
-        logger.info("In-memory dedup rebuilt from DB: %d tickers marked as submitted today", len(_submitted_today))
-    except Exception as e:
-        logger.warning("Failed to rebuild in-memory dedup: %s", e)
-        _submitted_today = set()
+    # NOTE: _submitted_today no longer rebuilt from database on startup.
+    # Direction-specific dedup happens at submission time via has_submitted_today().
+    # This allows windows to re-analyze and re-score tickers even if they were
+    # submitted in a previous window (e.g., AMAT as BULLISH in window 1 can be
+    # re-analyzed and potentially submitted as BEARISH in window 2).
+    _submitted_today = set()
+    logger.info("Pool dedup enabled: direction-specific at submission time")
     
     # Start midnight reset thread
     reset_thread = threading.Thread(target=_midnight_reset, daemon=True, name="sage-midnight-reset")
@@ -277,13 +276,12 @@ def _analyze_pool(payload: dict) -> None:
         # --- Deterministic scoring via sage_scorer (replaces DeepSeek LLM) ---
         from sage_scorer import score_pool as _sage_score_pool
 
-        # Dedup: skip tickers already submitted today (in-memory + DB)
+        # Dedup: skip tickers already submitted today (in-memory cache)
+        # Direction-specific dedup happens after scoring (per-submission)
         valid_tickers = [
             t for t in pool
             if isinstance(t, str)
             and t not in _submitted_today
-            and not has_submitted_today(_settings.db_path, t, "bullish")
-            and not has_submitted_today(_settings.db_path, t, "bearish")
         ]
 
         scored_results = _sage_score_pool(valid_tickers, window_id=window_id)
@@ -310,6 +308,16 @@ def _analyze_pool(payload: dict) -> None:
 
             direction = result.direction
             reasoning = result.reasoning
+
+            # Direction-specific dedup: skip if this ticker+direction was already submitted today
+            if has_submitted_today(_settings.db_path, ticker, direction):
+                logger.info("Skipping %s/%s — already submitted today", ticker, direction)
+                log_decision(
+                    _settings.db_path, AGENT_NAME, window_id, ticker, REJECTED,
+                    direction=direction, score=result.alpha_score, threshold=45.0,
+                    reasoning="already submitted today",
+                )
+                continue
 
             if result.llm_flag:
                 logger.info("LLM review flagged %s: triggers=%s", ticker, result.llm_triggers)

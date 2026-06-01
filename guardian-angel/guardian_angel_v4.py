@@ -179,7 +179,7 @@ SERVICES: List[Dict[str, Any]] = [
     # SQS databases — trade history and capital deployment state
     {"name": "sqs-atm-multiweek","port": 9004,  "health_path": "/health", "launchd": "com.sqs.multiweek",     "db": None, "ext_db": "/Users/ahmedsadek/sqs/atm-multi-week/data/atm-multi-week.db"},
     {"name": "sqs-atm-0dte",     "port": 9005,  "health_path": "/health", "launchd": "com.sqs.0dte",         "db": None, "ext_db": "/Users/ahmedsadek/sqs/atm-0dte/data/atm.db"},
-    {"name": "sqs-atg-swing",    "port": 9006,  "health_path": "/health", "launchd": "com.sqs.swing",        "db": None, "ext_db": "/Users/ahmedsadek/sqs/atg-swing/atg_swing.db"},
+    {"name": "sqs-atg-swing",    "port": 9006,  "health_path": "/health", "launchd": "com.sqs.swing",        "db": None, "ext_db": "/Users/ahmedsadek/sqs/atg-swing/atg_swing.db", "health_timeout": 60},  # FIX 2026-05-24: QI validation takes 40s, need 60s timeout
     {"name": "sqs-atg-intraday", "port": 9007,  "health_path": "/health", "launchd": "com.sqs.intraday",     "db": None, "ext_db": "/Users/ahmedsadek/sqs/atg-intraday/atg_intraday.db"},
     {"name": "sqs-capital-router","port": 8000, "health_path": "/health", "launchd": "com.sqs.capital-router","db": None, "ext_db": "/Users/ahmedsadek/sqs/capital-router/capital_router.db"},
 ]
@@ -1920,7 +1920,10 @@ class PipelineTelemetry:
                 pass
 
     def check_omni_brain_health(self) -> None:
-        """4c: OMNI should have >=3 brains available; >0 activity past noon."""
+        """4c: OMNI deterministic mode — synthesis activity check.
+        Ahmed directive May 2026: Quad Intelligence replaced by deterministic
+        score-based verdicts. Brains no longer relevant.
+        """
         try:
             resp = requests.get(
                 "http://localhost:8004/health",
@@ -1931,16 +1934,8 @@ class PipelineTelemetry:
                 return
             data = resp.json()
 
-            brains = data.get("brains_available", data.get("active_brains", 3))
-            if isinstance(brains, int) and brains < 3:
-                self._escalation.report_failure(
-                    "omni", f"Only {brains}/3 AI brains available"
-                )
-                _send_telegram(
-                    f"*OMNI DEGRADED* — {brains}/3 brains available\nRestarting OMNI.",
-                    tier=3,
-                )
-                _launchctl_restart("omni")
+            # Deterministic mode: no AI brains — skip brain count check
+            # Ahmed directive May 2026
 
             now_et = _get_et_now()
             if now_et and now_et.hour >= 12:

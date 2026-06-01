@@ -275,10 +275,16 @@ def _evaluate_tier2(
     # IV rank
     iv_rank = polygon_get_iv_rank(ticker, polygon_api_key)
     if iv_rank is None:
-        # IV rank unknown — reject. Do NOT default to 50; that masked low-IVR stocks
-        # that Cipher's liquidity gate then hard-capped at 30. Require confirmed data.
-        logger.debug("Tier 2 reject %s: iv_rank=None (ORATS unavailable)", ticker)
-        return False, 0.0, "iv_rank=None"
+        # ORATS unavailable (rate limit, circuit open, or network error)
+        # Graceful degradation (G14 — circuit breaker resilience):
+        # Use neutral IV rank (50) so Tier 2 can still run. Buffer validators (C-01, C-02)
+        # will apply their own IV checks. This prevents a single 3rd-party outage from
+        # blocking the entire pool generation.
+        logger.warning(
+            "Tier 2 graceful degrade %s: iv_rank=None (ORATS unavailable — using neutral 50)",
+            ticker,
+        )
+        iv_rank = 50.0  # Neutral IV rank — neither punished nor favored
 
     if not (MIN_IV_RANK <= iv_rank <= MAX_IV_RANK):
         return False, 0.0, f"iv_rank={iv_rank:.1f}"

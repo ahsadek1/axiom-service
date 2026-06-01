@@ -44,21 +44,46 @@ def _parse_scan_ts(ts_str: Optional[str]) -> Optional[datetime]:
 
 def _is_scanner_stale(snap: ServiceSnapshot) -> bool:
     """
-    Return True if the scanner is DOWN or its last_scan_at is older than
-    SCANNER_STALE_MINUTES minutes.
+    Return True if the scanner is DOWN or its recent activity indicates staleness.
+    
+    Schema mapping (services return different fields):
+    - OMNI: check last_synthesis_min_ago < 90 (hard limit)
+    - Cipher/Atlas/Sage: check today_picks > 0 OR total_picks > 0
 
     Args:
         snap: ServiceSnapshot for one of the agent scanning services.
 
     Returns:
-        True if stale or unreachable, False if recently scanned.
+        True if stale or unreachable, False if recently active.
     """
     if snap.status == "DOWN":
         return True
-    ts = _parse_scan_ts(snap.data.get("last_scan_at"))
-    if ts is None:
-        return True
-    return (datetime.now(timezone.utc) - ts) > timedelta(minutes=SCANNER_STALE_MINUTES)
+    
+    service_name = snap.name.lower()
+    
+    # OMNI uses synthesis, not scans
+    if "omni" in service_name:
+        last_synthesis_min = snap.data.get("last_synthesis_min_ago")
+        if last_synthesis_min is None:
+            return True
+        # OMNI is stale if synthesis > 90 minutes
+        return float(last_synthesis_min) > 90.0
+    
+    # Cipher, Atlas, Sage use picks/windows
+    # They're stale if no activity today AND total activity is low
+    today_picks = snap.data.get("today_picks", 0)
+    total_picks = snap.data.get("total_picks", 0)
+    
+    # If service has any picks today, it's active
+    if today_picks > 0:
+        return False
+    
+    # If service has zero picks today but has some total history, it might just be quiet
+    # Don't mark as stale unless it's completely inactive
+    if total_picks == 0:
+        return True  # No activity at all — stale
+    
+    return False  # Has history but quiet today — not stale
 
 
 def diagnose(

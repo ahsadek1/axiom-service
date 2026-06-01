@@ -61,6 +61,7 @@ market_state      = MarketState()
 preflight_passed  = False
 scanner_active    = False
 _resume_requested = False
+_last_preflight_alert_state = None  # Track preflight state to deduplicate alerts
 
 
 # ── Alert function ────────────────────────────────────────────────────────────
@@ -87,6 +88,34 @@ async def check_resume() -> bool:
     return False
 
 
+# ── Pathway mapping ──────────────────────────────────────────────────────────
+
+def _map_recommendation_to_pathway(recommendation: str, system: str = "alpha") -> str:
+    """
+    Map scorer recommendation to valid pathway code.
+    
+    Valid pathways:
+      - ATG_SWING: Swing equity positions (default for EXECUTE)
+      - ATG_INTRADAY: Intraday momentum equities
+      - ATM_MULTIWEEK: 20-45 DTE call spreads
+      - ATM_0DTE: 0 DTE strangles
+    
+    Reject or watch recommendations don't execute.
+    """
+    rec = (recommendation or "").upper().strip()
+    
+    if rec == "EXECUTE":
+        return "ATG_SWING"  # Default execution pathway
+    elif rec == "WATCH":
+        return "WATCH"  # Will be rejected by queue_worker
+    elif rec == "REJECT":
+        return "REJECT"  # Will be rejected by queue_worker
+    else:
+        # Malformed or missing recommendation — reject to prevent invalid submissions
+        logger.warning(f"Malformed recommendation '{recommendation}' — defaulting to REJECT")
+        return "REJECT"
+
+
 # ── OMNI dispatch ─────────────────────────────────────────────────────────────
 
 def omni_dispatch(ticker, ctx, axiom, score_result, direction="bullish", window_id="") -> None:
@@ -97,7 +126,7 @@ def omni_dispatch(ticker, ctx, axiom, score_result, direction="bullish", window_
             "ticker":    ticker,
             "direction": direction.lower(),
             "system":    "alpha",
-            "pathway":   score_result.recommendation or "P1",
+            "pathway":   _map_recommendation_to_pathway(score_result.recommendation, system="alpha"),
             "weighted_score": float(score_result.score),
             "agents_involved": ["Sage", "Cipher"],
             "scores": {
@@ -162,20 +191,43 @@ async def lifespan(app: FastAPI):
     logger.info("MarketState poller started")
 
     # 4. Preflight (runs immediately if market hours, else waits for 9:25 AM cron)
+    # FIX: Deduplicate preflight alerts — only alert on state CHANGE, not every startup
+    global _last_preflight_alert_state
+    
+    # Load last persisted preflight state from DB
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            row = conn.execute(
+                "SELECT passed FROM preflight_results ORDER BY run_at DESC LIMIT 1"
+            ).fetchone()
+            _last_preflight_alert_state = ("PASSED" if row[0] else "FAILED") if row else None
+    except Exception as e:
+        logger.warning(f"Failed to load preflight state from DB: {e}")
+        _last_preflight_alert_state = None
+    
     result = run_preflight(DB_PATH)
     preflight_passed = result.passed
-    if result.passed:
-        await alert(
-            f"✅ <b>Nexus V2 preflight PASSED</b>\n"
-            f"IVR/RSI/fundamentals verified for {', '.join(['AAPL','JPM','NVDA'])}.\n"
-            f"Pipeline open."
-        )
+    
+    current_state = "PASSED" if result.passed else "FAILED"
+    if current_state != _last_preflight_alert_state:
+        # State changed — send alert
+        _last_preflight_alert_state = current_state
+        if result.passed:
+            await alert(
+                f"✅ <b>Nexus V2 preflight PASSED</b>\n"
+                f"IVR/RSI/fundamentals verified for {', '.join(['AAPL','JPM','NVDA'])}.\n"
+                f"Pipeline open."
+            )
+        else:
+            failures_str = "\n".join(f"• {f}" for f in result.failures)
+            await alert(
+                f"🔴 <b>Nexus V2 preflight FAILED</b>\n{failures_str}\n"
+                f"Pipeline suspended. Auto-retry every 10 minutes."
+            )
     else:
-        failures_str = "\n".join(f"• {f}" for f in result.failures)
-        await alert(
-            f"🔴 <b>Nexus V2 preflight FAILED</b>\n{failures_str}\n"
-            f"Pipeline suspended. Auto-retry every 10 minutes."
-        )
+        logger.info(f"Preflight {current_state} (no change from last alert — deduped)")
+    
+    if not result.passed:
         # C5 fix: suspend with wait-retry, not SystemExit
         await suspend_until_resume(
             state       = market_state,

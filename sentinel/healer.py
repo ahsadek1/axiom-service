@@ -314,3 +314,64 @@ def heal(component: str) -> tuple[bool, str]:
 
     # Default: restart the service
     return heal_service(component)
+
+
+def heal_circuit_breaker_paper_reset(alpha_buffer_url: str, nexus_secret: str) -> tuple[bool, str]:
+    """
+    Auto-reset circuit breaker overnight for paper trading mode.
+    ONLY fires if:
+      1. ALPACA_PAPER=true confirmed
+      2. Current time is outside market hours (before 9:00 AM or after 4:30 PM ET)
+      3. CB status is STOP or RED
+    Never auto-resets in live trading mode — requires Ahmed manual intervention.
+    Ahmed directive May 2026.
+    """
+    import os
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    # Safety: only auto-reset in paper mode
+    is_paper = os.getenv("ALPACA_PAPER", "false").lower() == "true"
+    if not is_paper:
+        return False, "LIVE MODE — CB reset requires Ahmed manual approval"
+
+    # Safety: only outside market hours
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    in_market = now_et.weekday() < 5 and (
+        now_et.replace(hour=9, minute=0) <= now_et <= now_et.replace(hour=16, minute=30)
+    )
+    if in_market:
+        return False, "Market hours — CB reset requires Ahmed manual approval"
+
+    try:
+        resp = requests.post(
+            f"{alpha_buffer_url}/circuit-breaker/reset",
+            headers={"X-Nexus-Secret": nexus_secret},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            log.info("CB auto-reset successful (paper mode, off-hours)")
+            _alert_ahmed("✅ Circuit breaker auto-reset (paper mode, off-hours) — V2 ready for tomorrow")
+            return True, "CB reset to NORMAL"
+        return False, f"CB reset failed: HTTP {resp.status_code}"
+    except Exception as exc:
+        return False, f"CB reset error: {exc}"
+
+
+def check_and_heal_backtest_db(backtest_db_path: str) -> tuple[bool, str]:
+    """
+    Verify backtest DB is accessible and populated.
+    Critical: OMNI's deterministic verdicts depend on this data.
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect(backtest_db_path, timeout=5)
+        count = conn.execute("SELECT COUNT(*) FROM historical_win_rates").fetchone()[0]
+        conn.close()
+        if count < 1000:
+            _alert_ahmed(f"⚠️ Backtest DB has only {count} rows — expected 10,000+. OMNI Kelly sizing degraded.")
+            return False, f"Backtest DB underpopulated: {count} rows"
+        return True, f"Backtest DB healthy: {count} rows"
+    except Exception as exc:
+        _alert_ahmed(f"🚨 Backtest DB unreachable: {exc} — OMNI Kelly sizing disabled")
+        return False, f"Backtest DB error: {exc}"
