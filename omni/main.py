@@ -1480,45 +1480,59 @@ def receive_concordance(
     def _pooled_synthesis():
         """Run synthesis in pool worker — rolls back dedup and retries once on failure.
         GAP-14: Semaphore is always released via try/finally to prevent pool slot leaks.
+        FIX-WORKER-LIFECYCLE (2026-06-01): Top-level exception handler ensures worker stays alive.
         """
-        _SYNTHESIS_SEMAPHORE.acquire()
-        try:
+        try:  # FIX-WORKER-LIFECYCLE: Outermost wrapper to catch ANYTHING
+            _SYNTHESIS_SEMAPHORE.acquire()
             try:
-                _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
-            except Exception as _exc:
-                logger.critical(
-                    "OMNI pool synthesis FAILED for %s/%s — rolling back dedup for retry: %s",
-                    _ticker, _pathway, _exc, exc_info=True,
-                )
-                with _state_lock:
-                    app_state["synthesized_concordances"].discard(_conc_key)
-                # Mandate v2: don't silently discard — retry once immediately
                 try:
-                    logger.info("OMNI pool: retrying synthesis for %s/%s", _ticker, _pathway)
-                    with _state_lock:
-                        app_state["synthesized_concordances"].add(_conc_key)
                     _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
-                    logger.info("OMNI pool retry SUCCESS for %s/%s", _ticker, _pathway)
-                except Exception as _retry_exc:
+                except Exception as _exc:
                     logger.critical(
-                        "OMNI pool retry ALSO FAILED for %s/%s: %s — enqueuing in DLQ",
-                        _ticker, _pathway, _retry_exc,
+                        "OMNI pool synthesis FAILED for %s/%s — rolling back dedup for retry: %s",
+                        _ticker, _pathway, _exc, exc_info=True,
                     )
                     with _state_lock:
                         app_state["synthesized_concordances"].discard(_conc_key)
-                    # Notify SOVEREIGN
+                    # Mandate v2: don't silently discard — retry once immediately
                     try:
-                        import requests as _req
-                        _req.post(
-                            f"{os.environ.get('SOVEREIGN_BUS_URL','http://192.168.1.141:9999')}/send",
-                            json={"from":"omni","to":"sovereign",
-                                  "message":f"SYNTHESIS POOL DOUBLE-FAIL: {_ticker}/{_pathway} "
-                                            f"failed twice. Error: {str(_retry_exc)[:200]}"},
-                            timeout=5
+                        logger.info("OMNI pool: retrying synthesis for %s/%s", _ticker, _pathway)
+                        with _state_lock:
+                            app_state["synthesized_concordances"].add(_conc_key)
+                        _run_synthesis(_conc_key, _trace_id, _ticker, _pathway, _win_id, concordance)
+                        logger.info("OMNI pool retry SUCCESS for %s/%s", _ticker, _pathway)
+                    except Exception as _retry_exc:
+                        logger.critical(
+                            "OMNI pool retry ALSO FAILED for %s/%s: %s — enqueuing in DLQ",
+                            _ticker, _pathway, _retry_exc,
                         )
-                    except Exception: pass
-        finally:
-            _SYNTHESIS_SEMAPHORE.release()  # GAP-14: ALWAYS release, even if exception escapes
+                        with _state_lock:
+                            app_state["synthesized_concordances"].discard(_conc_key)
+                        # Notify SOVEREIGN
+                        try:
+                            import requests as _req
+                            _req.post(
+                                f"{os.environ.get('SOVEREIGN_BUS_URL','http://192.168.1.141:9999')}/send",
+                                json={"from":"omni","to":"sovereign",
+                                      "message":f"SYNTHESIS POOL DOUBLE-FAIL: {_ticker}/{_pathway} "
+                                                f"failed twice. Error: {str(_retry_exc)[:200]}"},
+                                timeout=5
+                            )
+                        except Exception: pass
+            finally:
+                _SYNTHESIS_SEMAPHORE.release()  # GAP-14: ALWAYS release, even if exception escapes
+        except Exception as _outer_exc:
+            # FIX-WORKER-LIFECYCLE: Catch ANY exception that escapes nested handlers
+            logger.critical(
+                "OMNI pool: OUTER EXCEPTION (worker may be dying): %s",
+                _outer_exc, exc_info=True
+            )
+            # Attempt to release semaphore if somehow it's held
+            try:
+                if _SYNTHESIS_SEMAPHORE._value < 3:
+                    _SYNTHESIS_SEMAPHORE.release()
+            except:
+                pass
 
     _priority = _PATHWAY_PRIORITY.get(_pathway, 5)
     _SYNTHESIS_POOL.submit(_pooled_synthesis)

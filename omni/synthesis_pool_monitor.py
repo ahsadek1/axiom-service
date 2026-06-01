@@ -98,6 +98,20 @@ class PoolHealthMonitor:
 
     def _check_pool_health(self) -> None:
         """Run a single health check cycle."""
+        # Check 0: Detect and respawn dead worker threads (FIX-WORKER-LIFECYCLE 2026-06-01)
+        live_workers = len([t for t in self.pool._threads if t.is_alive()])
+        if live_workers < self.pool._max_workers:
+            logger.critical(
+                "POOL HEALTH: Only %d/%d workers alive — spawning %d replacement worker(s)",
+                live_workers,
+                self.pool._max_workers,
+                self.pool._max_workers - live_workers,
+            )
+            self._respawn_dead_workers()
+            # Reset silence timer after respawn to give workers time to process
+            self._last_completion_time = time.time()
+            return
+        
         # Check 1: Can we acquire + release the semaphore? (proves it's not stuck)
         if not self._check_semaphore_responsive():
             logger.critical(
@@ -177,6 +191,27 @@ class PoolHealthMonitor:
         else:
             # Max retries exceeded — escalate to SOVEREIGN
             self._escalate_to_sovereign(failure_reason)
+
+    def _respawn_dead_workers(self) -> None:
+        """FIX-WORKER-LIFECYCLE: Respawn dead worker threads to maintain pool size.
+        Submits dummy no-op tasks to force ThreadPoolExecutor to spawn replacement threads.
+        """
+        try:
+            def _worker_sentinel():
+                """Dummy task to keep worker thread alive. Simply returns."""
+                return "worker_alive"
+            
+            # Submit replacement tasks equal to number of dead workers
+            live_workers = len([t for t in self.pool._threads if t.is_alive()])
+            dead_count = self.pool._max_workers - live_workers
+            
+            for i in range(dead_count):
+                future = self.pool.submit(_worker_sentinel)
+                logger.info("POOL HEALTH: Respawn #%d submitted", i + 1)
+            
+            logger.info("POOL HEALTH: %d replacement worker(s) enqueued", dead_count)
+        except Exception as e:
+            logger.error("POOL HEALTH: Failed to respawn workers: %s", e)
 
     def _escalate_to_sovereign(self, failure_reason: str) -> None:
         """Escalate pool failure to SOVEREIGN after max retries."""
