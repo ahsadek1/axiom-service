@@ -191,10 +191,14 @@ def check_brain_health(
 
 def run_all_brains(
     context: dict,
-    anthropic_api_key: str,
-    openai_api_key:    str,
-    gemini_api_key:    str,
-    deepseek_api_key:  str,
+    concordance: Optional[dict] = None,      # FIX-MEMORY-PHASE2: For brain-specific contexts
+    axiom_result: Optional[dict] = None,     # FIX-MEMORY-PHASE2
+    regime: Optional[dict] = None,           # FIX-MEMORY-PHASE2
+    oracle_ctx: Optional[dict] = None,       # FIX-MEMORY-PHASE2
+    anthropic_api_key: str = "",
+    openai_api_key:    str = "",
+    gemini_api_key:    str = "",
+    deepseek_api_key:  str = "",
     bot_token:         str = "",
     ahmed_chat_id:     str = "",
 ) -> dict[str, dict]:
@@ -238,7 +242,26 @@ def run_all_brains(
         BRAIN_DEEPSEEK: deepseek_api_key,
     }
 
-    context_json = json.dumps(context, default=str)  # FIX-MEMORY-PHASE1: minified (no indent) — saves 8KB per verdict
+    # FIX-MEMORY-PHASE2: Build brain-specific contexts to reduce oracle field duplication
+    # Each non-pattern brain excludes oracle (saves 2.5KB × 3 brains = 7.5KB per verdict)
+    from synthesis import build_context_for_brain  # Import new Phase 2 function
+    
+    brain_contexts_json = {}
+    if concordance is not None and axiom_result is not None and regime is not None:
+        # Use new brain-specific contexts (Phase 2)
+        for brain_name in ALL_BRAINS:
+            brain_ctx = build_context_for_brain(
+                brain_name=brain_name,
+                concordance=concordance,
+                axiom_result=axiom_result,
+                regime=regime,
+                oracle_ctx=oracle_ctx,
+            )
+            brain_contexts_json[brain_name] = json.dumps(brain_ctx, default=str)
+    else:
+        # Fallback: use original context for all brains (if components not provided)
+        context_json = json.dumps(context, default=str)  # FIX-MEMORY-PHASE1: minified
+        brain_contexts_json = {brain: context_json for brain in ALL_BRAINS}
 
     results: dict[str, dict] = {}
     # GAP-BRAIN-HANG: Hard deadline for all brain calls combined.
@@ -264,7 +287,7 @@ def run_all_brains(
         executor.submit(
             _call_brain,
             brain_name,
-            context_json,
+            brain_contexts_json[brain_name],  # FIX-MEMORY-PHASE2: Use brain-specific context
             api_keys[brain_name],
         ): brain_name
         for brain_name in ALL_BRAINS

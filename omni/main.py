@@ -1644,6 +1644,10 @@ def _run_synthesis(
     
     brain_results = run_all_brains(
         context           = context,
+        concordance       = concordance,              # FIX-MEMORY-PHASE2: For brain-specific contexts
+        axiom_result      = axiom_result,            # FIX-MEMORY-PHASE2
+        regime            = market_regime,           # FIX-MEMORY-PHASE2
+        oracle_ctx        = oracle_context,          # FIX-MEMORY-PHASE2
         anthropic_api_key = creds_to_use.anthropic_api_key,
         openai_api_key    = creds_to_use.openai_api_key,
         gemini_api_key    = creds_to_use.gemini_api_key,

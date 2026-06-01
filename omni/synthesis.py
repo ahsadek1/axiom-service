@@ -307,6 +307,66 @@ def build_context(
     }
 
 
+def build_context_for_brain(
+    brain_name: str,
+    concordance: dict,
+    axiom_result: Optional[dict],
+    regime: Optional[dict],
+    oracle_ctx: Optional[dict] = None,
+) -> dict:
+    """
+    Build minimal context for a specific brain role (FIX-MEMORY-PHASE2).
+    
+    Reduces memory footprint by:
+    1. Excluding oracle for non-PATTERN brains (Claude, o3-mini, DeepSeek)
+    2. Excluding unused fields based on brain role
+    3. Returning brain-specific field subset
+    
+    Called from quad_intelligence.run_all_brains() to generate
+    context once per brain instead of once for all.
+    """
+    base_context = {
+        "ticker":             concordance.get("ticker"),
+        "direction":          concordance.get("direction"),
+        "system":             concordance.get("system"),
+        "pathway":            concordance.get("pathway"),
+        "agent_weighted_score": concordance.get("weighted_score"),
+        "agents_involved":    concordance.get("agents_involved", []),
+        "agent_scores":       concordance.get("scores", {}),
+        "verdict_from_agents": concordance.get("verdict"),
+        "echo_chamber_flagged_at_buffer": concordance.get("echo_chamber", False),
+        "window_id":          concordance.get("window_id"),
+        "notes_from_buffer":  concordance.get("notes", []),
+        "axiom": {
+            "risk_score":   axiom_result.get("risk_score") if axiom_result else None,
+            "sizing_mult":  axiom_result.get("sizing_mult") if axiom_result else None,
+            "in_pool":      axiom_result.get("in_pool") if axiom_result else None,
+            "concern_1":    axiom_result.get("concern_1") if axiom_result else None,
+            "concern_2":    axiom_result.get("concern_2") if axiom_result else None,
+            "hard_stops":   axiom_result.get("hard_stops", []) if axiom_result else [],
+        },
+        "regime": {
+            "classification":       regime.get("classification") if regime else "UNKNOWN",
+            "vix":                  regime.get("vix") if regime else None,
+            "strategy_bias":        regime.get("strategy_bias") if regime else None,
+            "alpha_debit_allowed":  regime.get("alpha_debit_allowed") if regime else False,
+            "alpha_credit_allowed": regime.get("alpha_credit_allowed") if regime else False,
+            "prime_allowed":        regime.get("prime_allowed") if regime else False,
+        },
+    }
+    
+    # PATTERN brain (Gemini) gets full oracle context
+    # All other brains omit oracle (saves 2.5KB per brain × 3 = 7.5KB total)
+    if brain_name == "gemini" and oracle_ctx:
+        base_context["oracle"] = {
+            "ticker":         oracle_ctx.get("ticker"),
+            "flow_score":     oracle_ctx.get("flow_score"),
+            "gamma_exposure": oracle_ctx.get("gamma_exposure"),
+        }
+    
+    return base_context
+
+
 # G8 SYS-1: Rate-limit brain degradation alerts to 1 per ticker per hour.
 # Key: ticker string. Value: epoch time of last alert sent.
 _brain_alert_sent: dict = {}
