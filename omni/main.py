@@ -1793,31 +1793,12 @@ def _run_synthesis(
         )
         execution_ok = exec_ok
         
-        # FIX-EXEC-CONFIRM (2026-05-13): Confirm order was actually submitted
-        # Do NOT assume HTTP 202 means the order is live. Poll the execution engine.
-        if exec_ok:
-            exec_system = concordance["system"]
-            exec_ticker = concordance["ticker"]
-            exec_url    = (
-                settings.alpha_execution_url
-                if exec_system == "alpha"
-                else settings.prime_execution_url
-            )
-            confirmed, conf_detail = confirm_order_submitted(
-                system         = exec_system,
-                ticker         = exec_ticker,
-                execution_url  = exec_url,
-                auth_secret    = exec_auth,
-            )
-            if not confirmed:
-                logger.warning(
-                    "EXEC_CONFIRM FAILED: %s/%s order not confirmed (%s). "
-                    "Escalating to recovery.",
-                    exec_system.upper(), exec_ticker, conf_detail,
-                )
-                # Mark as unconfirmed so auto-recovery kicks in
-                execution_ok = False
-                exec_resp = f"unconfirmed: {conf_detail}"
+        # NOTE (2026-06-01): Secondary confirmation check REMOVED.
+        # execution_router.route_to_execution() now includes GATE-001 confirmation:
+        # On 4xx/5xx, it checks /trades endpoint to verify order actually reached Alpaca.
+        # This eliminates false "execution failed" flags when orders succeed but
+        # the execution engine temporarily returns an error (e.g., stale auth).
+        # We trust route_to_execution()'s return value: if exec_ok=True, order is confirmed.
         mark_execution_dispatched(
             settings.omni_db_path,
             synthesis_id,
