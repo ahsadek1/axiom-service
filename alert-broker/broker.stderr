@@ -25331,3 +25331,112 @@ Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
 2026-06-01 10:36:53,619 [INFO] alert_broker: alert_broker: sent [WARNING] '⚠️ alpha_execution: recent errors in logs' → {'nexus_health_group': True}
 2026-06-01 10:42:55,872 [INFO] alert_broker: alert_broker: sent [WARNING] '⚠️ alpha_execution: recent errors in logs' → {'nexus_health_group': True}
 2026-06-01 10:48:58,235 [INFO] alert_broker: alert_broker: sent [WARNING] '⚠️ alpha_execution: recent errors in logs' → {'nexus_health_group': True}
+2026-06-01 10:51:00,241 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=686 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*ORPHANS AUTO-CLOSED* — ['AAPL', 'IBM', 'MSFT', 'AVGO', 'CDN title=*ORPHANS AUTO-CLOSED* — ['AAPL', 'IBM', 'MSFT', 'AVGO', 'CDNS']
+Positions in Alpaca but not DB. Auto-liquidated.
+2026-06-01 10:51:00,245 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ORPHANS AUTO-CLOSED* — ['AAPL', 'IBM', 'MSFT', 'AVGO', 'CDNS']
+Positions in Alpaca but not DB. Auto-liquidated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 10:55:00,431 [INFO] alert_broker: alert_broker: sent [WARNING] '⚠️ alpha_execution: recent errors in logs' → {'nexus_health_group': True}
+2026-06-01 10:55:51,245 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from omni: p0_critical' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 10:57:53,108 [INFO] alert_broker: alert_broker: sent [CRITICAL] 'P0 from outcome-monitor: outcome monitor [critical] — 2026-06-01 14' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:01:02,661 [INFO] alert_broker: alert_broker: sent [WARNING] '⚠️ alpha_execution: recent errors in logs' → {'nexus_health_group': True}
+2026-06-01 11:01:03,388 [INFO] alert_broker: alert_broker: sent [WARNING] '*NEXUS PULSE — 11:00 ET*
+
+`axiom` ✅
+`alpha-buffer` ✅
+`prime-buffer` ✅
+`omni` ✅
+`alpha-execution` ✅
+`prime-execution` ✅
+`oracle` ✅
+`ails` ✅
+`cipher` ✅
+`atlas` ✅
+`sage` ✅
+`chronicle` ✅
+`pipeline-sentine' → {'nexus_health_group': True}
+2026-06-01 11:05:44,129 [INFO] alert_broker: alert_broker: sent [WARNING] '🟡 NEXUS PULSE WARN: atg-swing' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:05:57,884 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=687 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*CRITICAL — sqs-atg-swing*
+
+Max heal attempts (3) reached to title=*CRITICAL — sqs-atg-swing*
+
+Max heal attempts (3) reached today. Auto-healing stopped. Manual intervention required.
+
+Requires immediate manual intervention.
+2026-06-01 11:05:57,886 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*CRITICAL — sqs-atg-swing*
+
+Max heal attempts (3) reached today. Auto-healing stopped. Manual intervention required.
+
+Requires immediate manual intervention.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:06:07,371 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-swing`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *13.6 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:06:14,965 [INFO] alert_broker: alert_broker: sent [WARNING] '*UNRESOLVED — sqs-atg-swing*
+
+CONNECTION_REFUSED — http://localhost:9006/health
+
+Duration: 1.0 min — auto-heal attempted, not recovered.' → {'nexus_health_group': True}
+2026-06-01 11:06:45,810 [INFO] alert_broker: alert_broker: sent [WARNING] '⚠️ alpha_execution: recent errors in logs' → {'nexus_health_group': True}
+2026-06-01 11:06:58,872 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-swing`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *7.1 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:08:06,720 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-swing`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *4.4 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:08:58,867 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=688 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*ESCALATED — sqs-atg-swing*
+
+CONNECTION_REFUSED — http://loc title=*ESCALATED — sqs-atg-swing*
+
+CONNECTION_REFUSED — http://localhost:9006/health
+
+Duration: 4.0 min — requesting AI diagnosis.
+2026-06-01 11:08:58,870 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ESCALATED — sqs-atg-swing*
+
+CONNECTION_REFUSED — http://localhost:9006/health
+
+Duration: 4.0 min — requesting AI diagnosis.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:09:03,793 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-swing`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *3.1 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:09:11,877 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=689 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*AI DIAGNOSIS — sqs-atg-swing*
+
+*Claude:* # Diagnosis
+
+The ` title=*AI DIAGNOSIS — sqs-atg-swing*
+
+*Claude:* # Diagnosis
+
+The `sqs-atg-swing` service cannot connect to its health check endpoint at `localhost:9006`, indicating the service either failed to start, crash
+2026-06-01 11:09:11,881 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*AI DIAGNOSIS — sqs-atg-swing*
+
+*Claude:* # Diagnosis
+
+The `sqs-atg-swing` service cannot connect to its health check endpoint at `localhost:9006`, indicating the service either failed to start, crash' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:09:57,955 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-06-01 11:09:57,961 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*PREDICTED FAILURE* — `sqs-atg-swing`
+
+Signal: response_time_ms approaching 5000.0
+ETA: *8.3 minutes*
+Preemptive restart initiated.' → {'ahmed': True, 'nexus_health_group': False}
+2026-06-01 11:10:06,832 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-06-01 11:10:06,839 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=690 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*ALPACA UNREACHABLE from prime-execution*
+Cannot auto-fix. C title=*ALPACA UNREACHABLE from prime-execution*
+Cannot auto-fix. Check Alpaca API status.
+2026-06-01 11:10:06,843 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ALPACA UNREACHABLE from prime-execution*
+Cannot auto-fix. Check Alpaca API status.' → {'ahmed': True, 'nexus_health_group': False}
+2026-06-01 11:10:50,414 [INFO] alert_broker.router: router: flushing 2 overflow alerts for target 'nexus_health_group'
+2026-06-01 11:10:51,156 [WARNING] alert_broker.router: router: rate cap hit for 'nexus_health_group' — queuing overflow
+2026-06-01 11:10:59,357 [INFO] nexus.alert_manager: alert_manager: [OPEN] id=691 agent=guardian-angel-v4 service=guardian-angel-v4 key=guardian-angel-v4:*ALPACA UNREACHABLE from alpha-execution*
+Cannot auto-fix. C title=*ALPACA UNREACHABLE from alpha-execution*
+Cannot auto-fix. Check Alpaca API status.
+2026-06-01 11:10:59,360 [INFO] alert_broker: alert_broker: sent [CRITICAL] '*ALPACA UNREACHABLE from alpha-execution*
+Cannot auto-fix. Check Alpaca API status.' → {'ahmed': True, 'nexus_health_group': True}
+2026-06-01 11:11:06,289 [INFO] alert_broker.router: router: flushing 1 overflow alerts for target 'nexus_health_group'
+2026-06-01 11:12:48,113 [INFO] alert_broker: alert_broker: sent [WARNING] '⚠️ alpha_execution: recent errors in logs' → {'nexus_health_group': True}

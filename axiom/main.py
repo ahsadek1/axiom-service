@@ -706,6 +706,28 @@ def assess_stock(
         # No IVR provided — flag it but don't hard block (IVR data may be unavailable)
         flags.append("Credit spread submitted without IVR — verify IV percentile >= 30 before entry")
 
+    # ────────────────────────────────────────────────────────────────────────────────
+    # LAYER 1: CONCENTRATION RISK — Position gating (CRITICAL FIX)
+    # ────────────────────────────────────────────────────────────────────────────────
+    try:
+        from risk_engine import score_layer_1_concentration
+        positions = requests.get(f"{ALPACA_BASE}/v2/positions", headers=ALPACA_H, timeout=8).json()
+        if isinstance(positions, list):
+            equity = float(requests.get(f"{ALPACA_BASE}/v2/account", headers=ALPACA_H, timeout=8).json().get("equity", 1))
+            layer1_result = score_layer_1_concentration(ticker, 1000, positions, equity)  # Proposed: $1000 test
+            if layer1_result.get("critical_flag"):
+                hard_stops.append(layer1_result.get("note", "Position concentration limit breached"))
+                risk_score = 10.0
+                sizing_mult = 0.0
+            elif "gate CLOSED" in layer1_result.get("note", ""):
+                hard_stops.append(layer1_result.get("note", "Position gate closed"))
+                risk_score = 10.0
+                sizing_mult = 0.0
+    except Exception as e:
+        logger.warning("Layer 1 concentration check failed: %s — falling through", e)
+        # Do NOT block submission if check fails — risk being overly permissive vs blocking legitimately
+        pass
+
     # Not in current pool
     if pool and ticker not in pool:
         concerns.append(f"{ticker} not in current Axiom pool — submitted outside pool")

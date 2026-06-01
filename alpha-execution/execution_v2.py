@@ -589,14 +589,38 @@ def reconcile_on_startup(db_path: str, alert_fn) -> None:
     """
     C7 / Layer 4 recovery: On startup, compare DB state vs Alpaca.
     Flags discrepancies to Ahmed — never silently assumes correctness.
+    
+    FIX (2026-06-01): Add backoff retry on 429 rate limit.
+    Alpaca paper API sometimes returns 429 during startup if health checks are hammering it.
     """
-    try:
-        r = requests.get(f"{ALPACA_URL}/v2/positions", headers=ALPACA_HEADERS, timeout=8)
-        r.raise_for_status()
-        alpaca_positions = {p["symbol"]: p for p in r.json()}
-    except Exception as e:
-        logger.error("[Reconcile] Cannot reach Alpaca: %s", e)
-        alert_fn(f"⚠️ Startup reconciler: Alpaca unreachable — {e}")
+    import time
+    alpaca_positions = None
+    max_retries = 4
+    backoff_base = 2.0
+    
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(f"{ALPACA_URL}/v2/positions", headers=ALPACA_HEADERS, timeout=8)
+            if r.status_code == 429:
+                # Rate limited — wait and retry
+                wait_secs = backoff_base ** attempt
+                logger.warning("[Reconcile] HTTP 429 — backing off for %fs (attempt %d/%d)", wait_secs, attempt+1, max_retries)
+                time.sleep(wait_secs)
+                continue
+            r.raise_for_status()
+            alpaca_positions = {p["symbol"]: p for p in r.json()}
+            break
+        except Exception as e:
+            logger.error("[Reconcile] Attempt %d/%d failed: %s", attempt+1, max_retries, e)
+            if attempt == max_retries - 1:
+                # Final attempt failed
+                logger.error("[Reconcile] Cannot reach Alpaca after %d attempts: %s", max_retries, e)
+                alert_fn(f"⚠️ Startup reconciler: Alpaca unreachable after retries — {e}")
+                return
+            wait_secs = backoff_base ** (attempt + 1)
+            time.sleep(wait_secs)
+    
+    if alpaca_positions is None:
         return
 
     with get_db(db_path) as conn:
