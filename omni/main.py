@@ -1705,6 +1705,16 @@ def _run_synthesis(
     # P0 FIX (May 14, 2026): Signal pool health monitor that synthesis completed successfully
     if _pool_monitor:
         _pool_monitor.mark_synthesis_complete()
+    
+    # FIX-MEMORY-PHASE1: Explicit DB connection cleanup after persist
+    # Ensures WAL buffer doesn't accumulate; reduces memory bloat
+    try:
+        import sqlite3
+        conn = sqlite3.connect(settings.omni_db_path, timeout=5)
+        conn.execute("PRAGMA optimize;")
+        conn.close()
+    except Exception as _cleanup_exc:
+        logger.debug("DB cleanup after synthesis: %s", _cleanup_exc)
 
     with _state_lock:                          # Pass B fix (V6): thread-safe counter
         app_state["syntheses_today"] += 1

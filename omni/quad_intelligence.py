@@ -238,7 +238,7 @@ def run_all_brains(
         BRAIN_DEEPSEEK: deepseek_api_key,
     }
 
-    context_json = json.dumps(context, indent=2, default=str)
+    context_json = json.dumps(context, default=str)  # FIX-MEMORY-PHASE1: minified (no indent) — saves 8KB per verdict
 
     results: dict[str, dict] = {}
     # GAP-BRAIN-HANG: Hard deadline for all brain calls combined.

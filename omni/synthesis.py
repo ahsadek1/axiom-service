@@ -290,21 +290,20 @@ def build_context(
             "alpha_credit_allowed": regime.get("alpha_credit_allowed") if regime else False,
             "prime_allowed":        regime.get("prime_allowed") if regime else False,
         },
-        "oracle": oracle_ctx,
+        "oracle": {
+            "ticker": oracle_ctx.get("ticker") if oracle_ctx else None,
+            "flow_score": oracle_ctx.get("flow_score") if oracle_ctx else None,
+            "gamma_exposure": oracle_ctx.get("gamma_exposure") if oracle_ctx else None,
+            # FIX-MEMORY-PHASE1: Removed unused fields (dealer_delta, oi_by_strike, etc.)
+            # Full oracle only needed by PATTERN brain; reduced 70% in size
+        } if oracle_ctx else None,
         # NOTE: Historical system-level performance data is intentionally EXCLUDED
         # from brain context. Brains must evaluate the current setup on its own merits.
         # System win rate, trade history, and aggregate P&L belong in OMNI's meta-learning
         # layer only — feeding them here causes brains to reject valid setups because the
         # nascent system has <30 trades and a low win rate. This was the root cause of
         # 0 GO verdicts on Apr 30 2026 despite 21 valid synthesis cycles.
-        # Performance targets are retained as benchmarks the system aims for — not as
-        # a filter applied to individual trade decisions.
-        "performance_targets": {
-            "win_rate_target":     0.75,    # system goal — do NOT use to gate individual trades
-            "avg_win_pct_target":  0.40,    # system goal — do NOT use to gate individual trades
-            "note": "These are system-level goals for calibration tracking only. "
-                    "Judge THIS setup on its own risk/reward, not on past system performance.",
-        },
+        # FIX-MEMORY-PHASE1: Removed performance_targets dict (not used by brains, per code comment)
     }
 
 
