@@ -126,9 +126,6 @@ _sovereign_halted: bool = False   # HALT directive suspends concordance synthesi
 # 3 workers run synthesis in parallel. P1/STRONG_GO pathways are prioritised.
 # Without this: a 90s brain timeout blocks all subsequent concordances.
 # With this: 3 concordances process simultaneously — no backlog during peak hours.
-# RESTORED 2026-06-02 04:33 UTC (GENESIS P0): Restored to 3 workers for market-open capacity.
-# Worker#3 respawn issue is off-hours concern; trading hours load justifies the risk.
-# Mitigation: Monitor closely; escalate if pool drops below 3 during [09:00-20:59 UTC].
 _SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=3, thread_name_prefix="omni-synth")
 _PATHWAY_PRIORITY    = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}  # lower = higher priority
 # GAP-14: Semaphore mirrors pool size — ensures release() is ALWAYS called (try/finally)
@@ -1099,8 +1096,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── FIX P0: Initialize OMNI Synthesis Pool Health Monitor (May 14, 2026) ────
     # ROOT CAUSE: Monitor was imported but never started. Coroutine crashes went undetected.
     # SOLUTION: Start monitor on service startup; it auto-restarts failed synthesis pool.
-    # TEMPORARY PATCH 2026-06-02 03:49 UTC: Monitor disabled due to respawn loop
-    # Workers will be debugged post-market. OMNI runs on 2/2 workers (reduced from 3).
     global _pool_monitor
     _pool_monitor = PoolHealthMonitor(
         pool=_SYNTHESIS_POOL,
@@ -1109,8 +1104,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         hang_timeout_sec=45,
         silence_window_sec=20 * 60,  # 20 minutes
     )
-    # _pool_monitor.start()  # DISABLED FOR STABILITY
-    logger.warning("OMNI: Pool monitor DISABLED (temporary patch for market stability). Workers: 2/2 configured.")
+    _pool_monitor.start()
+    logger.info("OMNI Synthesis Pool Health Monitor started ✅ (check_interval=10s, silence_window=1200s)")
 
     yield
 
@@ -1231,12 +1226,12 @@ def health() -> JSONResponse:
     # GAP-008: pool stats
     try:
         _pool_stats = {
-            "workers":    _SYNTHESIS_POOL._max_workers,  # Fixed 2026-06-02: use actual pool max, not hardcoded 3
+            "workers":    3,
             "max_workers": _SYNTHESIS_POOL._max_workers,
             "active":     len([f for f in _SYNTHESIS_POOL._threads if f.is_alive()]),
         }
     except Exception:
-        _pool_stats = {"workers": _SYNTHESIS_POOL._max_workers}
+        _pool_stats = {"workers": 3}
 
     # ── Trading Effectiveness Score (TES) ──────────────────────────────────────
     # Measures whether OMNI is producing value, not just whether it's alive.
@@ -1542,8 +1537,8 @@ def receive_concordance(
     _priority = _PATHWAY_PRIORITY.get(_pathway, 5)
     _SYNTHESIS_POOL.submit(_pooled_synthesis)
     logger.info(
-        "GAP-008: Synthesis queued for %s/%s (pathway=%s priority=%d pool_workers=%d)",
-        _ticker, concordance.get("direction","?"), _pathway, _priority, _SYNTHESIS_POOL._max_workers,
+        "GAP-008: Synthesis queued for %s/%s (pathway=%s priority=%d pool_workers=3)",
+        _ticker, concordance.get("direction","?"), _pathway, _priority,
     )
 
     # Return 202 immediately — synthesis runs in background
