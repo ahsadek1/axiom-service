@@ -17,14 +17,19 @@ EXIT_TRAILING_TIGHT_PCT      = 0.08   # tight trailing stop after +50%
 EXIT_HARD_BACKSTOP_PCT       = -0.18  # -18% absolute backstop (technical stop preferred)
 
 # ── Position Limits ───────────────────────────────────────────────────────────
-MAX_CONCURRENT_POSITIONS = 15
+# CRITICAL (2026-06-02): Synchronized with Alpha execution config.py
+# Ahmed Sadek mandate: max 3 concurrent positions across ALL trading systems.
+# Prime and Alpha share the same Alpaca account; must enforce same gate.
+# Previous value (15) caused position breach during market hours (integrity check at 10:50 ET).
+# See CHRONICLE > intervention_log for gating failure incident.
+MAX_CONCURRENT_POSITIONS = 3    # MUST match alpha-execution/config.py:MAX_CONCURRENT_POSITIONS
 # MAX_NEW_PER_DAY: hard ceiling on cumulative new entries per calendar day.
 # Set to 10 — provides headroom for intraday high-throughput windows while
 # capping runaway frequency. The concurrent cap (MAX_CONCURRENT_POSITIONS)
 # is the primary safeguard; this is the secondary daily ceiling.
 # History: was 5 (too tight for intraday close+reopen), raised to 50 (too loose),
 # settled at 10 (right balance — approved by Ahmed 2026-04-27).
-MAX_NEW_PER_DAY          = 15
+MAX_NEW_PER_DAY          = 10
 
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 ALPACA_DATA_URL  = "https://data.alpaca.markets"
