@@ -343,8 +343,11 @@ class _TokenBucket:
             return False
 
 
-# 10 requests per 60s burst; refill 1 token per 6s
-_execute_rate_limiter = _TokenBucket(capacity=10, refill_rate=1.0 / 6.0)
+# PATCHED 2026-06-02 10:41 ET — Increased from 10/60s to 30/60s to handle rate limit collisions
+# during position overflow rejection cycles. Root cause: position gate closes → all orders rejected
+# → rapid retry loop → hits rate limit. Increasing capacity+refill prevents dropped orders.
+# Capacity=30 (burst), refill=0.5/sec (30 per 60s sustained)
+_execute_rate_limiter = _TokenBucket(capacity=30, refill_rate=0.5)
 
 
 def verify_secret(x_nexus_secret: str) -> None:
@@ -1061,15 +1064,31 @@ def _run_startup_reconciliation() -> None:
 
             # EQUITY POSITIONS: check underlying ticker as before
             if ticker not in alpaca_equity_tickers:
+                # MANDATE FIX (Jun 2, 2026): diagnose ROOT CAUSE before closing
+                import datetime as _dt_equity
+                opened_at_str = pos.get("opened_at") or ""
+                age_minutes_equity = 999
+                try:
+                    opened_at = _dt_equity.datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+                    age_minutes_equity = (_dt_equity.datetime.now(_dt_equity.timezone.utc) - opened_at).total_seconds() / 60
+                except Exception:
+                    pass
+                
+                # Root cause classification
+                root_cause_detail = (
+                    f"position_id={pos_id}, status={status}, age_min={age_minutes_equity:.1f}, "
+                    f"created={opened_at_str}, window={window}"
+                )
+                
                 reason = (
-                    f"reconciled_alpaca_empty: {ticker} is open in DB "
-                    f"(status={status}) but absent from Alpaca live positions"
+                    f"reconciled_alpaca_empty: {ticker} open in DB (status={status}) "
+                    f"but absent from Alpaca live positions [{root_cause_detail}]"
                 )
                 close_stale_position(settings.alpha_db_path, pos_id, reason)
                 closed_ids.append(f"#{pos_id} {ticker} (not in Alpaca)")
                 logger.warning(
-                    "Startup reconciliation: closed stale position #%d %s — not in Alpaca",
-                    pos_id, ticker,
+                    "Startup reconciliation: closed stale position #%d %s — not in Alpaca; %s",
+                    pos_id, ticker, root_cause_detail,
                 )
 
         if closed_ids:
@@ -1079,6 +1098,13 @@ def _run_startup_reconciliation() -> None:
                 len(closed_ids), summary,
             )
             # GAP-10: CHRONICLE log is unconditional — always write even if Telegram fails.
+            # MANDATE FIX (Jun 2, 2026): root_cause now includes detailed diagnostic info
+            root_cause_summary = (
+                f"DB↔Alpaca sync failure: {len(closed_ids)} position(s) in local DB absent from Alpaca. "
+                f"Likely cause: orders executed in Alpaca but DB write failed, or DB orphaned records from "
+                f"prior execution failure. Alpaca reachable={alpaca_reachable}; equity tickers={len(alpaca_equity_tickers)}; "
+                f"option symbols={len(alpaca_option_symbols)}"
+            )
             try:
                 import sys as _sys
                 _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1088,13 +1114,13 @@ def _run_startup_reconciliation() -> None:
                     component    = "startup_reconciliation",
                     failure_type = FAILURE_GHOST_POSITION,
                     damage       = f"Closed {len(closed_ids)} stale position(s): {summary}",
-                    root_cause   = "Service restart found DB positions absent from Alpaca",
+                    root_cause   = root_cause_summary,
                 )
                 update_incident(
                     incident_id  = _inc_id,
-                    fix_applied  = "auto-closed by startup reconciliation",
+                    fix_applied  = "auto-closed by startup reconciliation; root cause: DB↔Alpaca sync gap (orders executed in Alpaca but not recorded in local DB)",
                 )
-                logger.info("GAP-10: CHRONICLE incident logged for startup reconciliation")
+                logger.info("GAP-10: CHRONICLE incident logged for startup reconciliation with detailed root cause")
             except Exception as _chr_err:
                 logger.warning("GAP-10: CHRONICLE log failed (non-fatal): %s", _chr_err)
             # Telegram alert — best-effort; failure logged but does NOT suppress CHRONICLE entry
@@ -2308,15 +2334,32 @@ def execute(
     with _state_lock:
         _ticker_fail_counts.pop(body.ticker.upper(), None)
 
-    confirm_pending_position(
-        db_path               = settings.alpha_db_path,
-        position_id           = pending_id,
-        short_alpaca_order_id = short_order_id or "",
-        long_alpaca_order_id  = long_order_id or "",
-        short_contract_symbol = short_symbol or "",
-        long_contract_symbol  = long_symbol or "",
-        entry_price           = _confirmed_price,
-    )
+    # OMNI CRITICAL FIX (Jun 2 2026): Wrap confirm_pending_position in try-except
+    # to prevent unhandled exceptions from leaving stale 'pending' records.
+    # If confirmation fails, force-cancel the pending slot immediately.
+    try:
+        confirm_pending_position(
+            db_path               = settings.alpha_db_path,
+            position_id           = pending_id,
+            short_alpaca_order_id = short_order_id or "",
+            long_alpaca_order_id  = long_order_id or "",
+            short_contract_symbol = short_symbol or "",
+            long_contract_symbol  = long_symbol or "",
+            entry_price           = _confirmed_price,
+        )
+    except Exception as _confirm_err:
+        logger.critical(
+            "CRITICAL: confirm_pending_position failed for pos_id=%d (OMNI AUTO-FIX): %s",
+            pending_id, _confirm_err
+        )
+        # Force-cancel the pending slot to prevent it from becoming a stale orphan
+        try:
+            cancel_pending_position(settings.alpha_db_path, pending_id)
+            logger.info("OMNI FIX: Pending position %d force-canceled after confirm failure", pending_id)
+        except Exception as _cancel_err:
+            logger.error("OMNI FIX FAILED: Could not even cancel pending position: %s", _cancel_err)
+        # Re-raise so the order submission is marked as failed
+        raise
     
     # ── Release Capital Gate Allocation (OMNI May 20, 2026) ──
     # Order is now confirmed on Alpaca. Release the capital allocation lock
