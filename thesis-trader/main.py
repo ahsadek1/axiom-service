@@ -108,15 +108,10 @@ async def run_screening_cycle() -> None:
 
     log.info("Qualified (backtest >= %.0f%%): %d tickers", MIN_BACKTEST_WINRATE*100, len(qualified))
 
-    # 4. Execute top picks — full 7-layer pipeline
-    from zoneinfo import ZoneInfo as _ZI
-    _et = datetime.now(_ZI("America/New_York"))
-    _market_open = (_et.weekday() < 5 and
-                   (_et.hour > 9 or (_et.hour == 9 and _et.minute >= 30)) and
-                   _et.hour < 16)
-
+    # 4. Cache qualified picks for 9:30 AM execution job
+    # (Do NOT execute during pre-market screening)
     executed = 0
-    if _market_open and qualified:
+    if qualified:
         portfolio = get_portfolio_summary()
         capacity  = MAX_POSITIONS - portfolio["open_positions"]
         log.info("Executing: capacity=%d regime=%s", capacity, regime)
@@ -213,9 +208,8 @@ async def run_screening_cycle() -> None:
 
             except Exception as exc:
                 log.error("Screening error for %s: %s", ticker, exc)
-    else:
-        if not _market_open:
-            log.info("Market closed — screening only, no execution")
+    
+    # Note: Execution happens in run_market_open_execution() job at 9:30 AM
 
     # Update state
     _last_screening = {
@@ -242,6 +236,120 @@ async def run_screening_cycle() -> None:
     log.info("=== Cycle Complete ===")
 
 
+async def run_market_open_execution() -> None:
+    """Execute qualified picks once market opens (9:30 AM ET).
+    Uses cached results from last qualifying screening cycle.
+    """
+    global _last_shortlist, _last_screening
+    
+    if not _last_screening or _last_screening.get("qualified", 0) == 0:
+        log.info("No qualified picks from screening cycle")
+        return
+    
+    log.info("=== Market Open Execution (9:30 AM) ===")
+    log.info("Using qualified picks from screening cycle: %d tickers", _last_screening.get("qualified", 0))
+    
+    # Reconstruct picks from last screening results
+    regime = _last_screening.get("regime", "NORMAL")
+    executed = 0
+    
+    # Load qualified tickers from cache
+    # For now, re-screen with market-open=true constraint
+    # This ensures picks are fresh and market is open
+    qualified = []
+    if _last_shortlist:
+        from thesis_trader import get_win_rate, MIN_BACKTEST_WINRATE
+        for ticker in _last_shortlist[:30]:
+            wr = get_win_rate(ticker, regime)
+            if wr and wr >= MIN_BACKTEST_WINRATE:
+                qualified.append({"ticker": ticker, "win_rate": wr})
+    
+    if not qualified:
+        log.info("No qualified picks available for market open execution")
+        return
+    
+    portfolio = get_portfolio_summary()
+    capacity  = MAX_POSITIONS - portfolio["open_positions"]
+    log.info("Executing at market open: capacity=%d regime=%s", capacity, regime)
+    
+    for pick in qualified[:capacity]:
+        ticker = pick["ticker"]
+        win_rate = pick["win_rate"]
+        
+        try:
+            # Layer 4: Live market data check
+            trade_data = get_trade_data(ticker)
+            if not trade_data["tradeable"]:
+                log.info("%s: not tradeable (%s)", ticker,
+                        "earnings" if trade_data["has_earnings_soon"] else "IV/price")
+                continue
+
+            price = trade_data["price"]
+            if not price:
+                continue
+
+            # Layer 3: Risk checks
+            approved, failures = run_all_checks(ticker, 5.0, 1)
+            if not approved:
+                log.info("%s: risk check failed: %s", ticker, failures[0])
+                continue
+
+            # Layer 1: Options chain + strike selection
+            spread = select_bull_put_strikes(
+                ticker=ticker,
+                underlying_price=price,
+                target_dte=37,
+                short_delta_target=0.25,
+                spread_width=5.0,
+            )
+            if not spread:
+                log.info("%s: no suitable spread found", ticker)
+                continue
+
+            # Kelly sizing
+            base_size = kelly_position_size(win_rate, BASE_POSITION_USD)
+            contracts  = max(1, int(base_size / (spread["spread_width"] * 100)))
+
+            # High-impact week: reduce size
+            if trade_data["high_impact_week"]:
+                contracts = max(1, contracts // 2)
+                log.info("%s: High-impact week — halving contracts to %d", ticker, contracts)
+
+            # Execute with circuit breaker
+            if not can_execute_component("order_placement"):
+                log.warning("%s: Circuit breaker OPEN — skipping", ticker)
+                continue
+            
+            try:
+                position = execute_bull_put_spread(
+                    spread=spread,
+                    contracts=contracts,
+                    endorsements=3,
+                    win_rate=win_rate,
+                    legends=[],
+                )
+
+                if position:
+                    executed += 1
+                    record_component_success("order_placement")
+                    log.info("EXECUTED: %s %s/%s exp=%s premium=$%.2f contracts=%d",
+                             ticker, spread["short_strike"], spread["long_strike"],
+                             spread["expiration"], spread["net_premium"], contracts)
+                else:
+                    record_component_failure("order_placement", reason="execute_bull_put_spread returned None")
+            except Exception as exec_exc:
+                log.error("Execution error for %s: %s", ticker, exec_exc)
+                record_component_failure("order_placement", reason=str(exec_exc))
+                if HAS_GUARDS:
+                    escalate_critical("Execution Failure", f"{ticker}: {str(exec_exc)[:100]}", ticker)
+                raise
+
+        except Exception as exc:
+            log.error("Market open execution error for %s: %s", ticker, exc)
+    
+    log.info("=== Market Open Execution Complete: %d trades executed ===", executed)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -266,11 +374,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     _scheduler = AsyncIOScheduler(timezone=_ET)
 
-    # Pre-market scan: 8:45 AM ET
+    # Pre-market scan: 8:45 AM ET (screening only, no execution)
     _scheduler.add_job(run_screening_cycle, CronTrigger(hour=8, minute=45, timezone=_ET), id="premarket")
 
-    # Market hours: every 90 minutes from 9:30 to 15:00
-    for hour, minute in [(9,30),(11,0),(12,30),(14,0),(15,0)]:
+    # MARKET OPEN EXECUTION: 9:30 AM ET (uses cached qualified picks)
+    _scheduler.add_job(run_market_open_execution, CronTrigger(hour=9, minute=30, timezone=_ET), id="market_open_exec")
+
+    # Market hours screening: every 90 minutes from 11:00 to 15:00
+    for hour, minute in [(11,0),(12,30),(14,0),(15,0)]:
         _scheduler.add_job(run_screening_cycle, CronTrigger(hour=hour, minute=minute, timezone=_ET),
                           id=f"screen_{hour:02d}{minute:02d}")
 

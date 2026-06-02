@@ -1,0 +1,39 @@
+═══════════════════════════════════════════════════════════════════
+SWEEP REPORT — 2026-06-01 14:09 ET
+SOVEREIGN BLOCKER SWEEP
+═══════════════════════════════════════════════════════════════════
+
+BLOCKER #1 (RESOLVED): ATG Swing Service (Port 9006)
+  Root Cause: Duplicate process lock on port 9006 + database contention
+  Detection Time: 14:09 ET
+  Action: Killed ghost process (PID 96718), restarted main instance
+  Resolution Time: 14:10 ET (1 min)
+  Status: ✅ ONLINE
+
+BLOCKER #2 (ESCALATED): OMNI Synthesis (Port 8004)
+  Root Cause: Missing required environment secrets
+  Required Vars: NEXUS_WEBHOOK_SECRET, NEXUS_PRIME_SECRET, OMNI_SECRET,
+                 GEMINI_API_KEY, DEEPSEEK_API_KEY, AXIOM_URL, AXIOM_SECRET,
+                 ALPHA_EXECUTION_URL, PRIME_EXECUTION_URL, TELEGRAM_BOT_TOKEN,
+                 AHMED_CHAT_ID, OMNI_DB_PATH
+  Severity: P1 (Synthesis offline)
+  Detection Time: 14:09 ET
+  Action: Escalating to Ahmed for secret provisioning
+  Status: ⏳ AWAITING AHMED
+
+SERVICES VERIFIED:
+  ✓ Capital Router (8000)
+  ✓ Alpha-Buffer (8002)
+  ✗ OMNI (8004) — OFFLINE, SECRETS MISSING
+  ✓ Alpha Exec (8005)
+  ✓ Prime Exec (8006)
+  ✓ Oracle (8007)
+  ✓ Guardian (8009)
+  ✓ ATM Multi-Week (9004)
+  ✓ ATM 0DTE (9005)
+  ✓ ATG Swing (9006) — RECOVERED
+  ✓ ATG Intraday (9007)
+
+Sweep Duration: 1 minute
+Blockers Fixed: 1
+Blockers Pending: 1

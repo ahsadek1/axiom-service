@@ -1787,7 +1787,10 @@ def _run_synthesis(
 
     # ── Step 8: Route to execution ────────────────────────────────────────────
     execution_ok = None
-    if verdict.can_execute():
+    # MARKET HOURS GATE (2026-06-01): Only route if market is open
+    # Outside hours → synthesis completes but does not route to execution
+    # execution_ok stays None, which renders as "Not dispatched (market closed)"
+    if verdict.can_execute() and _is_market_hours():
         # Pass B fix #1: use system-appropriate secret for execution routing.
         # Alpha Execution expects X-Nexus-Secret = nexus_secret.
         # Prime Execution expects X-Nexus-Prime-Secret = nexus_prime_secret.
@@ -1889,6 +1892,11 @@ def _run_synthesis(
         )
 
     if verdict.verdict in ("GO", "STRONG_GO"):
+        # Determine dispatch reason if not dispatched
+        dispatch_reason = None
+        if execution_ok is None and verdict.can_execute() and not _is_market_hours():
+            dispatch_reason = "market_closed"
+        
         send_synthesis_card(
             bot_token          = settings.telegram_bot_token,
             chat_id            = settings.ahmed_chat_id,
@@ -1898,6 +1906,7 @@ def _run_synthesis(
             position_size      = position_size,
             execution_ok       = execution_ok,
             psychology_overlay = psychology_overlay,
+            not_dispatched_reason = dispatch_reason,
         )
     elif verdict.verdict == "CONDITIONAL":
         # CONDITIONAL = system degradation or borderline result. Alert Ahmed briefly.

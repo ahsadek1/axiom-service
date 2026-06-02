@@ -1075,17 +1075,42 @@ def sovereign_status(
 
 def _is_submissions_open() -> bool:
     """
-    Return True if current time is within the submission window (9:15 AM – 3:30 PM ET, Mon-Fri).
+    Return True if current time is within the submission window (9:15 AM – 3:30 PM ET, Mon-Fri)
+    AND position count is below the 3-position max.
 
     Returns:
         True if submissions are currently accepted.
     """
+    # Check market hours
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
     open_time  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return open_time <= now <= close_time
+    
+    if not (open_time <= now <= close_time):
+        return False
+    
+    # Check position count (CRITICAL FIX 2026-06-01 11:34 ET)
+    try:
+        import requests
+        ALPACA_KEY = os.getenv("ALPACA_KEY_ID", "PKPGM3BRNYPGCF5Z56IAUZCZJL")
+        ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs")
+        h = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+        r = requests.get("https://paper-api.alpaca.markets/v2/positions", headers=h, timeout=5)
+        if r.status_code == 200:
+            positions = r.json()
+            pos_count = len(positions) if isinstance(positions, list) else 0
+            # Gate: allow submissions only if <= 3 positions open (fail-closed)
+            if pos_count > 3:
+                logger.warning(f"Position gate CLOSED: {pos_count}/3 positions open")
+                return False
+    except Exception as e:
+        # On Alpaca connection error, FAIL CLOSED (block submissions)
+        logger.warning(f"Position count check failed: {e} — blocking submissions as safety measure")
+        return False
+    
+    return True
 
 @app.get("/trace")
 def trace_headers(request: Request) -> JSONResponse:

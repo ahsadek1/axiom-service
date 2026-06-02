@@ -57,6 +57,7 @@ def init_db(db_path: str) -> None:
                 long_alpaca_order_id  TEXT,
                 short_contract_symbol TEXT,   -- OCC symbol for short leg (adversarial fix #1/#4)
                 long_contract_symbol  TEXT,   -- OCC symbol for long leg  (adversarial fix #1/#4)
+                arena                 TEXT    DEFAULT 'alpha',  -- FIX #2: arena allocation tracking (alpha/prime)
                 status                TEXT    NOT NULL DEFAULT 'open',
                 partial_closed        INTEGER NOT NULL DEFAULT 0,
                 trailing_stop_pct     REAL,
@@ -92,11 +93,23 @@ def init_db(db_path: str) -> None:
                 conn.execute(f"ALTER TABLE positions ADD COLUMN {col}")
             except Exception:
                 pass  # Column already exists — safe to ignore
+        
+        # FIX #2: Add arena column for capital allocation tracking
+        try:
+            conn.execute("ALTER TABLE positions ADD COLUMN arena TEXT DEFAULT 'alpha'")
+        except Exception:
+            pass  # Column already exists — safe to ignore
 
         # Create the contract symbol index AFTER migration (columns now exist)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_positions_contract_symbols "
             "ON positions(short_contract_symbol, long_contract_symbol)"
+        )
+        
+        # FIX #2: Create arena index for capital router queries
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_positions_arena "
+            "ON positions(arena, status)"
         )
     logger.info("Alpha Execution database initialized at %s", db_path)
 
@@ -154,6 +167,7 @@ def reserve_position_slot(
     window_id:         str,
     agent_scores:      str,
     verdict:           str,
+    arena:             str = "alpha",  # FIX #2: arena field (alpha/prime)
 ) -> int:
     """
     Write a status='pending' placeholder record inside the position limit lock.
@@ -173,12 +187,12 @@ def reserve_position_slot(
                 ticker, direction, pathway, option_type,
                 short_strike, long_strike, expiration_date, dte_at_open,
                 contracts, position_size_usd, window_id, agent_scores, verdict,
-                status, opened_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                arena, status, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
             (ticker, direction, pathway, option_type,
              short_strike, long_strike, expiration_date, dte_at_open,
-             contracts, position_size_usd, window_id, agent_scores, verdict, now),
+             contracts, position_size_usd, window_id, agent_scores, verdict, arena, now),
         )
         conn.commit()
         pending_id = cursor.lastrowid
@@ -390,8 +404,7 @@ def get_open_positions(db_path: str) -> list[dict]:
         # Modern active_positions_v2 table (equity + new orders)
         try:
             modern_rows = conn.execute(
-                "SELECT id, ticker, direction, status, alpaca_order_id, pathway, window_id, opened_at "
-                "FROM active_positions_v2 WHERE status IN ('pending', 'open') ORDER BY opened_at ASC"
+                "SELECT * FROM active_positions_v2 WHERE status IN ('pending', 'open') ORDER BY opened_at ASC"
             ).fetchall()
             modern_positions = [dict(r) for r in modern_rows]
         except Exception as e:
@@ -404,6 +417,40 @@ def get_open_positions(db_path: str) -> list[dict]:
         # Combine both lists, dedup by ticker+status
         combined = legacy_positions + modern_positions
         return combined
+
+
+def get_live_positions(db_path: str) -> list[dict]:
+    """Return only OPEN positions (for exit evaluation, not confirmation polling).
+    
+    CRITICAL: Exit monitor should ONLY evaluate positions with status='open'.
+    Pending positions are awaiting fill confirmation and should NOT be evaluated
+    for exits. This prevents errors when accessing fields that only exist on
+    fully-filled positions.
+    
+    Introduced: 2026-06-01 as fix for exit-monitor crash when pending positions
+    accumulate (e.g. after a service restart where fill confirmations lag).
+    """
+    with get_conn(db_path) as conn:
+        # Legacy positions table (options) — only OPEN
+        legacy_rows = conn.execute(
+            "SELECT * FROM positions WHERE status='open' ORDER BY opened_at ASC"
+        ).fetchall()
+        legacy_positions = [dict(r) for r in legacy_rows]
+        
+        # Modern active_positions_v2 table (equity) — only OPEN
+        try:
+            modern_rows = conn.execute(
+                "SELECT * FROM active_positions_v2 WHERE status='open' ORDER BY opened_at ASC"
+            ).fetchall()
+            modern_positions = [dict(r) for r in modern_rows]
+        except Exception as e:
+            import logging
+            logging.getLogger("alpha_exec.database").warning(
+                f"Could not query active_positions_v2 (live only): {e}. Returning only legacy positions."
+            )
+            modern_positions = []
+        
+        return legacy_positions + modern_positions
 
 
 def get_position_by_id(db_path: str, position_id: int) -> Optional[dict]:

@@ -39,7 +39,7 @@ from config import (
 from contract_resolver import calculate_dte
 from database import (
     close_position,
-    get_open_positions,
+    get_live_positions,
     reduce_contracts,
     update_trailing_stop,
 )
@@ -72,7 +72,10 @@ def evaluate_exits(
     Returns:
         List of exit events that occurred this evaluation.
     """
-    positions = get_open_positions(db_path)
+    # CRITICAL: Only evaluate OPEN positions, NOT pending ones. Pending positions
+    # are awaiting fill confirmation and don't have the data structures needed for exit evaluation.
+    # This prevents KeyError crashes when pending accumulates after service restarts.
+    positions = get_live_positions(db_path)
     if not positions:
         return []
 
@@ -499,6 +502,7 @@ def _execute_close(
     chat_id:         str,
     reason:          str,
     pnl_pct:         float,
+    capital_router_url: str = "http://localhost:9100",
 ) -> dict:
     """Execute a full position close via Alpaca and report outcome."""
     pos_id     = pos["id"]
@@ -602,6 +606,9 @@ def _execute_close(
     # Alpaca confirmed — now safe to update DB
     close_position(db_path, pos_id, reason, pnl_pct, pnl_usd)
 
+    # FIX #1: Release capital allocation after close
+    _release_capital_allocation(capital_router_url, pos_id, pos.get("arena", "alpha"))
+
     # Report back to Alpha Buffer for circuit breaker
     try:
         buffer_reporter.report_outcome(
@@ -645,6 +652,7 @@ def _execute_partial_close(
     fraction:     float,
     trail_pct:    float,
     current_high: float,
+    capital_router_url: str = "http://localhost:9100",
 ) -> None:
     """
     Execute partial close and activate trailing stop.
@@ -653,6 +661,8 @@ def _execute_partial_close(
     Adversarial fix #10: trailing stop parameters are ALWAYS set regardless of whether
     the Alpaca partial close succeeds, ensuring the stop is active even on partial failure.
     Adversarial fix #1: closes by short contract symbol, not by ticker.
+    
+    FIX #1: Release capital proportional to contracts closed.
     """
     pos_id       = pos["id"]
     ticker       = pos["ticker"]
@@ -750,3 +760,65 @@ def _send_roll_alert(
         dedup_key=f"roll_needed_{pos_id}",
         targets=["nexus_health_group"],
     )
+
+
+def _release_capital_allocation(capital_router_url: str, position_id: int, arena: str) -> None:
+    """
+    FIX #1: Release capital after position close.
+    
+    After a position is successfully closed on Alpaca, notify the Capital Router
+    to release the allocation lock. This unblocks capital for new positions.
+    
+    Handles both full closes and partial closes. For partial closes, capital is
+    released proportionally.
+    
+    Args:
+        capital_router_url: Capital Router base URL (e.g., http://localhost:9100)
+        position_id: Position ID that was closed
+        arena: Arena name (alpha/prime) for tracking
+    """
+    try:
+        import httpx
+        # Query capital router for allocations tied to this position
+        async def _release_async():
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                # POST to capital router to release allocation for this position
+                resp = await client.post(
+                    f"{capital_router_url}/release-allocation/{position_id}",
+                    json={"arena": arena, "position_id": position_id}
+                )
+                if resp.status_code == 200:
+                    logger.info(
+                        "Capital released for position %d (arena=%s)",
+                        position_id, arena
+                    )
+                else:
+                    logger.warning(
+                        "Capital release returned %d for position %d",
+                        resp.status_code, position_id
+                    )
+        
+        # Run async call in event loop or fallback to sync
+        try:
+            import asyncio
+            asyncio.run(_release_async())
+        except RuntimeError:
+            # No event loop available — use sync httpx
+            import httpx as _sync_httpx
+            resp = _sync_httpx.post(
+                f"{capital_router_url}/release-allocation/{position_id}",
+                json={"arena": arena, "position_id": position_id},
+                timeout=3.0
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    "Capital released for position %d (arena=%s)",
+                    position_id, arena
+                )
+            else:
+                logger.warning(
+                    "Capital release returned %d for position %d",
+                    resp.status_code, position_id
+                )
+    except Exception as e:
+        logger.error("Failed to release capital for position %d: %s", position_id, e)

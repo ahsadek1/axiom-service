@@ -644,15 +644,20 @@ def _preflight_check() -> tuple[bool, str]:
 
 
 def _run_preflight_retry_loop() -> None:
-    """Block 2: Background thread — retry preflight every 30s until ACTIVE.
+    """Block 2: Background thread — retry preflight with exponential backoff on 429.
 
     Transitions _SERVICE_MODE from 'standby' to 'active' when all checks pass.
+    Respects Alpaca rate limit (429) with exponential backoff up to 5 minutes.
     Alerts Ahmed once on entering standby, once on exiting.
     """
     global _SERVICE_MODE, _standby_reason, _standby_alerted
     import time as _time
+    backoff_secs = 30  # start at 30s
+    max_backoff_secs = 300  # 5 minutes
+    rate_limit_hits = 0  # counter for consecutive 429s
+    
     while True:
-        _time.sleep(30)
+        _time.sleep(backoff_secs)
         with _state_lock:
             if _SERVICE_MODE == "active":
                 return  # already active — nothing to do
@@ -661,6 +666,8 @@ def _run_preflight_retry_loop() -> None:
             with _state_lock:
                 _SERVICE_MODE = "active"
                 _standby_reason = ""
+                backoff_secs = 30  # reset backoff on success
+                rate_limit_hits = 0
             logger.info("Block 2: Preflight PASSED — transitioning to ACTIVE mode")
             try:
                 from shared.notification_router import notify_info as _ni
@@ -669,6 +676,26 @@ def _run_preflight_retry_loop() -> None:
             except Exception:
                 pass
             return
+        else:
+            # Check if it's a 429 rate limit error
+            if "429" in reason or "rate limit" in reason.lower():
+                rate_limit_hits += 1
+                logger.warning(f"Preflight hit Alpaca 429 rate limit (hit #{rate_limit_hits}). Exponential backoff to {backoff_secs}s")
+                # Double backoff, cap at max
+                backoff_secs = min(backoff_secs * 2, max_backoff_secs)
+                if rate_limit_hits >= 3:
+                    logger.critical(f"Preflight 429 hit {rate_limit_hits} times. Escalating to SOVEREIGN.")
+                    try:
+                        from shared.sovereign_comms import report, EscalationLevel
+                        report("alpha-execution", "rate_limit_cascade",
+                               {"hits": rate_limit_hits, "reason": reason},
+                               escalation=EscalationLevel.CRITICAL)
+                    except Exception:
+                        pass
+            else:
+                # Reset counter and backoff for non-rate-limit errors
+                rate_limit_hits = 0
+                backoff_secs = 30
 
 
 _nns_watchdog = Watchdog("alpha-execution")
@@ -959,13 +986,16 @@ def _run_startup_reconciliation() -> None:
 
         closed_ids: list[str] = []
         for pos in all_db_positions:
-            pos_id        = pos["id"]
+            pos_id        = pos.get("id")  # Use .get() to avoid KeyError on V2 positions
+            if not pos_id:
+                logger.warning("Startup reconciliation: skipping position with no ID: %s", pos)
+                continue
             ticker        = (pos.get("ticker") or "").upper()
             window        = (pos.get("window_id") or "")
             status        = (pos.get("status") or "")
             short_sym     = (pos.get("short_contract_symbol") or "").upper()
             long_sym      = (pos.get("long_contract_symbol") or "").upper()
-            is_options_pos = bool(short_sym or long_sym)
+            is_options_pos = bool(short_sym or long_sym)  # V2 equity positions will have neither
 
             # Rule A: test window entries are NEVER production positions
             if "test" in window.lower():
@@ -1388,6 +1418,37 @@ def execute(
                 "reason":   "Execution paused — auto-heal in progress or manual resume required (/resume)",
             },
         )
+
+    # ── AXIOM POSITION GATE (2026-06-01) ───────────────────────────────────────
+    # Check Axiom's submissions_open flag before submitting to Alpha.
+    # Axiom closes the gate when position count >= 3 (Ahmed's max position limit).
+    # This is the PRIMARY enforcement point — Alpha must NOT bypass Axiom.
+    try:
+        import requests as _axiom_req
+        axiom_resp = _axiom_req.get("http://localhost:8001/health", timeout=3)
+        if axiom_resp.status_code == 200:
+            axiom_data = axiom_resp.json()
+            if axiom_data.get("submissions_open") is False:
+                logger.warning(
+                    f"Axiom position gate CLOSED — rejecting {body.ticker} (position limit reached)"
+                )
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "executed": False,
+                        "reason": "Axiom position gate CLOSED: max 3 positions reached",
+                    },
+                )
+    except Exception as e:
+        # On Axiom health check error, FAIL CLOSED (block submissions) as safety measure
+        logger.warning(f"Axiom health check failed ({e}) — blocking submission as safety measure")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "executed": False,
+                "reason": "Axiom gate check failed — system in safe mode",
+            },
+        )
     
     # ━━━━━ QUEUE WORKER FAST PATH (May 21 2026) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # All quick validation gates have passed. Enqueue order for async batch processing.
@@ -1691,21 +1752,30 @@ def execute(
     with _execute_lock:
         # V2 C1 fix: Alpaca live query is combined cap ground truth across all services.
         # Local DB count is secondary. If Alpaca unreachable: fail closed (block execution).
+        # 🔴 CRITICAL FIX (Jun 1 2026 11:20 ET): Gate must block when count >= limit, not just >
         try:
             from database import count_open_positions_alpaca
             alpaca_live_count = count_open_positions_alpaca(
                 settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
             )
+            # HARD STOP: If we're already AT the position limit, block new executions
+            # This is fail-closed: positions=3, limit=3 → BLOCK (do not execute)
             if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
-                logger.info(
-                    "Alpha execution blocked: Alpaca shows %d/%d live positions (combined cap)",
+                logger.critical(
+                    "🔴 POSITION GATE FIRED: Alpaca has %d/%d positions — NEW EXECUTION BLOCKED",
                     alpaca_live_count, MAX_CONCURRENT_POSITIONS
+                )
+                _report_exec_event(
+                    "execution_rejected", body.ticker, body.direction,
+                    reason=f"POSITION_CAP: {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} positions open",
+                    pathway=body.pathway or "",
+                    extra={"gate": "position_limit_reached", "alpaca_live_count": alpaca_live_count},
                 )
                 return JSONResponse(
                     status_code=429,
                     content={
                         "executed": False,
-                        "reason": f"POSITION_CAP: Alpaca shows {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open positions (combined across all services)",
+                        "reason": f"🔴 POSITION_CAP: Alpaca shows {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open positions (combined across all services). No new executions allowed until positions are closed.",
                     },
                 )
         except RuntimeError as _alpaca_err:
@@ -1939,6 +2009,25 @@ def execute(
                     _allocation_id = _gate_result.get("allocation_id")
                 except Exception as e:
                     logger.warning("Capital gate check failed: %s — continuing with caution", str(e))
+            
+            # 🔴 FINAL DEFENSIVE CHECK: Before order submission, verify position cap again
+            # This is a redundant safety check — if gate above passed, this should pass too
+            # But if anything slipped through, this is the last line of defense
+            try:
+                from database import count_open_positions_alpaca
+                _final_alpaca_count = count_open_positions_alpaca(
+                    settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
+                )
+                if _final_alpaca_count >= MAX_CONCURRENT_POSITIONS:
+                    logger.critical(
+                        "🔴 FINAL GATE CHECK FAILED before order submission: %d/%d positions — aborting order",
+                        _final_alpaca_count, MAX_CONCURRENT_POSITIONS
+                    )
+                    raise RuntimeError(f"Position cap breach detected ({_final_alpaca_count}/{MAX_CONCURRENT_POSITIONS}) — order submission aborted")
+            except RuntimeError:
+                raise  # Re-raise to be caught by outer exception handler
+            except Exception as _final_check_err:
+                logger.warning("Final position check failed: %s — allowing submission with caution", _final_check_err)
             
             order = alpaca.place_spread_order(
                 legs             = legs,

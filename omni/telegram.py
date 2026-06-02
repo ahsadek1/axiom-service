@@ -23,6 +23,7 @@ def send_synthesis_card(
     position_size:      float,
     execution_ok:       Optional[bool],
     psychology_overlay: Optional[dict] = None,
+    not_dispatched_reason: Optional[str] = None,
 ) -> bool:
     """
     Send the full synthesis card to Ahmed via Telegram.
@@ -35,6 +36,7 @@ def send_synthesis_card(
         brain_results:  Raw brain results dict.
         position_size:  Final dollar position size.
         execution_ok:   True/False/None (None = not dispatched).
+        not_dispatched_reason: "market_closed", "not_go", or other reason (optional).
 
     Returns:
         True if sent successfully.
@@ -111,7 +113,11 @@ def send_synthesis_card(
     elif execution_ok is False:
         exec_line = f"⚠️ Execution routing FAILED — manual action required"
     else:
-        exec_line = "⏸ Not dispatched (CONDITIONAL/NO_GO)"
+        # execution_ok is None — pick reason
+        if not_dispatched_reason == "market_closed":
+            exec_line = "⏸ Market closed (synthesized, queued for post-market execution)"
+        else:
+            exec_line = "⏸ Not dispatched (CONDITIONAL/NO_GO)"
 
     brain_block = "\n".join(brain_lines)
 

@@ -69,3 +69,10 @@
 2026-05-31 19:26:51,879 [INFO] command_relay: Command Relay shutting down
 2026-05-31 19:27:35,337 [INFO] command_relay: command_relay: bus poll loop started
 2026-05-31 19:27:35,337 [INFO] command_relay: Command Relay started — bus polling active
+2026-06-01 12:08:33,377 [INFO] command_relay: command_relay: bus poll loop started
+2026-06-01 12:08:33,407 [INFO] command_relay: Command Relay started — bus polling active
+2026-06-01 12:11:28,963 [INFO] command_relay: command_relay: bus poll loop started
+2026-06-01 12:11:28,965 [INFO] command_relay: Command Relay started — bus polling active
+2026-06-01 14:09:30,376 [INFO] command_relay: command_relay: bus poll loop started
+2026-06-01 14:09:30,380 [INFO] command_relay: Command Relay started — bus polling active
+2026-06-01 16:13:32,650 [INFO] command_relay: Command Relay shutting down

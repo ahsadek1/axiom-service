@@ -188,7 +188,7 @@ async def lifespan(app: FastAPI):
     global _telegram_bot, _polling_task
 
     # ---- Schema migration
-    db_path = os.getenv("CHRONICLE_DB_PATH", "/Users/ahs/.openclaw/chronicle/chronicle.db")
+    db_path = os.getenv("CHRONICLE_DB_PATH", "/Users/ahmedsadek/nexus/data/chronicle.db")
     run_migration(db_path)
 
     # ---- Clients
@@ -363,7 +363,7 @@ async def health() -> HealthResponse:
     context_table_ok = False
     events_table_ok = False
 
-    db_path = os.getenv("CHRONICLE_DB_PATH", "/Users/ahs/.openclaw/chronicle/chronicle.db")
+    db_path = os.getenv("CHRONICLE_DB_PATH", "/Users/ahmedsadek/nexus/data/chronicle.db")
 
     if _chronicle is not None:
         try:
