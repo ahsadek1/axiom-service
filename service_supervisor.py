@@ -34,8 +34,8 @@ SERVICES = {
     "alpha-execution": {
         "command": ["python3", "/Users/ahmedsadek/nexus/alpha-execution/main.py"],
         "cwd": "/Users/ahmedsadek/nexus/alpha-execution",
-        "health_url": "http://localhost:8005/health",
-        "port": 8005,
+        "health_url": "http://localhost:5001/health",
+        "port": 5001,
         "process": None,
         "last_restart": None,
         "restart_count": 0,

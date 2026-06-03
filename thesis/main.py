@@ -56,6 +56,7 @@ from thesis_engine import ThesisEngine
 from layers.weekly import WeeklyThesisGenerator
 from layers.daily import DailyBriefGenerator
 from layers.monitor import RealTimeMonitor
+from thesis_cron_config import apply_monitoring_configuration
 
 load_dotenv()
 
@@ -277,6 +278,20 @@ async def lifespan(app: FastAPI):
         id="layer3_monitor",
         replace_existing=True,
     )
+
+    # MAXIMUS: Autonomous monitoring, self-healing, status reporting
+    maximus_success = apply_monitoring_configuration(
+        scheduler=_scheduler,
+        alpaca_key=os.getenv("ALPACA_KEY", ""),
+        alpaca_secret=os.getenv("ALPACA_SECRET", ""),
+        telegram_token=os.getenv("AXIOM_BOT_TOKEN", ""),
+    )
+    if not maximus_success:
+        logger.warning(
+            "MAXIMUS monitoring configuration failed — continuing without autonomous monitoring"
+        )
+    else:
+        logger.info("✅ MAXIMUS monitoring jobs configured")
 
     _scheduler.start()
     logger.info("THESIS service started on port %s", os.getenv("THESIS_PORT", "8060"))

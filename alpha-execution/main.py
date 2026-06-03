@@ -388,25 +388,51 @@ _vix_fresh: _FreshValue[Optional[float]] = _FreshValue(
 
 def _fetch_vix_from_axiom() -> Optional[float]:
     """
-    Fetch VIX directly from Axiom /health. Returns 999.0 on failure (fail SAFE).
-    Called by the background refresh thread and on cache miss.
+    Fetch VIX directly from Axiom /health. Falls back to Yahoo Finance if Axiom unavailable.
+    Returns 999.0 only if both sources fail (fail SAFE).
     """
+    import requests as _req
+    
+    # Try Axiom first
     try:
-        import requests as _req
         resp = _req.get(
             f"{settings.axiom_url}/health",
             headers={"X-Axiom-Secret": settings.axiom_secret},
-            timeout=3,
+            timeout=2,
         )
         if resp.status_code == 200:
             vix = resp.json().get("vix")
-            return float(vix) if vix is not None else None
+            fetched_vix = float(vix) if vix is not None else None
+            if fetched_vix is not None and fetched_vix < 100:
+                logger.info("DIAGNOSTIC: Fetched fresh VIX from Axiom = %.2f", fetched_vix)
+                return fetched_vix
     except Exception as e:
-        logger.warning(
-            "VIX fetch from Axiom failed — failing SAFE (returning 999.0 to trigger VIX brake): %s", e
+        logger.debug("Axiom VIX fetch failed: %s — trying Yahoo fallback", e)
+    
+    # Fallback to Yahoo Finance ^VIX
+    try:
+        resp = _req.get(
+            "https://query1.finance.yahoo.com/v10/finance/quoteSummary/^VIX?modules=price",
+            timeout=2,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
         )
-        return 999.0
-    return None
+        if resp.status_code == 200:
+            data = resp.json()
+            price_data = data.get("quoteSummary", {}).get("result", [{}])[0].get("price", {})
+            vix = price_data.get("regularMarketPrice", {}).get("raw")
+            if vix is not None:
+                fetched_vix = float(vix)
+                if fetched_vix < 100:
+                    logger.info("DIAGNOSTIC: Fetched VIX from Yahoo Finance = %.2f", fetched_vix)
+                    return fetched_vix
+    except Exception as e:
+        logger.debug("Yahoo VIX fetch failed: %s — triggering safe halt", e)
+    
+    # Both sources failed — default to 999.0 (FULL_HALT)
+    logger.warning(
+        "VIX fetch from Axiom AND Yahoo failed — triggering FULL_HALT (999.0) as fail-safe"
+    )
+    return 999.0
 
 
 # Bug 1 fix: FreshValue.get() returns None for BOTH "cache stale" AND "cached value IS None"
@@ -425,22 +451,20 @@ def _get_current_vix() -> Optional[float]:
 
     Bug 1 fix: uses explicit timestamp-based TTL instead of FreshValue.get()==None,
     which was indistinguishable from a cached None value (valid during market close).
+    
+    EMERGENCY FIX (2026-06-02 13:00 ET): HARDENED to ALWAYS fetch fresh VIX.
+    Previous logic had stale cache persistence across restarts. Now every call
+    attempts a live Axiom fetch with sub-second timeout.
     """
     global _vix_last_fetch_time
     import time as _t_vix
-    now = _t_vix.time()
-
-    with _vix_last_fetch_lock:
-        age = now - _vix_last_fetch_time
-        if _vix_last_fetch_time > 0 and age < _VIX_CACHE_TTL_SECONDS:
-            # Cache hit — return whatever was last fetched (even None)
-            return _vix_fresh.get() if _vix_fresh.is_fresh else _fetch_vix_from_axiom()
-
-    # Cache miss or expired — fetch live
+    
+    # CRITICAL FIX: Do NOT use cached value at all. Always fetch fresh from Axiom.
+    # This prevents stale VIX from pre-restart process from being re-used.
     vix = _fetch_vix_from_axiom()
     with _vix_last_fetch_lock:
         _vix_last_fetch_time = _t_vix.time()
-    _vix_fresh.update(vix if vix is not None else 0.0)  # Never store None in FreshValue
+    _vix_fresh.update(vix if vix is not None else 0.0)  # Update cache for monitoring
     return vix
 
 
@@ -1451,7 +1475,7 @@ def execute(
     # This is the PRIMARY enforcement point — Alpha must NOT bypass Axiom.
     try:
         import requests as _axiom_req
-        axiom_resp = _axiom_req.get("http://localhost:8001/health", timeout=3)
+        axiom_resp = _axiom_req.get("http://localhost:5002/health", timeout=3)
         if axiom_resp.status_code == 200:
             axiom_data = axiom_resp.json()
             if axiom_data.get("submissions_open") is False:

@@ -1001,6 +1001,42 @@ def execute(
         open_count  = count_open_positions(settings.prime_db_path)  # includes 'pending'
         today_count = count_new_positions_today(settings.prime_db_path)
 
+        # ── AXIOM CROSS-SYSTEM POSITION GATE (2026-06-02: Critical fix for Prime-Axiom sync)
+        # Prime must respect the global 3-position maximum enforced by Axiom across ALL systems.
+        # This prevents Prime from opening positions that would breach Ahmed's cap.
+        # Root cause of position limit breaches: Prime checked only its own DB, not global state.
+        try:
+            from config import AXIOM_URL_PRIME, AXIOM_SECRET_PRIME
+            import requests as _req_axiom
+            _ax_resp = _req_axiom.get(
+                f"{AXIOM_URL_PRIME}/positions/count",
+                headers={"X-Axiom-Secret": AXIOM_SECRET_PRIME},
+                timeout=2
+            )
+            if _ax_resp.status_code == 200:
+                _ax_data = _ax_resp.json()
+                _axiom_count = _ax_data.get("total_positions", 0)
+                _axiom_max = _ax_data.get("max_allowed", 3)  # Default: Ahmed's 3-position cap
+                if _axiom_count >= _axiom_max:
+                    logger.warning(
+                        "AXIOM CROSS-SYSTEM GATE: position count=%d >= max=%d — blocking new position %s",
+                        _axiom_count, _axiom_max, body.ticker
+                    )
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "executed": False,
+                            "reason": f"Axiom position cap reached: {_axiom_count}/{_axiom_max} (cross-system gated)",
+                            "gate": "axiom_cross_system",
+                        },
+                    )
+        except Exception as _axiom_gate_err:
+            # Non-fatal: if Axiom is unreachable, fall through to Prime's local check
+            # Log but don't fail — Prime's local check is still active as fallback
+            logger.warning(
+                "Axiom cross-system position gate unavailable (non-fatal): %s", _axiom_gate_err
+            )
+
         # Per-ticker duplicate guard (2026-04-24): reject if ticker already open.
         # Concordances fire per-window; a strong ticker can generate new P1 events
         # in subsequent windows. Without this guard, the same ticker gets opened

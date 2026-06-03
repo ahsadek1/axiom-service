@@ -40,7 +40,7 @@ SINGLE_SERVICE_THRASH_THRESHOLD: int = 3   # same service ≥3 restarts = P1 thr
 
 # Services to monitor (all local Nexus services)
 MONITORED_SERVICES: Dict[str, str] = {
-    "alpha-execution":  "http://localhost:8005/health",
+    "alpha-execution":  "http://localhost:5001/health",
     "prime-execution":  "http://localhost:8006/health",
     "omni":             "http://localhost:8004/health",
     "axiom":            "http://localhost:8001/health",

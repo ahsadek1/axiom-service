@@ -34,6 +34,7 @@ class AlpacaClient:
     def __init__(self, api_key: str, secret_key: str) -> None:
         self.api_key    = api_key
         self.secret_key = secret_key
+        self.base_url   = ALPACA_PAPER_URL  # Add base_url for position gate checks
         self._headers   = {
             "APCA-API-KEY-ID":     api_key,
             "APCA-API-SECRET-KEY": secret_key,

@@ -19,8 +19,11 @@ VOTES_REQUIRED_GO         = 2   # 2/4 brains GO → GO (pathway size)
 # Root cause: Claude API was hitting 120s+ read timeouts under load, blocking quad synthesis pool.
 # Impact: 8 execution failures in 60 min (all "unconfirmed: no confirmation after 30s").
 # Fix: 45s timeout per brain + allow synthesis with 2/4 brains responding (graceful degradation).
-BRAIN_TIMEOUT_SECONDS     = 45   # reduced from 120s. Per-brain timeout; synthesis waits max 45s per brain.
-BRAIN_RETRY_COUNT         = 0    # no retry on timeout — timeout = error result, not delay loop
+# FIX 2026-06-02 14:30 ET: Increased timeout to 60s due to API degradation across Anthropic + Gemini.
+# Recent synthesis errors: 11 timeout/connection errors in 30 min.
+# Action: Give APIs 60s instead of 45s + add 1 retry for transient failures.
+BRAIN_TIMEOUT_SECONDS     = 60   # increased from 45s to account for provider-side latency
+BRAIN_RETRY_COUNT         = 1    # 1 retry on timeout/transient error (changed from 0)
 MIN_BRAINS_REQUIRED       = 2    # 2+ brains required for synthesis (was enforcing all 4). Enables cascade resilience.
 
 # P3/P4 require minimum 3/4 brains GO to execute (higher bar for solo/OMNI-initiated)

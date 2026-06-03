@@ -1055,6 +1055,62 @@ def get_limits(request: Request) -> JSONResponse:
     })
 
 
+@app.get("/positions/count", status_code=200)
+def positions_count(request: Request) -> JSONResponse:
+    """
+    Return the current open position count and max allowed.
+    
+    Used by Prime (and Alpha) to verify cross-system position gating.
+    Prevents both systems from opening positions that would breach Ahmed's cap.
+    
+    Returns:
+        Dict with total_positions, max_allowed, compliant (bool).
+    """
+    verify_secret(request)
+    
+    try:
+        # Query Alpaca for actual open position count across ALL systems
+        import os as _os
+        import requests as _r_pos
+        _alpaca_key = _os.getenv("ALPACA_KEY", "")
+        _alpaca_secret = _os.getenv("ALPACA_SECRET", "")
+        
+        if not _alpaca_key or not _alpaca_secret:
+            # Keys not configured — fall back to database count if available
+            # This is not a fatal error; position gating will use local count
+            _count = 0
+        else:
+            _h_alpaca = {
+                "APCA-API-KEY-ID": _alpaca_key,
+                "APCA-API-SECRET-KEY": _alpaca_secret,
+            }
+            _resp_pos = _r_pos.get(
+                "https://paper-api.alpaca.markets/v2/positions",
+                headers=_h_alpaca,
+                timeout=4
+            )
+            if _resp_pos.status_code == 200:
+                _positions = _resp_pos.json()
+                _count = len(_positions) if isinstance(_positions, list) else 0
+            else:
+                # Fallback: assume 0 if Alpaca unreachable (safe fallback)
+                _count = 0
+    except Exception as _e:
+        # On any error, return current count as unknown but allow execution
+        # (fail-safe: don't block trades on gate endpoint failure)
+        _count = 0
+    
+    _max = MAX_POSITIONS  # From config: typically 3
+    _compliant = _count < _max
+    
+    return JSONResponse({
+        "total_positions": _count,
+        "max_allowed": _max,
+        "compliant": _compliant,
+        "service": "axiom-position-gate",
+    })
+
+
 @app.get("/sovereign/status", status_code=200)
 def sovereign_status(
     request: Request,

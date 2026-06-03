@@ -17,11 +17,14 @@ With ≥ 3 brains responding, synthesis proceeds. Fewer → CONDITIONAL automati
 import json
 import logging
 import time
+import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import (
     ALL_BRAINS,
@@ -34,13 +37,34 @@ from config import (
     BRAIN_RETRY_COUNT,
 )
 
+# GENESIS FIX 2026-06-02: Socket-level timeout adapter to prevent hung connections
+# Prevents brain API calls from blocking indefinitely on stalled TCP connections
+class TimeoutHTTPAdapter(HTTPAdapter):
+    """HTTP adapter with socket-level timeout."""
+    def __init__(self, timeout, *args, **kwargs):
+        self.timeout = timeout
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        kwargs['timeout'] = self.timeout
+        return super().send(request, **kwargs)
+
+
+def _create_timeout_session(timeout_sec: int = BRAIN_TIMEOUT_SECONDS):
+    """Create a requests.Session with socket timeout on both connect and read."""
+    sess = requests.Session()
+    adapter = TimeoutHTTPAdapter(timeout=(5, timeout_sec))  # connect_timeout, read_timeout
+    sess.mount('http://', adapter)
+    sess.mount('https://', adapter)
+    return sess
+
 # ── Brain Health Cache ────────────────────────────────────────────────────────
 # Cached health status for each brain. Reset on new synthesis cycle.
 # Key: brain_name, Value: dict with 'healthy': bool, 'checked_at': float
 _brain_health_cache: dict[str, dict] = {}
 _BRAIN_HEALTH_CACHE_TTL = 120  # seconds — recheck every 2 min during market hours
 
-_BRAIN_PING_TIMEOUT = 3.0  # seconds for health ping
+_BRAIN_PING_TIMEOUT = 15.0  # seconds for health ping. Gemini 2.5-flash under load: ~10s. Increased 2026-06-02 post-PRIMUS alert.
 
 # GPT-4o is the fallback when Gemini is unresponsive.
 # It takes the Gemini PATTERN role when Gemini fails the health check.
@@ -435,42 +459,55 @@ def _dispatch_api(brain_name: str, prompt: str, api_key: str) -> str:
 
 
 def _call_anthropic(prompt: str, api_key: str) -> str:
-    """Call Claude claude-sonnet-4-6 via Anthropic Messages API."""
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key":         api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type":      "application/json",
-        },
-        json={
-            "model":      "claude-sonnet-4-6",
-            "max_tokens": 1000,
-            "messages":   [{"role": "user", "content": prompt}],
-        },
-        timeout=BRAIN_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    return resp.json()["content"][0]["text"]
+    """Call Claude claude-sonnet-4-6 via Anthropic Messages API.
+    
+    GENESIS FIX 2026-06-02: Use timeout session with socket-level timeout
+    to prevent hung connections from blocking indefinitely.
+    """
+    sess = _create_timeout_session(BRAIN_TIMEOUT_SECONDS)
+    try:
+        resp = sess.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-sonnet-4-6",
+                "max_tokens": 1000,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"]
+    finally:
+        sess.close()
 
 
 def _call_openai(prompt: str, api_key: str) -> str:
-    """Call o3-mini via OpenAI Chat Completions API."""
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-        },
-        json={
-            "model":                 "o3-mini",
-            "messages":              [{"role": "user", "content": prompt}],
-            "max_completion_tokens": 2000,
-        },
-        timeout=BRAIN_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    """Call o3-mini via OpenAI Chat Completions API.
+    
+    GENESIS FIX 2026-06-02: Use timeout session with socket-level timeout.
+    """
+    sess = _create_timeout_session(BRAIN_TIMEOUT_SECONDS)
+    try:
+        resp = sess.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":                 "o3-mini",
+                "messages":              [{"role": "user", "content": prompt}],
+                "max_completion_tokens": 2000,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    finally:
+        sess.close()
 
 
 def _call_gemini(prompt: str, api_key: str) -> str:
@@ -483,30 +520,27 @@ def _call_gemini(prompt: str, api_key: str) -> str:
     JSON vote this brain delivers (500-char output, deterministic format).
     Cipher Finding 9 (Pro required for reasoning depth) does not apply to
     this structured voting use case — it applies to open-ended synthesis.
+    
+    GENESIS FIX 2026-06-02: Use timeout session with socket-level timeout.
     """
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
-        headers={"Content-Type": "application/json"},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": 4096,
-                "temperature": 0.2,
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
-            # GENESIS FIX 2026-04-30: thinkingBudget=0 disables Gemini 2.5-flash's internal
-            # thinking phase. Without this, the model consumes thinking tokens that eat into
-            # the maxOutputTokens budget, causing JSON truncation ("Unterminated string" errors).
-            # Also bumped maxOutputTokens from 2048→4096 as safety margin.
-            # Verified working: 940ms response, 0 thoughtTokens.
-        },
-        timeout=BRAIN_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    # Parse response defensively — Gemini 2.5 Flash (thinking model) may include
-    # thought blocks before the text response. Filter to actual text parts only.
-    # Handle missing/empty/malformed content gracefully.
+    sess = _create_timeout_session(BRAIN_TIMEOUT_SECONDS)
     try:
+        resp = sess.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 4096,
+                    "temperature": 0.2,
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
+            },
+        )
+        resp.raise_for_status()
+        # Parse response defensively — Gemini 2.5 Flash (thinking model) may include
+        # thought blocks before the text response. Filter to actual text parts only.
+        # Handle missing/empty/malformed content gracefully.
         data = resp.json()
         candidates = data.get("candidates", [])
         if not candidates:
@@ -530,6 +564,11 @@ def _call_gemini(prompt: str, api_key: str) -> str:
     except (KeyError, IndexError, TypeError, AttributeError) as e:
         logger.warning("Gemini response parsing error: %s | Response: %s", e, resp.text[:300])
         return ""
+    except Exception as e:
+        logger.warning("Gemini API error: %s", e)
+        raise
+    finally:
+        sess.close()
 
 
 def _call_gpt4o_pattern(prompt: str, api_key: str) -> str:
@@ -538,43 +577,54 @@ def _call_gpt4o_pattern(prompt: str, api_key: str) -> str:
     FIX-GEMINI-HEALTH (2026-05-04): Used when Gemini is unresponsive.
     GPT-4o is fully capable of the structured JSON vote format.
     Uses gpt-4o (not o3-mini) to keep the adversarial brain (o3-mini) distinct.
+    
+    GENESIS FIX 2026-06-02: Use timeout session with socket-level timeout.
     """
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-        },
-        json={
-            "model":      "gpt-4o",
-            "messages":   [{"role": "user", "content": prompt}],
-            "max_tokens": 1000,
-            "temperature": 0.2,
-        },
-        timeout=BRAIN_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    sess = _create_timeout_session(BRAIN_TIMEOUT_SECONDS)
+    try:
+        resp = sess.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":      "gpt-4o",
+                "messages":   [{"role": "user", "content": prompt}],
+                "max_tokens": 1000,
+                "temperature": 0.2,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    finally:
+        sess.close()
 
 
 def _call_deepseek(prompt: str, api_key: str) -> str:
-    """Call DeepSeek V3 via DeepSeek Chat Completions API (OpenAI-compatible)."""
-    resp = requests.post(
-        "https://api.deepseek.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-        },
-        json={
-            "model":       "deepseek-chat",
-            "messages":    [{"role": "user", "content": prompt}],
-            "max_tokens":  1000,
-            "temperature": 0.2,
-        },
-        timeout=BRAIN_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    """Call DeepSeek V3 via DeepSeek Chat Completions API (OpenAI-compatible).
+    
+    GENESIS FIX 2026-06-02: Use timeout session with socket-level timeout.
+    """
+    sess = _create_timeout_session(BRAIN_TIMEOUT_SECONDS)
+    try:
+        resp = sess.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       "deepseek-chat",
+                "messages":    [{"role": "user", "content": prompt}],
+                "max_tokens":  1000,
+                "temperature": 0.2,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    finally:
+        sess.close()
 
 
 def _parse_brain_response(raw_text: str, brain_name: str) -> dict:

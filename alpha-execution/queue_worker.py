@@ -373,6 +373,33 @@ class QueueWorker(threading.Thread):
                 queue_id, ticker, direction, verdict, window_id, score, pathway, pos_size, size_mult = row
                 
                 try:
+                    # ━━━━━ POSITION GATE CHECK (ATOMIC) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # CRITICAL FIX 2026-06-02 10:41 ET: Check position count BEFORE EACH order
+                    # not just at batch start. Prevents race condition where multiple orders
+                    # execute simultaneously, breaching position cap (3 max).
+                    try:
+                        from database import count_open_positions_alpaca
+                        from config import MAX_CONCURRENT_POSITIONS
+                        alpaca_live_count = count_open_positions_alpaca(
+                            self.alpaca_client.base_url,
+                            getattr(self.alpaca_client, '_session', None).headers.get('APCA-API-KEY-ID', ''),
+                            getattr(self.alpaca_client, '_session', None).headers.get('APCA-API-SECRET-KEY', '')
+                        )
+                        if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
+                            self.logger.critical(
+                                f"Queue {queue_id}: POSITION GATE FIRED — Alpaca has {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} "
+                                f"positions. Skipping {ticker} {direction} to prevent breach."
+                            )
+                            cursor.execute(
+                                "UPDATE execution_queue SET status = 'position_cap_reached', error = ? WHERE id = ?",
+                                (f"Position cap ({alpaca_live_count}/{MAX_CONCURRENT_POSITIONS}) reached at submission time", queue_id)
+                            )
+                            conn.commit()
+                            continue  # Skip this order, try next one
+                    except Exception as pos_check_err:
+                        self.logger.error(f"Queue {queue_id}: Position count check failed: {pos_check_err}")
+                        # Don't block; continue with submission. Better to breach than deadlock.
+                    
                     # ━━━━━ VALIDATION: Skip excluded/delisted tickers ━━━━━━━━━━━━━━━━━━━━━━
                     if ticker in EXCLUDED_TICKERS:
                         self.logger.warning(

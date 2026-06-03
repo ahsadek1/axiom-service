@@ -193,25 +193,30 @@ class PoolHealthMonitor:
             self._escalate_to_sovereign(failure_reason)
 
     def _respawn_dead_workers(self) -> None:
-        """FIX-WORKER-LIFECYCLE: Respawn dead worker threads to maintain pool size.
-        Submits dummy no-op tasks to force ThreadPoolExecutor to spawn replacement threads.
+        """FIX-WORKER-LIFECYCLE 2026-06-02: Respawn dead worker threads.
+        
+        Critical fix: ThreadPoolExecutor does NOT spawn threads on-demand from pending work.
+        Threads are created at init time. Dead threads are PERMANENTLY dead until pool restart.
+        
+        Solution: Force pool shutdown + restart to reset all threads.
+        This is an emergency recovery mechanism — escalate to SOVEREIGN for restart if needed.
         """
         try:
-            def _worker_sentinel():
-                """Dummy task to keep worker thread alive. Simply returns."""
-                return "worker_alive"
-            
-            # Submit replacement tasks equal to number of dead workers
             live_workers = len([t for t in self.pool._threads if t.is_alive()])
             dead_count = self.pool._max_workers - live_workers
             
-            for i in range(dead_count):
-                future = self.pool.submit(_worker_sentinel)
-                logger.info("POOL HEALTH: Respawn #%d submitted", i + 1)
-            
-            logger.info("POOL HEALTH: %d replacement worker(s) enqueued", dead_count)
+            if dead_count > 0:
+                logger.critical(
+                    "POOL HEALTH: %d dead workers detected — ThreadPoolExecutor cannot respawn threads.",
+                    dead_count
+                )
+                logger.critical(
+                    "POOL HEALTH: Escalating to SOVEREIGN for service restart (only recovery method)."
+                )
+                # Escalate immediately instead of submitting futile sentinels
+                self._escalate_to_sovereign("worker_threads_dead_pool_restart_required")
         except Exception as e:
-            logger.error("POOL HEALTH: Failed to respawn workers: %s", e)
+            logger.error("POOL HEALTH: Failed to check/escalate dead workers: %s", e)
 
     def _escalate_to_sovereign(self, failure_reason: str) -> None:
         """Escalate pool failure to SOVEREIGN after max retries."""
