@@ -1475,7 +1475,7 @@ def execute(
     # This is the PRIMARY enforcement point — Alpha must NOT bypass Axiom.
     try:
         import requests as _axiom_req
-        axiom_resp = _axiom_req.get("http://localhost:5002/health", timeout=3)
+        axiom_resp = _axiom_req.get("http://localhost:8001/health", timeout=3)
         if axiom_resp.status_code == 200:
             axiom_data = axiom_resp.json()
             if axiom_data.get("submissions_open") is False:
