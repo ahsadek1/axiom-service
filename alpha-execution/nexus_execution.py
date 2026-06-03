@@ -58,17 +58,24 @@ class ExecutionResult:
 
 @contextmanager
 def get_db(db_path: str, isolation_level=None):
+    """DB context manager. Default isolation_level=None → autocommit. Set to 'IMMEDIATE' for transaction."""
     conn = sqlite3.connect(db_path, timeout=10, isolation_level=isolation_level)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
-        if isolation_level is not None:
+        # AUTO-COMMIT for isolation_level=None (SQLite default)
+        # For any other isolation level ("IMMEDIATE", etc), caller manages transaction
+        if isolation_level is not None and isolation_level != "":
+            # isolation_level="" was a hack — always require explicit semantics
             conn.commit()
     except Exception:
-        if isolation_level is not None:
-            conn.rollback()
+        if isolation_level is not None and isolation_level != "":
+            try:
+                conn.rollback()
+            except:
+                pass
         raise
     finally:
         conn.close()
@@ -235,7 +242,9 @@ def execute_trade(
 
     # Step 3: Insert pending position (DB trigger = local cap safety net)
     try:
-        with get_db(db_path, isolation_level="") as conn:
+        with sqlite3.connect(db_path, timeout=10) as conn:  # ← Direct connection + explicit commit
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.execute(
                 """INSERT INTO active_positions
                    (ticker, arena, client_order_id, status, strategy, direction,
@@ -244,6 +253,7 @@ def execute_trade(
                 (ticker, arena, client_order_id, "pending", strategy, direction,
                  MAX_RISK_USD, allocated_usd, dte, expiry, pathway, window_id)
             )
+            conn.commit()  # ← EXPLICIT COMMIT
     except sqlite3.IntegrityError as e:
         err = str(e)
         if "UNIQUE" in err:
@@ -291,13 +301,16 @@ def execute_trade(
 
         if r.status_code in (200, 201):
             alpaca_id = r.json().get("id")
-            # Step 5: Confirm
-            with get_db(db_path, isolation_level="") as conn:
+            # Step 5: Confirm — EXPLICIT COMMIT required
+            with sqlite3.connect(db_path, timeout=10) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute(
                     "UPDATE active_positions SET status='open', alpaca_order_id=?, "
                     "entry_time=datetime('now') WHERE client_order_id=?",
                     (alpaca_id, client_order_id)
                 )
+                conn.commit()  # ← EXPLICIT COMMIT
             logger.info("[Exec] %s filled: alpaca_id=%s", ticker, alpaca_id)
             return ExecutionResult(
                 success=True,
@@ -327,12 +340,15 @@ def _rollback_execution(db_path: str, arena: str, allocated_usd: float,
                          client_order_id: str, reason: str) -> None:
     """Clean rollback: cancel DB position + release capital."""
     try:
-        with get_db(db_path, isolation_level="") as conn:
+        with sqlite3.connect(db_path, timeout=10) as conn:  # ← Direct connection + explicit commit
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.execute(
                 "UPDATE active_positions SET status='cancelled', notes=? "
                 "WHERE client_order_id=?",
                 (reason[:200], client_order_id)
             )
+            conn.commit()  # ← EXPLICIT COMMIT
     except Exception as e:
         logger.error("[Exec] Rollback DB update failed: %s", e)
     try:
