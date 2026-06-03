@@ -9,19 +9,24 @@ Status: IMPLEMENTATION READY (awaiting Capital Router Railway deployment)
 
 import requests
 import json
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from datetime import datetime, timedelta
+import logging
 
 CAPITAL_ROUTER_URL = "http://localhost:9100"  # Live as of 2026-05-21 08:59 AM (Capital Router started, auto-bound to 9100 due to port conflict)
 ALLOCATION_LOCK_TTL_SEC = 5
+POSITION_LIMIT_MAX = 3  # Ahmed's risk protocol: max 3 open positions
+
+logger = logging.getLogger(__name__)
 
 class CapitalGate:
     """Gate logic to enforce cross-system position + allocation checks"""
     
-    def __init__(self, router_url: str = CAPITAL_ROUTER_URL, timeout_sec: int = 3):
+    def __init__(self, router_url: str = CAPITAL_ROUTER_URL, timeout_sec: int = 3, alpaca_client=None):
         self.router_url = router_url
         self.timeout = timeout_sec
         self.last_error = None
+        self.alpaca_client = alpaca_client  # fallback for position counting when router unavailable
     
     def check_position_availability(self, ticker: str, system: str) -> Tuple[bool, Dict]:
         """
@@ -60,12 +65,32 @@ class CapitalGate:
             
         except requests.RequestException as e:
             self.last_error = str(e)
-            # FAIL-SAFE: if router is unreachable, allow execution with caution
-            # (don't block trading on router outage)
+            # FALLBACK: Router unavailable — check position count directly via Alpaca
+            if self.alpaca_client:
+                try:
+                    positions = self.alpaca_client.get_positions()
+                    if len(positions) >= POSITION_LIMIT_MAX:
+                        logger.warning(
+                            "Position limit reached: %d open (max %d). Blocking new execution for %s",
+                            len(positions), POSITION_LIMIT_MAX, ticker
+                        )
+                        return (False, {
+                            "gate": "POSITION_LIMIT_BLOCKED",
+                            "reason": f"Position limit {POSITION_LIMIT_MAX} reached ({len(positions)} open)",
+                            "current_positions": len(positions),
+                            "max_allowed": POSITION_LIMIT_MAX,
+                            "fallback_check": "alpaca_client"
+                        })
+                except Exception as fallback_err:
+                    logger.error("Fallback position check failed: %s", fallback_err)
+            
+            # If fallback unavailable or passed, allow with warning
+            logger.warning("Router unreachable and no fallback available — passing with caution")
             return (True, {
                 "gate": "ROUTER_UNREACHABLE_PASS",
                 "error": str(e),
-                "warning": "Position race gate not available — continuing with caution"
+                "warning": "Position race gate not available — continuing with caution",
+                "fallback_status": "unavailable" if not self.alpaca_client else "attempted"
             })
     
     def request_allocation(self, ticker: str, system: str, amount_usd: float) -> Tuple[bool, Dict]:

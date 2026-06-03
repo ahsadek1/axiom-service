@@ -1,0 +1,203 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                    SQS PREFLIGHT — QUICK REFERENCE CARD                         ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 DEPLOY (One Command)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  bash /Users/ahmedsadek/nexus/scripts/deploy-preflight.sh
+
+This installs everything and verifies it works.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ VERIFY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  # Service loaded?
+  launchctl list com.axiom.sqs-preflight
+
+  # Test run
+  python3 /Users/ahmedsadek/nexus/preflight_runner.py
+
+  # Check logs
+  tail -20 /Users/ahmedsadek/nexus/logs/sqs_preflight.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 WHAT IT DOES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Runs at 8:30 AM ET every trading day
+Tests all 9 engines (ATG, AILS, ATM, AMAT, ATEM, ATOM)
+Validates 72 checks (9 engines × 8 dimensions)
+Sends GO/NO-GO report to Ahmed on Telegram
+Auto-recovers common failures
+Stores results in CHRONICLE database
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔧 MANAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Reload (after changes):
+  launchctl unload ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+  launchctl load ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+
+Disable:
+  launchctl unload ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+
+Enable:
+  launchctl load ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+
+Manual run:
+  python3 /Users/ahmedsadek/nexus/preflight_runner.py
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 VIEW LOGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Main log:
+  tail -100 /Users/ahmedsadek/nexus/logs/sqs_preflight.log
+
+Follow live:
+  tail -f /Users/ahmedsadek/nexus/logs/sqs_preflight.log
+
+Launchd stdout/stderr:
+  tail /Users/ahmedsadek/nexus/logs/sqs_preflight_stdout.log
+  tail /Users/ahmedsadek/nexus/logs/sqs_preflight_stderr.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 QUERY RESULTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Last 10 runs:
+  sqlite3 /Users/ahmedsadek/nexus/data/chronicle.db \
+    "SELECT timestamp, overall_status, confidence_score, engines_ok \
+     FROM preflight_results ORDER BY timestamp DESC LIMIT 10;"
+
+Failures:
+  sqlite3 /Users/ahmedsadek/nexus/data/chronicle.db \
+    "SELECT timestamp, critical_failures FROM preflight_results \
+     WHERE critical_failures IS NOT NULL LIMIT 5;"
+
+Count of runs:
+  sqlite3 /Users/ahmedsadek/nexus/data/chronicle.db \
+    "SELECT COUNT(*) FROM preflight_results;"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔧 CONFIGURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Change run time (8:30 AM → other):
+  Edit: ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+  Modify: StartCalendarInterval / Hour and Minute
+  Reload service
+
+Add/remove engines:
+  Edit: /Users/ahmedsadek/nexus/preflight_runner.py
+  Modify: ENGINES list
+  Reload service
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🐛 TROUBLESHOOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Service not loading:
+  → Reload: launchctl unload ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+  → Then: launchctl load ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+
+No Telegram reports:
+  → Verify AXIOM_BOT_TOKEN set
+  → Verify AHMED_CHAT_ID = 8573754783
+  → Check logs
+
+Database locked:
+  → Kill process: lsof | grep capital_handler.db | awk '{print $2}' | xargs kill
+  → Reset WAL: rm /Users/ahmedsadek/nexus/data/capital_handler.db-shm
+
+Timeout errors:
+  → Check if engines running: ps aux | grep engine_name
+  → Increase timeout in health_checks.py
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 FILES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Core:
+  /Users/ahmedsadek/nexus/preflight_runner.py
+  /Users/ahmedsadek/nexus/health_checks.py
+  /Users/ahmedsadek/nexus/recovery_actions.py
+
+Launchd:
+  ~/Library/LaunchAgents/com.axiom.sqs-preflight.plist
+
+Documentation:
+  /Users/ahmedsadek/nexus/README_PREFLIGHT.md
+  /Users/ahmedsadek/nexus/PREFLIGHT_DEPLOYMENT.md
+  /Users/ahmedsadek/nexus/PREFLIGHT_INTEGRATION_GUIDE.md
+
+Logs:
+  /Users/ahmedsadek/nexus/logs/sqs_preflight.log (main)
+  /Users/ahmedsadek/nexus/logs/sqs_preflight_stdout.log
+  /Users/ahmedsadek/nexus/logs/sqs_preflight_stderr.log
+
+Data:
+  /Users/ahmedsadek/nexus/data/chronicle.db (preflight_results table)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📖 DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+README_PREFLIGHT.md
+  • What it is, what it does, quick start
+  • Component descriptions, execution flow
+  • Management commands, configuration
+
+PREFLIGHT_DEPLOYMENT.md
+  • Technical implementation details
+  • Installation steps (with alternatives)
+  • All 9 health checks explained
+  • Comprehensive troubleshooting
+
+PREFLIGHT_INTEGRATION_GUIDE.md
+  • For Ahmed: deployment checklist
+  • Integration points with existing systems
+  • First run verification
+  • Detailed configuration guide
+
+PREFLIGHT_SUMMARY.txt
+  • Overview of what was built
+  • Deployment checklist
+  • Quick reference
+
+PREFLIGHT_QUICK_REFERENCE.txt
+  • This file: commands, troubleshooting, files
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 SUCCESS CRITERIA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Service loaded and scheduled
+✅ Manual test run succeeds
+✅ Report received by Ahmed at 8:30 AM ET
+✅ All 9 engines showing OK (most days)
+✅ Confidence score ≥ 95%
+✅ Execution < 30 seconds
+✅ Zero crashes or unhandled errors
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📞 SUPPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For issues:
+  1. Check log: /Users/ahmedsadek/nexus/logs/sqs_preflight.log
+  2. Run manual test: python3 /Users/ahmedsadek/nexus/preflight_runner.py
+  3. Read PREFLIGHT_DEPLOYMENT.md for your issue
+  4. Query CHRONICLE for historical results
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Production Ready | Created 2026-06-02 | Deploy with one command ↑
+
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                     Ready to deploy and run in production                      ║
+╚════════════════════════════════════════════════════════════════════════════════╝

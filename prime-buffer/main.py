@@ -373,6 +373,38 @@ def submit_pick(
     except Exception:
         pass  # fail-open: treat as FRESH
 
+    # POSITION CAP GATE — Ahmed mandate (max 3 open positions)
+    try:
+        import os as _os
+        import requests as _req
+        _alpaca_base = _os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        _alpaca_key = _os.getenv("ALPACA_API_KEY", "PKPGM3BRNYPGCF5Z56IAUZCZJL")
+        _alpaca_secret = _os.getenv("ALPACA_SECRET_KEY", "5uVVmmB2dYnpA1SsTbkde8V2wixocBfAvGBsnrWSnJDs")
+        _pos_resp = _req.get(
+            f"{_alpaca_base}/v2/positions",
+            headers={"APCA-API-KEY-ID": _alpaca_key, "APCA-API-SECRET-KEY": _alpaca_secret},
+            timeout=5
+        )
+        if _pos_resp.status_code == 200:
+            _open_positions = _pos_resp.json()
+            _pos_count = len(_open_positions) if isinstance(_open_positions, list) else 0
+            if _pos_count >= 3:
+                logger.warning(
+                    "Prime submission BLOCKED by position cap: %d/3 open (ticker: %s/%s)",
+                    _pos_count, body.ticker, body.direction
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "accepted": False,
+                        "reason": f"Position cap breached: {_pos_count}/3 open positions",
+                        "open_positions": [p.get("symbol") for p in _open_positions] if isinstance(_open_positions, list) else [],
+                    },
+                )
+    except Exception as _e:
+        logger.warning("Position cap check failed: %s (fail-open)", _e)
+        pass  # fail-open: allow submission if Alpaca unreachable
+
     _agent_window = body.window_id or window_id
     from shared.window_coordinator import evaluate_window  # G7
     _window_result = evaluate_window(_agent_window, window_id, body.ticker, body.agent)

@@ -206,9 +206,15 @@ def run_scan_cycle(
 
     result = ScanResult(window_id=window_id, pool_size=0)
 
-    # Gate 1: Market state check (staleness-aware)
-    if not get_scanning_allowed(market_state):
-        reason = market_state.pause_reason or "MarketState not ready"
+    # Gate 1: Market state check — REBUILD each cycle to avoid staleness
+    # FIX-STALE-MARKET-STATE (2026-06-03): Scanner was built with market_state at startup,
+    # causing it to lock in "pre-market" state at startup time and never transition to "market open".
+    # Now we rebuild market_state each cycle to get live status.
+    from market_state import build_market_state
+    current_market_state = build_market_state(axiom_url, nexus_secret)
+    
+    if not get_scanning_allowed(current_market_state):
+        reason = current_market_state.pause_reason or "MarketState not ready"
         logger.info("[Scanner] Scan blocked: %s", reason)
         result.log_skip("market_state_blocked")
         return result

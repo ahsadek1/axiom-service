@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Service identifier (must be unique) -->
+	<key>Label</key>
+	<string>com.axiom.sqs-preflight</string>
+
+	<!-- Program to execute -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/ahmedsadek/nexus/preflight_runner.py</string>
+	</array>
+
+	<!-- Working directory -->
+	<key>WorkingDirectory</key>
+	<string>/Users/ahmedsadek/nexus</string>
+
+	<!-- Environment variables -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>HOME</key>
+		<string>/Users/ahmedsadek</string>
+		<key>PYTHONPATH</key>
+		<string>/Users/ahmedsadek/nexus:/Users/ahmedsadek/nexus/shared</string>
+	</dict>
+
+	<!-- Run at 8:30 AM ET on trading days -->
+	<!-- StartCalendarInterval specifies when to run -->
+	<!-- Hour=13 (1:30 PM UTC = 8:30 AM ET) -->
+	<key>StartCalendarInterval</key>
+	<array>
+		<!-- Monday 8:30 AM -->
+		<dict>
+			<key>Hour</key>
+			<integer>13</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+			<key>Weekday</key>
+			<integer>1</integer>
+		</dict>
+		<!-- Tuesday 8:30 AM -->
+		<dict>
+			<key>Hour</key>
+			<integer>13</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+			<key>Weekday</key>
+			<integer>2</integer>
+		</dict>
+		<!-- Wednesday 8:30 AM -->
+		<dict>
+			<key>Hour</key>
+			<integer>13</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+			<key>Weekday</key>
+			<integer>3</integer>
+		</dict>
+		<!-- Thursday 8:30 AM -->
+		<dict>
+			<key>Hour</key>
+			<integer>13</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+			<key>Weekday</key>
+			<integer>4</integer>
+		</dict>
+		<!-- Friday 8:30 AM -->
+		<dict>
+			<key>Hour</key>
+			<integer>13</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+			<key>Weekday</key>
+			<integer>5</integer>
+		</dict>
+	</array>
+
+	<!-- Log output -->
+	<key>StandardOutPath</key>
+	<string>/Users/ahmedsadek/nexus/logs/sqs_preflight_stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/ahmedsadek/nexus/logs/sqs_preflight_stderr.log</string>
+
+	<!-- Restart on failure -->
+	<key>KeepAlive</key>
+	<false/>
+
+	<!-- Run only once per interval -->
+	<key>StartInterval</key>
+	<integer>0</integer>
+</dict>
+</plist>

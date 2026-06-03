@@ -1031,10 +1031,20 @@ def execute(
                         },
                     )
         except Exception as _axiom_gate_err:
-            # Non-fatal: if Axiom is unreachable, fall through to Prime's local check
-            # Log but don't fail — Prime's local check is still active as fallback
-            logger.warning(
-                "Axiom cross-system position gate unavailable (non-fatal): %s", _axiom_gate_err
+            # CRITICAL: Axiom cross-system gate is a hard safety requirement.
+            # Cannot fall through to local check during market hours — that's how we breached the cap.
+            # Must reject execution to protect global position limit.
+            logger.error(
+                "AXIOM CROSS-SYSTEM GATE FAILED (hard block): %s — rejecting execution for %s", 
+                _axiom_gate_err, body.ticker
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "executed": False,
+                    "reason": f"Axiom cross-system gate unreachable — cannot verify global position cap. Execution blocked.",
+                    "gate": "axiom_cross_system_failed",
+                },
             )
 
         # Per-ticker duplicate guard (2026-04-24): reject if ticker already open.
@@ -1138,7 +1148,8 @@ def execute(
     _allocation_id = None
     if CAPITAL_GATE_AVAILABLE:
         try:
-            _capital_gate = CapitalGate(router_url="http://localhost:9100", timeout_sec=3)
+            _alpaca_client = _get_alpaca()  # Pass alpaca client for fallback position checking
+            _capital_gate = CapitalGate(router_url="http://localhost:9100", timeout_sec=3, alpaca_client=_alpaca_client)
             _gate_allowed, _gate_result = _capital_gate.pre_execution_check(
                 ticker=body.ticker,
                 system="prime",

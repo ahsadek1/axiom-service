@@ -96,11 +96,11 @@ def check_service_health(service_name, service_config):
 def redeploy_service(service_name, service_config):
     """Trigger a redeploy on Railway via GraphQL mutation."""
     service_id = service_config["id"]
-    # Railway API expects direct arguments, not wrapped in 'input'
-    # Environment defaults to 'production' for default environment
+    # Railway API requires both serviceId and environmentId
+    # Environment ID 'production' is the default production environment
     mutation = """
     mutation {
-      serviceInstanceRedeploy(serviceId: "%s")
+      serviceInstanceRedeploy(serviceId: "%s", environmentId: "production")
     }
     """ % service_id
     

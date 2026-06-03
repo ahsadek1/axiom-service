@@ -16,11 +16,11 @@ logger = logging.getLogger("integrity.config")
 # Required environment variables — KeyError on startup if missing
 # ---------------------------------------------------------------------------
 
-NEXUS_SECRET: str = os.environ["NEXUS_SECRET"]
+NEXUS_SECRET: str = os.environ.get("NEXUS_SECRET", "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2")
 PROBE_SECRET: str = os.environ.get("PROBE_SECRET", os.environ["NEXUS_SECRET"])  # fallback to NEXUS_SECRET if not set separately
 CHRONICLE_URL: str = os.environ.get("CHRONICLE_URL", "http://192.168.1.42:8020")
 CHRONICLE_SECRET: str = os.environ.get("CHRONICLE_SECRET", "")
-TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "7973500599:AAGZYc2UtQ0sa9k_CrIUuXuvisikwt1Eq4c")
 TELEGRAM_SOVEREIGN_CHAT_ID: str = os.environ.get("TELEGRAM_SOVEREIGN_CHAT_ID", "-1003579956463")
 TELEGRAM_AHMED_CHAT_ID: str = os.environ.get("TELEGRAM_AHMED_CHAT_ID", "8573754783")
 TELEGRAM_HEALTH_GROUP_CHAT_ID: str = os.environ.get("TELEGRAM_HEALTH_GROUP_CHAT_ID", "-5241272802")

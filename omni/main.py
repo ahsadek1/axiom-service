@@ -123,16 +123,13 @@ logger.info("OMNI: NEXUS_AUTO_EXECUTE=%s", _auto_execute)
 _sovereign_halted: bool = False   # HALT directive suspends concordance synthesis
 
 # GAP-008: Concurrent synthesis worker pool (2026-04-29)
-# TEMPORARY FIX (2026-06-02 20:47): Reduced to 1 worker due to recurring brain timeout deadlock.
-# Root cause: Brain API calls with hung TCP connections bypass per-request timeout.
-# Solution: Until socket-level timeout is implemented in _call_anthropic/_call_openai/_call_gemini,
-# use single-worker queue to prevent pool starvation. Each synthesis gets full 60s deadline.
-# Permanent fix: Implement requests.adapters with socket timeout + health checks before brain dispatch.
-_SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="omni-synth")
+# RESTORED (2026-06-03 13:00): Restored to 3 workers. Previous 1-worker "temporary fix" caused 87-min synthesis stall.
+# Pending permanent fix for brain timeout deadlock: socket-level timeout implementation in _call_anthropic/_call_openai/_call_gemini.
+_SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=3, thread_name_prefix="omni-synth")
 _PATHWAY_PRIORITY    = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}  # lower = higher priority
 # GAP-14: Semaphore mirrors pool size — ensures release() is ALWAYS called (try/finally)
 # even if _run_synthesis() raises uncaught exception inside a pool worker.
-_SYNTHESIS_SEMAPHORE = __import__("threading").Semaphore(1)
+_SYNTHESIS_SEMAPHORE = __import__("threading").Semaphore(3)
 
 # P0 FIX (May 14, 2026): Pool health monitor initialized in lifespan, accessible here for marking completions
 _pool_monitor: Optional[PoolHealthMonitor] = None
