@@ -1,0 +1,824 @@
+"""
+exit_monitor.py — Alpha Execution Exit Monitor
+
+Runs every 1 minute during market hours (changed from 15-min, approved Ahmed Sadek 2026-04-12).
+Evaluates all open positions against exit rules.
+Executes exits via Alpaca. Reports outcomes to Alpha Buffer.
+
+Exit rules (approved Apr 10, 2026):
+  +35%  → sell 50%, activate 15% trailing stop
+  +100% → close immediately (full profit take)
+  Trailing stop → close when P&L drops 15% from trailing high
+  DTE ≤ 7  → close entire position
+  DTE ≤ 5  → emergency close
+  DTE ≤ 21 → flag for roll (log only in MVP — manual roll)
+"""
+
+import logging
+import sys as _sys
+_sys.path.insert(0, "/Users/ahmedsadek/nexus/shared")
+from alert_client import send_alert as _send_alert
+from datetime import date, datetime, timezone
+from typing import Optional
+import zoneinfo as _zoneinfo
+
+# _ET: Eastern Time zone — used by EOD force-close logic and test patching.
+_ET = _zoneinfo.ZoneInfo("America/New_York")
+
+from ails_reporter import post_outcome as _post_ails_outcome
+
+from config import (
+    DTE_CLOSE_THRESHOLD,
+    DTE_EMERGENCY_CLOSE,
+    DTE_ROLL_THRESHOLD,
+    EXIT_FULL_CLOSE_PCT,
+    EXIT_PARTIAL_SELL_FRACTION,
+    EXIT_PARTIAL_TRIGGER_PCT,
+    EXIT_TRAILING_STOP_PCT,
+)
+from contract_resolver import calculate_dte
+from database import (
+    close_position,
+    get_live_positions,
+    reduce_contracts,
+    update_trailing_stop,
+)
+
+logger = logging.getLogger("alpha_exec.exit_monitor")
+
+
+def evaluate_exits(
+    db_path:             str,
+    alpaca_client,
+    buffer_reporter,
+    bot_token:           str,
+    chat_id:             str,
+    ticker_lock_getter=None,  # GAP-6: optional per-ticker lock getter (callable: str → Lock)
+) -> list[dict]:
+    """
+    Evaluate all open positions against exit rules.
+
+    Runs on every scheduled tick (every 1 min during market hours).
+
+    Args:
+        db_path:             Alpha Execution database path.
+        alpaca_client:       AlpacaClient instance.
+        buffer_reporter:     BufferReporter for outcome reporting.
+        bot_token:           Telegram bot token.
+        chat_id:             Ahmed's chat ID.
+        ticker_lock_getter:  GAP-6: if provided, called as ticker_lock_getter(ticker) to get a
+                             per-ticker threading.Lock that prevents execute() / exit_monitor races.
+
+    Returns:
+        List of exit events that occurred this evaluation.
+    """
+    # CRITICAL: Only evaluate OPEN positions, NOT pending ones. Pending positions
+    # are awaiting fill confirmation and don't have the data structures needed for exit evaluation.
+    # This prevents KeyError crashes when pending accumulates after service restarts.
+    positions = get_live_positions(db_path)
+    if not positions:
+        return []
+
+    exits: list[dict] = []
+
+    # -- EOD Force-Close Gate (15:50 ET) ----------------------------------
+    # Near market close, force-close all open positions to prevent overnight
+    # carry. Runs before individual position evaluation.
+    now_et = datetime.now(_ET)
+    _is_eod = (
+        now_et.weekday() < 5
+        and (now_et.hour == 15 and now_et.minute >= 50)
+    )
+    if _is_eod:
+        for pos in positions:
+            # CREDIT SPREAD GUARD: Never EOD-close a credit spread with DTE > 7.
+            # Bull put spreads need 21-40 days to decay — EOD closing locks in losses.
+            # Ahmed directive May 2026.
+            _pos_dte = calculate_dte(pos.get("expiration_date", ""))
+            _is_spread = bool(pos.get("short_contract_symbol") and pos.get("long_contract_symbol"))
+            if _is_spread and _pos_dte > DTE_CLOSE_THRESHOLD:
+                logger.info(
+                    "EOD_SKIP_CREDIT_SPREAD: %s DTE=%d — holding for theta decay",
+                    pos["ticker"], _pos_dte,
+                )
+                continue
+            logger.warning(
+                "EOD_FORCE_CLOSE: position %d (%s) -- forcing close at %s ET",
+                pos["id"], pos["ticker"], now_et.strftime("%H:%M")
+            )
+            # BUG-FIX (RE-003 / Axiom 3.1): EOD path now updates DB after Alpaca close.
+            # Previously Alpaca was closed but DB stayed 'open' forever — phantom positions
+            # triggered reconciler pause every morning and lost all AILS outcome data.
+            #
+            # BUG-FIX (RE-006): get P&L AFTER close attempt so that if Alpaca already
+            # closed the position (404), we detect it and use a separate P&L lookup
+            # rather than reporting 0.0% LOSS based on a missing position.
+            _eod_pnl = _get_current_pnl(pos, alpaca_client) or 0.0
+            try:
+                short_sym = pos.get("short_contract_symbol")
+                long_sym  = pos.get("long_contract_symbol")
+                _short_404 = False
+                _long_404  = False
+                _eod_close_reason = "EOD_FORCE_CLOSE"  # default; updated below if 404
+                if short_sym and long_sym:
+                    try:
+                        alpaca_client.close_position(short_sym)
+                    except Exception as _e_short:
+                        logger.warning("EOD short leg close failed %s: %s", short_sym, _e_short)
+                        if "404" in str(_e_short) or "position not found" in str(_e_short).lower():
+                            _short_404 = True
+                    try:
+                        alpaca_client.close_position(long_sym)
+                    except Exception as _e_long:
+                        logger.warning("EOD long leg close failed %s: %s", long_sym, _e_long)
+                        if "404" in str(_e_long) or "position not found" in str(_e_long).lower():
+                            _long_404 = True
+                    # BUG-FIX (RE-006): If both legs returned 404, Alpaca already closed
+                    # this position (e.g. stop-loss triggered, option expired, or broker
+                    # auto-close). Re-fetch P&L from Alpaca order history.
+                    if _short_404 and _long_404:
+                        logger.warning(
+                            "EOD_ALREADY_CLOSED_BY_ALPACA: position %d (%s) — "
+                            "both legs returned 404; querying order history for actual P&L",
+                            pos["id"], pos["ticker"],
+                        )
+                        try:
+                            _pnl_from_orders = _get_pnl_from_closed_orders(
+                                pos, alpaca_client
+                            )
+                            if _pnl_from_orders is not None:
+                                _eod_pnl = _pnl_from_orders
+                                logger.info(
+                                    "RE-006: recovered actual P&L for %s from order history: %.4f",
+                                    pos["ticker"], _eod_pnl,
+                                )
+                            else:
+                                logger.warning(
+                                    "RE-006: could not recover P&L for %s from order history "
+                                    "— leaving as 0.0 (ALREADY_CLOSED_BY_ALPACA)",
+                                    pos["ticker"],
+                                )
+                        except Exception as _re006_err:
+                            logger.warning("RE-006 P&L recovery failed for %s: %s", pos["ticker"], _re006_err)
+                else:
+                    alpaca_client.close_position(pos["ticker"])
+                # Mark DB closed — reason reflects whether Alpaca had already closed it
+                _eod_close_reason = (
+                    "EOD_ALREADY_CLOSED_BY_ALPACA"
+                    if (_short_404 and _long_404)
+                    else "EOD_FORCE_CLOSE"
+                )
+                _eod_pnl_usd = (pos.get("position_size_usd") or 0) * _eod_pnl
+                close_position(db_path, pos["id"], _eod_close_reason, _eod_pnl, _eod_pnl_usd)
+                # Report outcome to AILS and buffer
+                # G6 FIX (2026-05-03): guard against None buffer_reporter
+                # (test contexts pass None; production always has a real reporter)
+                if buffer_reporter is not None:
+                    try:
+                        buffer_reporter.report_outcome(
+                            ticker  = pos["ticker"],
+                            won     = _eod_pnl > 0,
+                            pnl_pct = _eod_pnl,
+                            pathway = pos.get("pathway", "P1"),
+                        )
+                    except Exception as _br_err:
+                        logger.warning("EOD buffer report failed for %s: %s", pos["ticker"], _br_err)
+                else:
+                    logger.debug("EOD buffer report skipped for %s — no reporter", pos["ticker"])
+                _post_ails_outcome(
+                    ticker           = pos["ticker"],
+                    strategy         = pos.get("option_type", "bull_put_spread"),
+                    regime           = "UNKNOWN",
+                    direction        = pos.get("direction", "bullish"),
+                    pnl_usd          = _eod_pnl_usd,
+                    win              = _eod_pnl > 0,
+                    system           = "alpha",
+                    concordance_path = pos.get("pathway"),
+                )
+                exits.append({
+                    "position_id": pos["id"],
+                    "ticker":      pos["ticker"],
+                    "reason":      _eod_close_reason,
+                    "pnl_pct":     _eod_pnl,
+                })
+            except Exception as _eod_err:
+                logger.error("EOD close FAILED for %s: %s", pos["ticker"], _eod_err)
+                exits.append({
+                    "position_id": pos["id"],
+                    "ticker":      pos["ticker"],
+                    "reason":      "CLOSE_FAILED",
+                    "error":       str(_eod_err),
+                })
+        return exits
+
+    for pos in positions:
+        _tlock = ticker_lock_getter(pos["ticker"].upper()) if ticker_lock_getter else None
+        if _tlock:
+            _tlock.acquire()
+        try:
+            exit_event = _evaluate_position(
+                pos, db_path, alpaca_client, buffer_reporter, bot_token, chat_id
+            )
+            if exit_event:
+                exits.append(exit_event)
+        except Exception as e:
+            logger.error("Exit evaluation failed for position %d (%s): %s", pos["id"], pos["ticker"], e)
+        finally:
+            if _tlock:
+                _tlock.release()
+
+    return exits
+
+
+def _evaluate_position(
+    pos:             dict,
+    db_path:         str,
+    alpaca_client,
+    buffer_reporter,
+    bot_token:       str,
+    chat_id:         str,
+) -> Optional[dict]:
+    """
+    Evaluate a single position's exit conditions.
+
+    Args:
+        pos: Position dict from database.
+
+    Returns:
+        Exit event dict if position was closed/partially closed, else None.
+    """
+    ticker     = pos["ticker"]
+    pos_id     = pos["id"]
+    # BUG-FIX (EXIT-001): expiration_date only exists on options, not equity positions.
+    # Equity positions (DELL, AIG, etc.) have no expiration, so skip DTE-based logic.
+    expiry     = pos.get("expiration_date")
+    if not expiry:
+        # Equity position — skip all DTE-based exit logic. Return None (no exit needed).
+        logger.debug("Skipping DTE evaluation for equity position %d (%s) — no expiration_date", pos_id, ticker)
+        return None
+    dte        = calculate_dte(expiry)
+    partial    = bool(pos["partial_closed"])
+    trail_pct  = pos["trailing_stop_pct"]
+    trail_high = pos["trailing_stop_high"]
+    entry_px   = pos["entry_price"] or 0
+
+    # ── Minimum hold period for credit spreads (3 days) ─────────────────────
+    # Bull put spreads need time to decay — never exit within 3 days of entry.
+    # Only DTE_EMERGENCY_CLOSE (≤5 DTE) overrides this. Ahmed directive May 2026.
+    _is_spread = bool(pos.get("short_contract_symbol") and pos.get("long_contract_symbol"))
+    if _is_spread and dte > DTE_EMERGENCY_CLOSE:
+        try:
+            from datetime import datetime, timezone
+            _opened_at = pos.get("opened_at") or ""
+            if _opened_at:
+                _open_dt = datetime.fromisoformat(_opened_at.replace("Z", "+00:00"))
+                _hold_days = (datetime.now(timezone.utc) - _open_dt).days
+                if _hold_days < 3:
+                    logger.info(
+                        "MIN_HOLD: skipping exit for %s (held %d days, min 3)",
+                        ticker, _hold_days,
+                    )
+                    return None
+        except Exception as _hold_err:
+            logger.debug("MIN_HOLD check error for %s: %s", ticker, _hold_err)
+
+    # ── Get current position value from Alpaca ────────────────────────────────
+    current_pnl_pct = _get_current_pnl(pos, alpaca_client)
+    if current_pnl_pct is None:
+        logger.debug("Could not get P&L for position %d (%s) — skipping", pos_id, ticker)
+        return None
+
+    # ── DTE Emergency Close (≤ 5) ─────────────────────────────────────────────
+    if dte <= DTE_EMERGENCY_CLOSE:
+        logger.warning("EMERGENCY CLOSE: position %d (%s) DTE=%d", pos_id, ticker, dte)
+        return _execute_close(
+            pos, db_path, alpaca_client, buffer_reporter,
+            bot_token, chat_id,
+            reason     = "DTE_EMERGENCY",
+            pnl_pct    = current_pnl_pct,
+        )
+
+    # ── DTE Close (≤ 7) ──────────────────────────────────────────────────────
+    if dte <= DTE_CLOSE_THRESHOLD:
+        logger.info("DTE CLOSE: position %d (%s) DTE=%d", pos_id, ticker, dte)
+        return _execute_close(
+            pos, db_path, alpaca_client, buffer_reporter,
+            bot_token, chat_id,
+            reason  = "DTE_CLOSE",
+            pnl_pct = current_pnl_pct,
+        )
+
+    # ── DTE Auto-Roll (≤ 21) ──────────────────────────────────────────────────
+    if dte <= DTE_ROLL_THRESHOLD:
+        logger.info("AUTO-ROLL: position %d (%s) DTE=%d — attempting roll forward", pos_id, ticker, dte)
+        from roll_manager import _attempt_roll
+        roll_result = _attempt_roll(
+            pos           = pos,
+            db_path       = db_path,
+            alpaca_client = alpaca_client,
+            bot_token     = bot_token,
+            chat_id       = chat_id,
+        )
+        if roll_result.action == "rolled":
+            # Position was closed and replaced — return the close event
+            return [{"event": "ROLLED", "position_id": pos_id, "new_position_id": roll_result.new_position_id, "ticker": ticker}]
+        elif roll_result.action == "failed":
+            logger.error("AUTO-ROLL FAILED for pos %d (%s): %s", pos_id, ticker, roll_result.error)
+        else:
+            logger.info("AUTO-ROLL SKIPPED for pos %d (%s): %s", pos_id, ticker, roll_result.reason)
+
+    # ── +100% Full Close ──────────────────────────────────────────────────────
+    if current_pnl_pct >= EXIT_FULL_CLOSE_PCT:
+        logger.info("FULL PROFIT TAKE: position %d (%s) pnl=%.1f%%", pos_id, ticker, current_pnl_pct * 100)
+        return _execute_close(
+            pos, db_path, alpaca_client, buffer_reporter,
+            bot_token, chat_id,
+            reason  = "PROFIT_TARGET_100",
+            pnl_pct = current_pnl_pct,
+        )
+
+    # ── Trailing Stop Check ───────────────────────────────────────────────────
+    if partial and trail_pct and trail_high is not None:
+        # Update trailing high
+        new_high = max(trail_high, current_pnl_pct)
+        if new_high > trail_high:
+            update_trailing_stop(db_path, pos_id, trail_pct, new_high, partial_closed=True)
+            trail_high = new_high
+
+        # Check if trailing stop breached
+        if current_pnl_pct <= trail_high - trail_pct:
+            logger.info(
+                "TRAILING STOP: position %d (%s) pnl=%.1f%% trail_high=%.1f%% stop=%.1f%%",
+                pos_id, ticker,
+                current_pnl_pct * 100, trail_high * 100, trail_pct * 100,
+            )
+            return _execute_close(
+                pos, db_path, alpaca_client, buffer_reporter,
+                bot_token, chat_id,
+                reason  = "TRAILING_STOP",
+                pnl_pct = current_pnl_pct,
+            )
+
+    # ── +35% Partial Close ────────────────────────────────────────────────────
+    if not partial and current_pnl_pct >= EXIT_PARTIAL_TRIGGER_PCT:
+        logger.info(
+            "PARTIAL EXIT: position %d (%s) pnl=%.1f%% — selling 50%%",
+            pos_id, ticker, current_pnl_pct * 100,
+        )
+        _execute_partial_close(
+            pos, db_path, alpaca_client,
+            fraction   = EXIT_PARTIAL_SELL_FRACTION,
+            trail_pct  = EXIT_TRAILING_STOP_PCT,
+            current_high = current_pnl_pct,
+        )
+        return {
+            "event":     "PARTIAL_CLOSE",
+            "position_id": pos_id,
+            "ticker":    ticker,
+            "pnl_pct":   current_pnl_pct,
+            "reason":    "PROFIT_TARGET_35",
+        }
+
+    return None
+
+
+def _get_pnl_from_closed_orders(pos: dict, alpaca_client) -> Optional[float]:
+    """
+    BUG-FIX (RE-006): Recover actual P&L for a position that was already closed
+    by Alpaca before our EOD sweep (indicated by 404 on both legs).
+
+    Queries Alpaca's closed orders for the entry order IDs stored in the DB,
+    calculates net credit received vs debit paid, and returns P&L as a fraction
+    of position_size_usd.
+
+    Returns:
+        P&L as decimal (e.g. 0.20 = +20%) or None if unable to determine.
+    """
+    try:
+        short_order_id = pos.get("short_alpaca_order_id")
+        long_order_id  = pos.get("long_alpaca_order_id")
+        size_usd       = pos.get("position_size_usd") or 0
+        if not short_order_id or size_usd <= 0:
+            return None
+        # Fetch recent closed orders (limited to 100 by alpaca_client wrapper)
+        # Note: alpaca_client.get_orders() only accepts 'status' parameter
+        closed_orders = alpaca_client.get_orders(
+            status="closed"
+        ) if hasattr(alpaca_client, "get_orders") else []
+        if not closed_orders:
+            return None
+        net_pnl_usd = 0.0
+        matched = 0
+        for order in closed_orders:
+            oid = order.get("id", "")
+            filled_avg = float(order.get("filled_avg_price") or 0)
+            filled_qty = float(order.get("filled_qty") or 0)
+            side       = order.get("side", "")
+            # Only count filled legs we care about
+            if oid not in (short_order_id, long_order_id):
+                continue
+            matched += 1
+            # sell (short leg / credit leg) = received premium
+            # buy  (long leg / debit leg)   = paid premium
+            if side == "sell":
+                net_pnl_usd += filled_avg * filled_qty * 100  # credit received
+            else:
+                net_pnl_usd -= filled_avg * filled_qty * 100  # debit paid
+        if matched == 0:
+            logger.warning("RE-006: no matching orders found for pos %d in closed history", pos.get("id"))
+            return None
+        logger.info("RE-006: pos %d net_pnl_usd=%.2f from %d matched order(s)", pos.get("id"), net_pnl_usd, matched)
+        return net_pnl_usd / size_usd
+    except Exception as _e:
+        logger.warning("RE-006 _get_pnl_from_closed_orders error: %s", _e)
+        return None
+
+
+def _get_current_pnl(pos: dict, alpaca_client) -> Optional[float]:
+    """
+    Calculate current P&L percentage from Alpaca position data.
+
+    Adversarial fix #4: now queries by individual leg contract symbols (short + long)
+    rather than underlying ticker. For a credit spread:
+      - Short leg gain = short_entry_credit - current_short_cost (positive if option decayed)
+      - Long leg gain  = current_long_value - long_entry_debit   (negative, insurance cost)
+      - Net P&L        = short_gain + long_gain
+
+    If contract symbols are not stored (legacy records), falls back to ticker-based proxy
+    with a clear warning.
+
+    Args:
+        pos:           Position dict from database.
+        alpaca_client: AlpacaClient instance.
+
+    Returns:
+        Current P&L as decimal (e.g. 0.35 = +35%), or None if unavailable.
+    """
+    short_symbol = pos.get("short_contract_symbol")
+    long_symbol  = pos.get("long_contract_symbol")
+    size_usd     = pos.get("position_size_usd") or 0
+
+    if short_symbol and long_symbol and size_usd > 0:
+        # ── Preferred path: per-leg P&L aggregation ──────────────────────────
+        try:
+            short_pos = alpaca_client.get_position(short_symbol)
+            long_pos  = alpaca_client.get_position(long_symbol)
+
+            short_pnl = float(short_pos.get("unrealized_pl", 0)) if short_pos else 0.0
+            long_pnl  = float(long_pos.get("unrealized_pl",  0)) if long_pos  else 0.0
+            net_pnl   = short_pnl + long_pnl
+
+            return net_pnl / size_usd
+        except Exception as e:
+            logger.warning(
+                "Per-leg P&L fetch failed for position %d (%s/%s): %s — falling back to ticker",
+                pos.get("id"), short_symbol, long_symbol, e,
+            )
+
+    # ── Fallback: underlying ticker proxy (legacy or on per-leg failure) ──────
+    # Known limitation: returns aggregated P&L across all positions on ticker.
+    # Only used when contract symbols are unavailable.
+    try:
+        ticker     = pos["ticker"]
+        alpaca_pos = alpaca_client.get_position(ticker)
+        if alpaca_pos is None:
+            return None
+        logger.warning(
+            "Position %d (%s): using ticker-based P&L proxy (contract symbols not stored)",
+            pos.get("id"), ticker,
+        )
+        return float(alpaca_pos.get("unrealized_plpc", 0))
+    except Exception as e:
+        logger.debug("P&L fetch failed for %s: %s", pos.get("ticker"), e)
+        return None
+
+
+def _execute_close(
+    pos:             dict,
+    db_path:         str,
+    alpaca_client,
+    buffer_reporter,
+    bot_token:       str,
+    chat_id:         str,
+    reason:          str,
+    pnl_pct:         float,
+    capital_router_url: str = "http://localhost:9100",
+) -> dict:
+    """Execute a full position close via Alpaca and report outcome."""
+    pos_id     = pos["id"]
+    ticker     = pos["ticker"]
+    size_usd   = pos["position_size_usd"] or 0
+    pnl_usd    = size_usd * pnl_pct
+
+    # ── Close on Alpaca FIRST — only mark DB closed on confirmed success ────────
+    # Adversarial fix #1: close each leg by contract symbol, not by underlying ticker.
+    # Closing by ticker would aggregate and close ALL positions on that symbol.
+    short_symbol = pos.get("short_contract_symbol")
+    long_symbol  = pos.get("long_contract_symbol")
+
+    close_error = None
+    for attempt in range(3):
+        if short_symbol and long_symbol:
+            # ── Two-leg spread close — track each leg independently ────────────
+            # OMNI Pass 3 Finding 5: prior code caught each leg exception independently
+            # and always set close_error=None + break — so dual-leg failure still
+            # resulted in DB being marked closed. Fix: gate close_error=None on
+            # at least one leg succeeding.
+            short_ok = False
+            long_ok  = False
+            try:
+                alpaca_client.close_position(short_symbol)
+                short_ok = True
+            except Exception as e_short:
+                logger.warning(
+                    "Short leg close failed for %s (attempt %d): %s",
+                    short_symbol, attempt + 1, e_short,
+                )
+            try:
+                alpaca_client.close_position(long_symbol)
+                long_ok = True
+            except Exception as e_long:
+                logger.warning(
+                    "Long leg close failed for %s (attempt %d): %s",
+                    long_symbol, attempt + 1, e_long,
+                )
+
+            if short_ok or long_ok:
+                # At least one leg closed — proceed to DB write
+                if not short_ok or not long_ok:
+                    logger.warning(
+                        "Position %d (%s): partial leg close — short_ok=%s long_ok=%s. "
+                        "Marking DB closed; orphaned leg will surface in reconciler.",
+                        pos_id, ticker, short_ok, long_ok,
+                    )
+                close_error = None
+                break
+            else:
+                # Both legs failed — do not mark closed; retry
+                close_error = Exception(f"Both legs failed on attempt {attempt + 1}")
+                if attempt < 2:
+                    import time
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(
+                        "ALPACA CLOSE FAILED (both legs) after 3 attempts for position %d (%s) — "
+                        "NOT marking DB closed. Will retry on next exit monitor tick.",
+                        pos_id, ticker,
+                    )
+                    return {
+                        "event":       "CLOSE_FAILED",
+                        "position_id": pos_id,
+                        "ticker":      ticker,
+                        "reason":      reason,
+                        "error":       "Both spread legs failed to close after 3 attempts",
+                    }
+        else:
+            # ── Legacy single-ticker fallback ─────────────────────────────────
+            try:
+                logger.warning(
+                    "Position %d (%s): no contract symbols stored — closing by ticker (may affect wrong legs)",
+                    pos_id, ticker,
+                )
+                alpaca_client.close_position(ticker)
+                close_error = None
+                break
+            except Exception as e:
+                close_error = e
+                if attempt < 2:
+                    import time
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(
+                        "ALPACA CLOSE FAILED after 3 attempts for position %d (%s) — "
+                        "NOT marking DB closed. Will retry on next exit monitor tick. Error: %s",
+                        pos_id, ticker, e,
+                    )
+                    return {
+                        "event":       "CLOSE_FAILED",
+                        "position_id": pos_id,
+                        "ticker":      ticker,
+                        "reason":      reason,
+                        "error":       str(e)[:200],
+                    }
+
+    logger.info("Position %d (%s) closed on Alpaca: reason=%s pnl=%.1f%%", pos_id, ticker, reason, pnl_pct * 100)
+
+    # Alpaca confirmed — now safe to update DB
+    close_position(db_path, pos_id, reason, pnl_pct, pnl_usd)
+
+    # FIX #1: Release capital allocation after close
+    _release_capital_allocation(capital_router_url, pos_id, pos.get("arena", "alpha"))
+
+    # Report back to Alpha Buffer for circuit breaker
+    try:
+        buffer_reporter.report_outcome(
+            ticker  = ticker,
+            won     = pnl_pct > 0,
+            pnl_pct = pnl_pct,
+            pathway = pos.get("pathway", "P1"),
+        )
+    except Exception as e:
+        logger.warning("Buffer outcome report failed for %s: %s", ticker, e)
+
+    # Telegram notification
+    _send_close_notification(bot_token, chat_id, ticker, pos_id, reason, pnl_pct, pnl_usd)
+
+    # Post outcome to AILS for Bayesian learning (fire-and-forget)
+    _post_ails_outcome(
+        ticker=ticker,
+        strategy=pos.get("option_type", "bull_put_spread"),
+        regime=pos.get("regime", "UNKNOWN"),
+        direction=pos.get("direction", "bullish"),
+        pnl_usd=pnl_usd,
+        win=pnl_pct > 0,
+        system="alpha",
+        concordance_path=pos.get("pathway"),
+    )
+
+    return {
+        "event":       "FULL_CLOSE",
+        "position_id": pos_id,
+        "ticker":      ticker,
+        "reason":      reason,
+        "pnl_pct":     pnl_pct,
+        "pnl_usd":     pnl_usd,
+    }
+
+
+def _execute_partial_close(
+    pos:          dict,
+    db_path:      str,
+    alpaca_client,
+    fraction:     float,
+    trail_pct:    float,
+    current_high: float,
+    capital_router_url: str = "http://localhost:9100",
+) -> None:
+    """
+    Execute partial close and activate trailing stop.
+
+    Adversarial fix #3: reduces the DB contracts count by qty_closed after partial close.
+    Adversarial fix #10: trailing stop parameters are ALWAYS set regardless of whether
+    the Alpaca partial close succeeds, ensuring the stop is active even on partial failure.
+    Adversarial fix #1: closes by short contract symbol, not by ticker.
+    
+    FIX #1: Release capital proportional to contracts closed.
+    """
+    pos_id       = pos["id"]
+    ticker       = pos["ticker"]
+    contracts    = pos.get("contracts", 1)
+    close_qty    = max(1, int(contracts * fraction))
+    short_symbol = pos.get("short_contract_symbol")
+    long_symbol  = pos.get("long_contract_symbol")
+
+    # ── Always set trailing stop FIRST (fix #10) ─────────────────────────────
+    # Even if the Alpaca call below fails, the exit monitor will see partial_closed=True
+    # on the next tick and enforce the trailing stop. This is the safe default.
+    update_trailing_stop(
+        db_path, pos_id,
+        trailing_stop_pct  = trail_pct,
+        trailing_stop_high = current_high,
+        partial_closed     = True,
+    )
+
+    # ── Reduce contract count in DB (fix #3) ─────────────────────────────────
+    remaining = reduce_contracts(db_path, pos_id, close_qty)
+    logger.info(
+        "Partial close: position %d (%s) — closing %d contracts, %d remaining",
+        pos_id, ticker, close_qty, remaining,
+    )
+
+    # ── Execute partial close on Alpaca — BOTH legs (OMNI Pass 3 Finding 4) ──
+    # Prior code only closed the short leg, leaving the long leg at full size.
+    # After partial close: short leg has fewer contracts than long leg → unhedged
+    # directional long exposure + wrong P&L calculation on next monitor tick.
+    # Fix: reduce BOTH legs by close_qty simultaneously.
+    try:
+        if short_symbol and long_symbol:
+            # Close both legs of the spread
+            try:
+                alpaca_client.close_position(short_symbol, qty=close_qty)
+            except Exception as e_short:
+                logger.error(
+                    "Partial close short leg failed for position %d (%s): %s",
+                    pos_id, short_symbol, e_short,
+                )
+            try:
+                alpaca_client.close_position(long_symbol, qty=close_qty)
+            except Exception as e_long:
+                logger.error(
+                    "Partial close long leg failed for position %d (%s): %s",
+                    pos_id, long_symbol, e_long,
+                )
+        elif short_symbol:
+            # Single-leg (unusual) or legacy position without long_contract_symbol
+            alpaca_client.close_position(short_symbol, qty=close_qty)
+        else:
+            # Fallback: close by ticker (legacy positions without contract symbols)
+            logger.warning(
+                "Position %d (%s): no contract symbols — partial close by ticker",
+                pos_id, ticker,
+            )
+            alpaca_client.close_position(ticker, qty=close_qty)
+    except Exception as e:
+        logger.error(
+            "Partial close Alpaca call failed for position %d (%s): %s — "
+            "trailing stop is active; full close will fire on next tick if stop breaches",
+            pos_id, ticker, e,
+        )
+
+
+def _send_close_notification(
+    bot_token: str, chat_id: str,
+    ticker: str, pos_id: int,
+    reason: str, pnl_pct: float, pnl_usd: float,
+) -> None:
+    """Route trade-closed notification through Alert Broker."""
+    emoji  = "✅" if pnl_pct > 0 else "❌"
+    result = "WIN" if pnl_pct > 0 else "LOSS"
+    _send_alert(
+        source="alpha-exit-monitor",
+        level="INFO",
+        title=f"{emoji} ALPHA TRADE CLOSED — {ticker} — {result} | P&L: {pnl_pct*100:+.1f}% (${pnl_usd:+,.0f})",
+        body=f"Reason: {reason} | Position #{pos_id}",
+        dedup_key=f"trade_closed_{pos_id}",
+        targets=["nexus_health_group"],
+    )
+
+
+def _send_roll_alert(
+    bot_token: str, chat_id: str,
+    ticker: str, pos_id: int,
+    dte: int, pnl_pct: float,
+) -> None:
+    """Route roll-reminder notification through Alert Broker."""
+    _send_alert(
+        source="alpha-exit-monitor",
+        level="WARNING",
+        title=f"⏰ ALPHA ROLL NEEDED — {ticker} | DTE: {dte} | P&L: {pnl_pct*100:+.1f}%",
+        body=f"Position #{pos_id} — consider rolling forward",
+        dedup_key=f"roll_needed_{pos_id}",
+        targets=["nexus_health_group"],
+    )
+
+
+def _release_capital_allocation(capital_router_url: str, position_id: int, arena: str) -> None:
+    """
+    FIX #1: Release capital after position close.
+    
+    After a position is successfully closed on Alpaca, notify the Capital Router
+    to release the allocation lock. This unblocks capital for new positions.
+    
+    Handles both full closes and partial closes. For partial closes, capital is
+    released proportionally.
+    
+    Args:
+        capital_router_url: Capital Router base URL (e.g., http://localhost:9100)
+        position_id: Position ID that was closed
+        arena: Arena name (alpha/prime) for tracking
+    """
+    try:
+        import httpx
+        # Query capital router for allocations tied to this position
+        async def _release_async():
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                # POST to capital router to release allocation for this position
+                resp = await client.post(
+                    f"{capital_router_url}/release-allocation/{position_id}",
+                    json={"arena": arena, "position_id": position_id}
+                )
+                if resp.status_code == 200:
+                    logger.info(
+                        "Capital released for position %d (arena=%s)",
+                        position_id, arena
+                    )
+                else:
+                    logger.warning(
+                        "Capital release returned %d for position %d",
+                        resp.status_code, position_id
+                    )
+        
+        # Run async call in event loop or fallback to sync
+        try:
+            import asyncio
+            asyncio.run(_release_async())
+        except RuntimeError:
+            # No event loop available — use sync httpx
+            import httpx as _sync_httpx
+            resp = _sync_httpx.post(
+                f"{capital_router_url}/release-allocation/{position_id}",
+                json={"arena": arena, "position_id": position_id},
+                timeout=3.0
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    "Capital released for position %d (arena=%s)",
+                    position_id, arena
+                )
+            else:
+                logger.warning(
+                    "Capital release returned %d for position %d",
+                    resp.status_code, position_id
+                )
+    except Exception as e:
+        logger.error("Failed to release capital for position %d: %s", position_id, e)

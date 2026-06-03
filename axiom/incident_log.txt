@@ -1,0 +1,6 @@
+[2026-05-11 09:54 ET] BLOCKER: Sage submission 422 errors
+Status: ESCALATED to SOVEREIGN + GENESIS + VECTOR
+Details: 241 total errors, Sage 20 consecutive, market hours impact
+Diagnosed: Submission format mismatch (root cause TBD)
+Attempts: 1/3 (escalated before max)
+Follow-up: 09:59 ET

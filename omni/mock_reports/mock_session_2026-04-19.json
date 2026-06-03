@@ -1,0 +1,233 @@
+{
+  "date": "2026-04-19",
+  "started_at": "2026-04-19T18:35:50.142700-04:00",
+  "finished_at": "2026-04-19T18:35:52.910036-04:00",
+  "duration_s": 2.1751580238342285,
+  "go_count": 3,
+  "no_go_count": 3,
+  "blocked_count": 4,
+  "railway_healthy": true,
+  "railway_version": "9",
+  "scanner_active": true,
+  "total_simulated_pnl": 455.13,
+  "trades": [
+    {
+      "id": 1,
+      "ticker": "NVDA",
+      "direction": "CALL",
+      "strike": 875.0,
+      "dte": 35,
+      "ivr": 52,
+      "agent": "Cipher",
+      "axiom_passed": true,
+      "verdict": "NO-GO",
+      "confidence": 60,
+      "block_reason": null,
+      "simulated_pnl": null,
+      "elapsed_ms": 0.21982192993164062,
+      "pipeline_steps": [
+        "[Cipher] Screen \u2192 NVDA CALL $875.0strike DTE=35",
+        "Axiom: PASS (all 11 layers)",
+        "Claude: score=62 | momentum+macro alignment",
+        "Gemini: score=51 | IV=elevated, IVR=52",
+        "DeepSeek: score=69 | quant pattern recognized",
+        "OMNI consensus: 60.7 \u2192 NO-GO"
+      ]
+    },
+    {
+      "id": 2,
+      "ticker": "AAPL",
+      "direction": "CALL",
+      "strike": 190.0,
+      "dte": 28,
+      "ivr": 38,
+      "agent": "Atlas",
+      "axiom_passed": true,
+      "verdict": "NO-GO",
+      "confidence": 64,
+      "block_reason": null,
+      "simulated_pnl": null,
+      "elapsed_ms": 0.10395050048828125,
+      "pipeline_steps": [
+        "[Atlas] Screen \u2192 AAPL CALL $190.0strike DTE=28",
+        "Axiom: PASS (all 11 layers)",
+        "Claude: score=70 | momentum+macro alignment",
+        "Gemini: score=64 | IV=moderate, IVR=38",
+        "DeepSeek: score=60 | quant pattern recognized",
+        "OMNI consensus: 64.7 \u2192 NO-GO"
+      ]
+    },
+    {
+      "id": 3,
+      "ticker": "TSLA",
+      "direction": "PUT",
+      "strike": 165.0,
+      "dte": 42,
+      "ivr": 71,
+      "agent": "Sage",
+      "axiom_passed": true,
+      "verdict": "GO",
+      "confidence": 67,
+      "block_reason": null,
+      "simulated_pnl": 167.66,
+      "elapsed_ms": 0.1289844512939453,
+      "pipeline_steps": [
+        "[Sage] Screen \u2192 TSLA PUT $165.0strike DTE=42",
+        "Axiom: PASS (all 11 layers)",
+        "Claude: score=61 | momentum+macro alignment",
+        "Gemini: score=84 | IV=elevated, IVR=71",
+        "DeepSeek: score=57 | quant pattern recognized",
+        "OMNI consensus: 67.3 \u2192 GO"
+      ]
+    },
+    {
+      "id": 4,
+      "ticker": "SPY",
+      "direction": "CALL",
+      "strike": 520.0,
+      "dte": 14,
+      "ivr": 22,
+      "agent": "Cipher",
+      "axiom_passed": false,
+      "verdict": "BLOCKED",
+      "confidence": 0,
+      "block_reason": "DTE 14 < 21 \u2014 too short",
+      "simulated_pnl": null,
+      "elapsed_ms": 0.06771087646484375,
+      "pipeline_steps": [
+        "[Cipher] Screen \u2192 SPY CALL $520.0strike DTE=14",
+        "Axiom: BLOCK \u2014 DTE 14 < 21 \u2014 too short",
+        "AXIOM BLOCK \u2014 synthesis skipped"
+      ]
+    },
+    {
+      "id": 5,
+      "ticker": "META",
+      "direction": "CALL",
+      "strike": 480.0,
+      "dte": 33,
+      "ivr": 44,
+      "agent": "Atlas",
+      "axiom_passed": true,
+      "verdict": "NO-GO",
+      "confidence": 63,
+      "block_reason": null,
+      "simulated_pnl": null,
+      "elapsed_ms": 0.09965896606445312,
+      "pipeline_steps": [
+        "[Atlas] Screen \u2192 META CALL $480.0strike DTE=33",
+        "Axiom: PASS (all 11 layers)",
+        "Claude: score=60 | momentum+macro alignment",
+        "Gemini: score=63 | IV=moderate, IVR=44",
+        "DeepSeek: score=66 | quant pattern recognized",
+        "OMNI consensus: 63.0 \u2192 NO-GO"
+      ]
+    },
+    {
+      "id": 6,
+      "ticker": "AMZN",
+      "direction": "PUT",
+      "strike": 175.0,
+      "dte": 29,
+      "ivr": 18,
+      "agent": "Sage",
+      "axiom_passed": true,
+      "verdict": "GO",
+      "confidence": 76,
+      "block_reason": null,
+      "simulated_pnl": 137.28,
+      "elapsed_ms": 0.13589859008789062,
+      "pipeline_steps": [
+        "[Sage] Screen \u2192 AMZN PUT $175.0strike DTE=29",
+        "Axiom: PASS (all 11 layers)",
+        "Claude: score=87 | momentum+macro alignment",
+        "Gemini: score=88 | IV=moderate, IVR=18",
+        "DeepSeek: score=53 | quant pattern recognized",
+        "OMNI consensus: 76.0 \u2192 GO"
+      ]
+    },
+    {
+      "id": 7,
+      "ticker": "MSFT",
+      "direction": "CALL",
+      "strike": 415.0,
+      "dte": 45,
+      "ivr": 58,
+      "agent": "Cipher",
+      "axiom_passed": true,
+      "verdict": "GO",
+      "confidence": 77,
+      "block_reason": null,
+      "simulated_pnl": 150.19,
+      "elapsed_ms": 0.1990795135498047,
+      "pipeline_steps": [
+        "[Cipher] Screen \u2192 MSFT CALL $415.0strike DTE=45",
+        "Axiom: PASS (all 11 layers)",
+        "Claude: score=89 | momentum+macro alignment",
+        "Gemini: score=76 | IV=elevated, IVR=58",
+        "DeepSeek: score=66 | quant pattern recognized",
+        "OMNI consensus: 77.0 \u2192 GO"
+      ]
+    },
+    {
+      "id": 8,
+      "ticker": "GOOGL",
+      "direction": "CALL",
+      "strike": 170.0,
+      "dte": 38,
+      "ivr": 6,
+      "agent": "Atlas",
+      "axiom_passed": false,
+      "verdict": "BLOCKED",
+      "confidence": 0,
+      "block_reason": "IVR 6 < 15 \u2014 premium too cheap for credit spread",
+      "simulated_pnl": null,
+      "elapsed_ms": 0.06413459777832031,
+      "pipeline_steps": [
+        "[Atlas] Screen \u2192 GOOGL CALL $170.0strike DTE=38",
+        "Axiom: BLOCK \u2014 IVR 6 < 15 \u2014 premium too cheap for credit spread",
+        "AXIOM BLOCK \u2014 synthesis skipped"
+      ]
+    },
+    {
+      "id": 9,
+      "ticker": "QQQ",
+      "direction": "PUT",
+      "strike": 430.0,
+      "dte": 31,
+      "ivr": 61,
+      "agent": "Cipher",
+      "axiom_passed": false,
+      "verdict": "BLOCKED",
+      "confidence": 0,
+      "block_reason": "Position cap reached (3/3 open)",
+      "simulated_pnl": null,
+      "elapsed_ms": 0.06079673767089844,
+      "pipeline_steps": [
+        "[Cipher] Screen \u2192 QQQ PUT $430.0strike DTE=31",
+        "Axiom: BLOCK \u2014 Position cap reached (3/3 open)",
+        "AXIOM BLOCK \u2014 synthesis skipped"
+      ]
+    },
+    {
+      "id": 10,
+      "ticker": "COIN",
+      "direction": "CALL",
+      "strike": 220.0,
+      "dte": 25,
+      "ivr": 88,
+      "agent": "Sage",
+      "axiom_passed": false,
+      "verdict": "BLOCKED",
+      "confidence": 0,
+      "block_reason": "Position cap reached (3/3 open)",
+      "simulated_pnl": null,
+      "elapsed_ms": 0.06198883056640625,
+      "pipeline_steps": [
+        "[Sage] Screen \u2192 COIN CALL $220.0strike DTE=25",
+        "Axiom: BLOCK \u2014 Position cap reached (3/3 open)",
+        "AXIOM BLOCK \u2014 synthesis skipped"
+      ]
+    }
+  ]
+}

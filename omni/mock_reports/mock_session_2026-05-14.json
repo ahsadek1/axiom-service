@@ -1,0 +1,59 @@
+{
+  "session_id": "MOCK-20260514-183514",
+  "started_at": "2026-05-14T18:35:14.456559-04:00",
+  "finished_at": "2026-05-14T18:39:21.419999-04:00",
+  "duration_s": 246.96344,
+  "passed": 3,
+  "total": 7,
+  "cycles": [
+    {
+      "number": 1,
+      "name": "Clean P1 Concordance",
+      "passed": false,
+      "details": "No Alpaca order submitted within 60s. exec_health=1/True",
+      "elapsed_s": 96.645024061203
+    },
+    {
+      "number": 2,
+      "name": "P2 Concordance",
+      "passed": false,
+      "details": "No GO after 90s. buffer window: {'AVGO/bullish': {'agents_submitted': ['Cipher', 'Atlas'], 'count': 2, 'scores': {'Cipher': 63.0, 'Atlas': 63.0}, 'concordance': None, 'omni_dispatched': False}, 'ETN/bearish': {'agents_submitted': ['Cipher', 'Atlas'], 'count': 2, 'scores': {'Cipher': 60.0, 'Atlas': 60.0}, 'concordance': None, 'omni_dispatched': False}, 'GOOGL/bullish': {'agents_submitted': ['Cipher', 'Atlas'], 'count': 2, 'scores': {'Cipher': 88.0, 'Atlas': 84.0}, 'concordance': 'P2', 'omni_dispatched': 1}, 'HLT/bullish': {'agents_submitted': ['Atlas'], 'count': 1, 'scores': {'Atlas': 55.0}, 'concordance': None, 'omni_dispatched': False}, 'STLD/bullish': {'agents_submitted': ['Cipher', 'Atlas'], 'count': 2, 'scores': {'Cipher': 69.0, 'Atlas': 69.0}, 'concordance': 'P2', 'omni_dispatched': 1}, 'TMO/bearish': {'agents_submitted': ['Atlas'], 'count': 1, 'scores': {'Atlas': 59.0}, 'concordance': None, 'omni_dispatched': False}, 'WDC/bullish': {'agents_submitted': ['Atlas', 'Cipher'], 'count': 2, 'scores': {'Atlas': 73.0, 'Cipher': 73.0}, 'concordance': 'P2', 'omni_dispatched': 1}}",
+      "elapsed_s": 91.0219349861145
+    },
+    {
+      "number": 3,
+      "name": "Score Rejection Gate",
+      "passed": false,
+      "details": "Expected all 422, got: [409, 409, 200]",
+      "elapsed_s": 0.07886195182800293
+    },
+    {
+      "number": 4,
+      "name": "Invalid Ticker Injection",
+      "passed": false,
+      "details": "BADTICKER=HTTP 200 UNEXPECTED | MSFT=accepted | elapsed=0.1s",
+      "elapsed_s": 0.07813596725463867
+    },
+    {
+      "number": 7,
+      "name": "Idempotency",
+      "passed": true,
+      "details": "First=accepted | Second=409 deduped | gap=12ms | elapsed=0.0s",
+      "elapsed_s": 0.034415245056152344
+    },
+    {
+      "number": 10,
+      "name": "Bearish Direction",
+      "passed": true,
+      "details": "Bearish TSLA P1 \u2192 OMNI GO | elapsed=15.8s",
+      "elapsed_s": 15.759541034698486
+    },
+    {
+      "number": 13,
+      "name": "Malformed Payload",
+      "passed": true,
+      "details": "All 5 payloads rejected | elapsed=0.0s",
+      "elapsed_s": 0.027978181838989258
+    }
+  ]
+}
