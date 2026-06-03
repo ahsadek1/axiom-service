@@ -56,6 +56,7 @@ class PoolHealthMonitor:
         self._ping_future = None
         self._restart_count = 0
         self._max_retries = 3
+        self._startup_time = time.time()  # GENESIS FIX 2026-06-02: Skip health checks during warm-up
 
     def start(self) -> None:
         """Start background health monitor thread."""
@@ -98,9 +99,16 @@ class PoolHealthMonitor:
 
     def _check_pool_health(self) -> None:
         """Run a single health check cycle."""
+        # GENESIS FIX 2026-06-02: Skip health checks for 30s after startup
+        # ThreadPoolExecutor creates worker threads lazily (on first task submission).
+        # At startup, _threads is empty even though the pool is healthy.
+        # This prevents false "dead workers" alerts during initialization.
+        if time.time() - self._startup_time < 30:
+            return
+        
         # Check 0: Detect and respawn dead worker threads (FIX-WORKER-LIFECYCLE 2026-06-01)
         live_workers = len([t for t in self.pool._threads if t.is_alive()])
-        if live_workers < self.pool._max_workers:
+        if live_workers < self.pool._max_workers and live_workers > 0:
             logger.critical(
                 "POOL HEALTH: Only %d/%d workers alive — spawning %d replacement worker(s)",
                 live_workers,

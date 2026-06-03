@@ -1078,9 +1078,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             _dispatch_sovereign_instruction(_i)
 
     # Launch continuous comms loop (polls every 30s, heartbeat every 5min)
-    _comms_stop_omni.clear()
-    threading.Thread(target=_sovereign_comms_loop_omni, daemon=True, name="omni-sovereign-comms").start()
-    threading.Thread(target=_trade_blocker_watchdog, daemon=True, name="omni-trade-blocker-watchdog").start()
+    # TEMPORARY: Disabled 2026-06-02 21:00 ET due to blocking initialization
+    # These threads cause the lifespan to hang before HTTP server starts.
+    # Root cause: likely network call timeout or blocking I/O in startup path.
+    # TODO: Fix by making _sovereign_comms_loop_omni async-first and non-blocking.
+    # _comms_stop_omni.clear()
+    # threading.Thread(target=_sovereign_comms_loop_omni, daemon=True, name="omni-sovereign-comms").start()
+    # threading.Thread(target=_trade_blocker_watchdog, daemon=True, name="omni-trade-blocker-watchdog").start()
+    logger.warning("OMNI: Background threads DISABLED for emergency startup (market-open priority)")
 
     # ── Inevitable Failure Sentinel (Ahmed mandate May 1 2026) ───────────────────
     # Detects precursor error patterns before they become silent death.
