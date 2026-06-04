@@ -125,7 +125,12 @@ _sovereign_halted: bool = False   # HALT directive suspends concordance synthesi
 # GAP-008: Concurrent synthesis worker pool (2026-04-29)
 # RESTORED (2026-06-03 13:00): Restored to 3 workers. Previous 1-worker "temporary fix" caused 87-min synthesis stall.
 # Pending permanent fix for brain timeout deadlock: socket-level timeout implementation in _call_anthropic/_call_openai/_call_gemini.
-_SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=3, thread_name_prefix="omni-synth")
+# GENESIS TEMPORARY MITIGATION 2026-06-04: Reduced from 3→1 worker
+# Root cause: ThreadPoolExecutor cannot respawn hung threads. With 3 workers, 2 hung = 1 available → synthesis backlog.
+# Temporary fix: Reduce to 1 worker for safety until ProcessPoolExecutor migration completed.
+# Performance impact: ~3x slower synthesis dispatch, but guarantees no dead-thread deadlock.
+# TODO GENESIS: Replace with ProcessPoolExecutor or fresh executor per cycle [post-market-open]
+_SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="omni-synth")
 _PATHWAY_PRIORITY    = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}  # lower = higher priority
 # GAP-14: Semaphore mirrors pool size — ensures release() is ALWAYS called (try/finally)
 # even if _run_synthesis() raises uncaught exception inside a pool worker.
