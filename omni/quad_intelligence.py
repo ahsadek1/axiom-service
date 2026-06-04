@@ -304,7 +304,7 @@ def run_all_brains(
     # FIX-CLAUDE-TIMEOUT (2026-06-01): Updated grace period from 30s to 15s (tighter deadline).
     # With 45s per-brain timeout, 4 brains in parallel complete in ~45s max.
     # Hard deadline of 60s allows for overhead + thread pool scheduling.
-    _HARD_DEADLINE = min(BRAIN_TIMEOUT_SECONDS * 4 // 3, 60)  # 60s hard stop (was 150s)
+    _HARD_DEADLINE = min(BRAIN_TIMEOUT_SECONDS * 4 // 3, 45)  # CANARY FIX 2026-06-04: 45s hard stop (from 60s) to prevent canary timeout (120s window). 4 brains * 30s timeout / 3 = 40s + 5s buffer = 45s max.
 
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omni-brain")
     futures = {

@@ -968,11 +968,32 @@ def _run_startup_reconciliation() -> None:
 
         # Also include pending slots left by a previous crash
         from database import get_conn as _get_conn
+        import datetime as _dt_pending
         with _get_conn(settings.alpha_db_path) as _conn:
             _pending_rows = _conn.execute(
                 "SELECT * FROM positions WHERE status='pending'"
             ).fetchall()
         pending_positions = [dict(r) for r in _pending_rows]
+        
+        # AUTO-CLEANUP: Any pending position older than 24 hours is treated as stale
+        # (order was never filled or execution failed silently)
+        cutoff_time = _dt_pending.datetime.now(_dt_pending.timezone.utc) - _dt_pending.timedelta(hours=24)
+        for pend_pos in pending_positions:
+            created_str = pend_pos.get("opened_at") or pend_pos.get("created_at") or ""
+            try:
+                created_dt = _dt_pending.datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                if created_dt < cutoff_time:
+                    # This pending position is >24h old — close it immediately
+                    pos_id = pend_pos.get("id")
+                    ticker = pend_pos.get("ticker", "UNKNOWN")
+                    reason = f"reconciled_stale_pending: pending position >24h old, never filled (created={created_str})"
+                    close_stale_position(settings.alpha_db_path, pos_id, reason)
+                    logger.warning(
+                        "Startup reconciliation: auto-closed stale pending position #%d %s (age >24h, never filled)",
+                        pos_id, ticker,
+                    )
+            except Exception as _pend_err:
+                logger.warning("Startup reconciliation: failed to parse pending position age: %s", _pend_err)
 
         all_db_positions = db_positions + pending_positions
 

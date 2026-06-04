@@ -99,14 +99,17 @@ class PoolHealthMonitor:
 
     def _check_pool_health(self) -> None:
         """Run a single health check cycle."""
-        # GENESIS FIX 2026-06-02: Skip health checks for 30s after startup
+        # CIPHER FIX 2026-06-04: Skip health checks for 120s after startup (extended from 30s)
         # ThreadPoolExecutor creates worker threads lazily (on first task submission).
         # At startup, _threads is empty even though the pool is healthy.
-        # This prevents false "dead workers" alerts during initialization.
-        if time.time() - self._startup_time < 30:
+        # First synthesis may not arrive for 60-90s after service start.
+        # This extended window prevents false "dead workers" alerts during initialization.
+        if time.time() - self._startup_time < 120:
             return
         
         # Check 0: Detect and respawn dead worker threads (FIX-WORKER-LIFECYCLE 2026-06-01)
+        # Only trigger if we have SOME workers but fewer than expected (indicates actual death).
+        # Do NOT trigger if workers == 0 (pool hasn't spawned yet, still valid during early requests).
         live_workers = len([t for t in self.pool._threads if t.is_alive()])
         if live_workers < self.pool._max_workers and live_workers > 0:
             logger.critical(

@@ -35,6 +35,7 @@ from pydantic import BaseModel, field_validator
 
 from config import BASE_POSITION_SIZE, MIN_BRAINS_REQUIRED, load_settings
 from axiom_client import assess_ticker, get_regime
+from worker_monitor import WorkerHealthMonitor
 from database import (
     get_conn,
     get_recent_syntheses,
@@ -125,19 +126,17 @@ _sovereign_halted: bool = False   # HALT directive suspends concordance synthesi
 # GAP-008: Concurrent synthesis worker pool (2026-04-29)
 # RESTORED (2026-06-03 13:00): Restored to 3 workers. Previous 1-worker "temporary fix" caused 87-min synthesis stall.
 # Pending permanent fix for brain timeout deadlock: socket-level timeout implementation in _call_anthropic/_call_openai/_call_gemini.
-# GENESIS TEMPORARY MITIGATION 2026-06-04: Reduced from 3→1 worker
-# Root cause: ThreadPoolExecutor cannot respawn hung threads. With 3 workers, 2 hung = 1 available → synthesis backlog.
-# Temporary fix: Reduce to 1 worker for safety until ProcessPoolExecutor migration completed.
-# Performance impact: ~3x slower synthesis dispatch, but guarantees no dead-thread deadlock.
-# TODO GENESIS: Replace with ProcessPoolExecutor or fresh executor per cycle [post-market-open]
-_SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="omni-synth")
+# SOVEREIGN FIX 2026-06-04: Restored to 3 workers with WorkerHealthMonitor
+# Socket-level timeout fix (6/2) prevents brain API hangs.
+# WorkerHealthMonitor detects degradation and triggers auto-restart when capacity < 2/3.
+_SYNTHESIS_POOL      = _ThreadPoolExecutor(max_workers=3, thread_name_prefix="omni-synth")
 _PATHWAY_PRIORITY    = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}  # lower = higher priority
 # GAP-14: Semaphore mirrors pool size — ensures release() is ALWAYS called (try/finally)
 # even if _run_synthesis() raises uncaught exception inside a pool worker.
 _SYNTHESIS_SEMAPHORE = __import__("threading").Semaphore(3)
 
-# P0 FIX (May 14, 2026): Pool health monitor initialized in lifespan, accessible here for marking completions
-_pool_monitor: Optional[PoolHealthMonitor] = None
+# P0 FIX (June 4, 2026): Automated worker health monitor with self-healing
+_worker_monitor: Optional[WorkerHealthMonitor] = None
 
 
 def _dispatch_sovereign_instruction(instr: dict) -> None:
@@ -1102,24 +1101,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Failure sentinel started ✅")
     _nns_watchdog.start()
 
-    # ── FIX P0: Initialize OMNI Synthesis Pool Health Monitor (May 14, 2026) ────
-    # ROOT CAUSE: Monitor was imported but never started. Coroutine crashes went undetected.
-    # SOLUTION: Start monitor on service startup; it auto-restarts failed synthesis pool.
-    global _pool_monitor
-    _pool_monitor = PoolHealthMonitor(
-        pool=_SYNTHESIS_POOL,
-        semaphore=_SYNTHESIS_SEMAPHORE,
-        check_interval_sec=10,
-        hang_timeout_sec=45,
-        silence_window_sec=20 * 60,  # 20 minutes
+    # ── FIX P0: Initialize OMNI Synthesis Pool Health Monitor (June 4, 2026) ────
+    # SOVEREIGN FIX: Automated worker health monitor with self-healing restart
+    # Detects when workers die and triggers service restart when capacity < 2/3
+    global _worker_monitor
+    _worker_monitor = WorkerHealthMonitor(
+        executor=_SYNTHESIS_POOL,
+        max_workers=3,
     )
-    _pool_monitor.start()
-    logger.info("OMNI Synthesis Pool Health Monitor started ✅ (check_interval=10s, silence_window=1200s)")
+    _worker_monitor.start()
+    logger.info("OMNI Worker Health Monitor started ✅ (checking every 10s, restart if alive < 2)")
 
     yield
 
-    if _pool_monitor:
-        _pool_monitor.shutdown()
+    if _worker_monitor:
+        _worker_monitor.stop()
     _comms_stop_omni.set()
     report("omni", "status", {"event": "stopped"})
     logger.info("OMNI service stopped")

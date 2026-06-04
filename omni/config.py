@@ -22,7 +22,7 @@ VOTES_REQUIRED_GO         = 2   # 2/4 brains GO → GO (pathway size)
 # FIX 2026-06-02 14:30 ET: Increased timeout to 60s due to API degradation across Anthropic + Gemini.
 # Recent synthesis errors: 11 timeout/connection errors in 30 min.
 # Action: Give APIs 60s instead of 45s + add 1 retry for transient failures.
-BRAIN_TIMEOUT_SECONDS     = 60   # increased from 45s to account for provider-side latency
+BRAIN_TIMEOUT_SECONDS     = 30   # CANARY FIX 2026-06-04 09:06: lowered from 60s to prevent worker deadlock. Anthropic/Gemini timeout @30s + 5s buffer = 35s per brain max.
 BRAIN_RETRY_COUNT         = 1    # 1 retry on timeout/transient error (changed from 0)
 MIN_BRAINS_REQUIRED       = 2    # 2+ brains required for synthesis (was enforcing all 4). Enables cascade resilience.
 

@@ -35,6 +35,7 @@ class WorkerHealthMonitor:
         self.restart_callback = restart_callback or self._default_restart
         self.min_healthy_workers = max(1, (max_workers * 2) // 3)  # 2/3 threshold
         
+        self._startup_time = time.time()  # GENESIS FIX 2026-06-04: 30s grace period
         self._last_health_check = time.time()
         self._consecutive_degraded = 0
         self._lock = Lock()
@@ -78,6 +79,12 @@ class WorkerHealthMonitor:
     def _check_and_heal(self):
         """Check worker health; restart if degraded."""
         with self._lock:
+            # GENESIS FIX 2026-06-04: Skip checks during 30s startup grace period
+            # ThreadPoolExecutor doesn't spawn threads until work arrives
+            if time.time() - self._startup_time < 30:
+                self._consecutive_degraded = 0
+                return
+            
             # Count alive workers
             alive = len([f for f in self.executor._threads if f.is_alive()])
             
@@ -117,10 +124,14 @@ class WorkerHealthMonitor:
             self._last_health_check = time.time()
     
     def _default_restart(self):
-        """Default restart callback: restart the Python process via os.execv."""
-        logger.critical("Restarting OMNI service via os.execv")
+        """Default restart callback: notify and exit (launch-service.sh will restart).
         
-        # Notify SOVEREIGN before restart
+        GENESIS FIX 2026-06-04: os.execv causes circular import in uvicorn.logging.py.
+        Instead, log critical error and exit. launch-service.sh detects exit and restarts.
+        """
+        logger.critical("OMNI worker pool degraded — exiting for supervisor restart")
+        
+        # Notify SOVEREIGN before exit
         try:
             import requests
             requests.post(
@@ -128,16 +139,13 @@ class WorkerHealthMonitor:
                 json={
                     "from": "omni",
                     "to": "sovereign",
-                    "message": "OMNI worker pool restart triggered by monitor | alive workers < 2/3",
+                    "message": "OMNI worker pool degraded (alive < 2/3) — restarting via supervisor",
                 },
                 timeout=2
             )
         except Exception as e:
             logger.warning("Failed to notify SOVEREIGN: %s", e)
         
-        # Wait for notification to be sent
-        time.sleep(0.5)
-        
-        # Restart process
+        # Exit cleanly — launch-service.sh will detect and restart
         import sys
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        sys.exit(1)
