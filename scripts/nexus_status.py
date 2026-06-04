@@ -44,7 +44,7 @@ LOCAL_SERVICES = [
     {"name": "Oracle",       "port": 8007, "path": "/ping", "key": "status"},
     {"name": "AILS",         "port": 8008, "key": "status"},
     {"name": "Guardian",     "port": 8009, "key": "status"},
-    {"name": "Cap-Router",   "port": 8000, "key": "total_deployed"},
+    {"name": "Cap-Router",   "port": 9100, "key": "total_deployed"},
     {"name": "Cipher",       "port": 9001, "key": "picks_today"},
     {"name": "Atlas",        "port": 9002, "key": "picks_today"},
     {"name": "Sage",         "port": 9003, "key": "picks_today"},

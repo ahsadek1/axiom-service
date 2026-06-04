@@ -79,9 +79,10 @@ class WorkerHealthMonitor:
     def _check_and_heal(self):
         """Check worker health; restart if degraded."""
         with self._lock:
-            # GENESIS FIX 2026-06-04: Skip checks during 30s startup grace period
-            # ThreadPoolExecutor doesn't spawn threads until work arrives
-            if time.time() - self._startup_time < 30:
+            # GENESIS FIX 2026-06-04: Skip checks during 60s startup grace period
+            # ThreadPoolExecutor doesn't spawn threads until work arrives.
+            # Extended to 60s (was 30s) to account for slow API probe times.
+            if time.time() - self._startup_time < 60:
                 self._consecutive_degraded = 0
                 return
             
