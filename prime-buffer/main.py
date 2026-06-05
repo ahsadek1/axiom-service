@@ -402,8 +402,14 @@ def submit_pick(
                     },
                 )
     except Exception as _e:
-        logger.warning("Position cap check failed: %s (fail-open)", _e)
-        pass  # fail-open: allow submission if Alpaca unreachable
+        logger.critical("Position cap check FAILED — blocking as safety measure: %s", _e)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "accepted": False,
+                "reason": f"Cannot verify position cap: {_e} — execution blocked",
+            },
+        )
 
     _agent_window = body.window_id or window_id
     from shared.window_coordinator import evaluate_window  # G7
