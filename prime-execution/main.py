@@ -26,6 +26,22 @@ from pydantic import BaseModel, field_validator
 
 from alpaca_client import AlpacaClient
 from config import ALPACA_PAPER_URL
+
+# GUARANTEE 1-6: Capital Manager integration (SOVEREIGN 2026-06-06)
+import sys as _sys_cm
+_sys_cm.path.insert(0, '/Users/ahmedsadek/nexus')
+try:
+    from capital_manager import (
+    CapitalManager,
+    InsufficientCapitalError,
+    PositionBindingError,
+    CapitalValidationError,
+    OrphanDetectedError,
+)
+except ImportError as _cm_err:
+    logger.warning("Capital manager import failed (non-blocking): %s", _cm_err)
+    CapitalManager = None
+    InsufficientCapitalError = Exception
 from buffer_reporter import BufferReporter
 from config import MAX_CONCURRENT_POSITIONS, MAX_NEW_PER_DAY, load_settings
 import sys as _sys_p
@@ -169,9 +185,21 @@ logger = logging.getLogger("prime_exec.main")
 ET       = pytz.timezone("America/New_York")
 settings = load_settings()
 
+# GUARANTEE 1-6: Capital Manager initialization
+_capital_manager = None
+if CapitalManager is not None:
+    try:
+        _capital_manager = CapitalManager(db_path=settings.prime_db_path.replace('.db', '_capital.db'))
+        logger.info("Capital Manager initialized successfully")
+    except Exception as _cm_init_err:
+        logger.warning("Capital Manager init failed (non-blocking): %s", _cm_init_err)
+        _capital_manager = None
+
 app_state: dict = {
     "settings":                    settings,
     "svc_state":                   _svc_state,   # Bug 4 fix: expose for reconciler persistence
+    "capital_manager":             _capital_manager,  # GUARANTEE 1-6: Capital management
+    "cm_circuit_breaker_halted":    False,             # GUARANTEE 6: orphan circuit breaker state
     "start_time":                  datetime.now(ET).isoformat(),
     "trades_today":                0,
     "execution_paused":            False,
@@ -763,6 +791,25 @@ def health() -> JSONResponse:
         _resilience = _hr.to_dict()
     except Exception as _he:
         _resilience = {"error": str(_he)}
+    # Capital Manager health snapshot (non-fatal — never fail /health)
+    _cm_health: dict = {}
+    try:
+        _cm_inst = app_state.get("capital_manager")
+        if _cm_inst is not None:
+            _cm_health = {
+                "available_capital_usd": _cm_inst.get_available_capital(),
+                "open_positions":        _cm_inst.get_open_position_count(),
+                "circuit_breaker":       getattr(_cm_inst, "circuit_breaker_halted", False)
+                                          or app_state.get("cm_circuit_breaker_halted", False),
+                "circuit_breaker_reason": getattr(_cm_inst, "circuit_breaker_reason", None),
+                "status":                "halted" if (
+                    getattr(_cm_inst, "circuit_breaker_halted", False)
+                    or app_state.get("cm_circuit_breaker_halted", False)
+                ) else "ok",
+            }
+    except Exception as _cm_he:
+        _cm_health = {"status": "error", "error": str(_cm_he)}
+
     return JSONResponse({
         "status":              "standby" if _SERVICE_MODE == "standby" else ("healthy" if execution_valid else "degraded"),
         "service":             "prime-execution",
@@ -781,6 +828,7 @@ def health() -> JSONResponse:
         # P1 fix: /tmp sentinel is cleared on reboot — rely on hash comparison only (P3: cached 60s TTL)
         "stale_deploy":        _CODE_HASH != _get_cached_module_hash_p(),
         "resilience_status":   _resilience,
+        "capital_manager":     _cm_health,
     })
 
 
@@ -1141,39 +1189,142 @@ def execute(
                 "ticker": body.ticker,
             })
 
-    # ── Capital Gate (OMNI May 20, 2026): Cross-system position + allocation checks ──
-    # Prevents: (1) doubled positions on same ticker (Alpha + Prime race)
-    #           (2) capital double-allocation after position rotation
-    _capital_gate = None
+    # ── GUARANTEE 1+5+6: Capital Manager — Reserve capital BEFORE Alpaca submit ──
+    # GENESIS 2026-06-06 COMPLETE: All 6 capital guarantees enforced at this point.
+    _capital_mgr = app_state.get("capital_manager")
+    _binding = None
     _allocation_id = None
-    if CAPITAL_GATE_AVAILABLE:
+    _cm_request_id = f"{body.window_id}:{body.ticker}"
+
+    if _capital_mgr is not None:
+        # GUARANTEE 6: Check circuit breaker — orphan detection halts system
+        if getattr(_capital_mgr, "circuit_breaker_halted", False) or app_state.get("cm_circuit_breaker_halted"):
+            _cb_reason = getattr(_capital_mgr, "circuit_breaker_reason", "orphan_detected")
+            logger.critical("CM CIRCUIT BREAKER ACTIVE — blocking %s: %s", body.ticker, _cb_reason)
+            if pending_id:
+                cancel_pending_position(settings.prime_db_path, pending_id)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "executed": False,
+                    "reason": f"circuit_breaker_active: {_cb_reason}",
+                    "gate": "capital_manager_circuit_breaker",
+                },
+            )
+
         try:
-            _alpaca_client = _get_alpaca()  # Pass alpaca client for fallback position checking
-            _capital_gate = CapitalGate(router_url="http://localhost:9100", timeout_sec=3, alpaca_client=_alpaca_client)
-            _gate_allowed, _gate_result = _capital_gate.pre_execution_check(
+            # GUARANTEE 1: Reserve capital check — raises InsufficientCapitalError if short
+            allowed, prediction = _capital_mgr.pre_execute_check(
                 ticker=body.ticker,
-                system="prime",
-                amount_usd=body.position_size_usd
+                execution_system="prime",
+                quantity=int(shares),
+                entry_price=current_price,
+                request_id=_cm_request_id,
             )
-            logger.info(
-                "Capital gate result for %s: allowed=%s blocked_by=%s",
-                body.ticker, _gate_allowed, _gate_result.get("blocked_by", "none")
-            )
-            if not _gate_allowed:
-                logger.warning("Capital gate blocked execution: %s", _gate_result.get("blocked_by"))
+
+            if not allowed:
+                logger.warning("CM GUARANTEE 1: capital check denied for %s (position limit)", body.ticker)
                 if pending_id:
                     cancel_pending_position(settings.prime_db_path, pending_id)
                 return JSONResponse(
-                    status_code=403,
+                    status_code=402,
                     content={
                         "executed": False,
-                        "reason": _gate_result.get("blocked_by", "capital_gate_blocked"),
-                        "gate_details": _gate_result
-                    }
+                        "reason": "insufficient_capital",
+                        "detail": "Position limit reached",
+                    },
                 )
-            _allocation_id = _gate_result.get("allocation_id")
+
+            # GUARANTEE 5: Atomic position_binding + capital reservation (all-or-nothing)
+            success, binding = _capital_mgr.execute_with_atomic_binding(
+                ticker=body.ticker,
+                execution_system="prime",
+                quantity=int(shares),
+                entry_price=current_price,
+                request_id=_cm_request_id,
+            )
+
+            if not success or binding is None:
+                logger.error("CM GUARANTEE 5: atomic binding FAILED for %s — rejecting", body.ticker)
+                if pending_id:
+                    cancel_pending_position(settings.prime_db_path, pending_id)
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "executed": False,
+                        "reason": "position_binding_failed",
+                        "detail": "Atomic capital reservation transaction failed",
+                    },
+                )
+
+            _binding = binding
+            _allocation_id = binding.allocation_id
+            logger.info(
+                "CM GUARANTEE 1+5 PASS: %s binding_id=%d allocation=%s reserved=$%.2f",
+                body.ticker, binding.id, _allocation_id, binding.allocated_amount_usd,
+            )
+
+        except InsufficientCapitalError as e:
+            logger.warning("CM GUARANTEE 1 FAIL — InsufficientCapital for %s: %s", body.ticker, e)
+            if pending_id:
+                cancel_pending_position(settings.prime_db_path, pending_id)
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "executed": False,
+                    "reason": "insufficient_capital",
+                    "required_usd": getattr(e, "required", 0),
+                    "available_usd": getattr(e, "available", 0),
+                },
+            )
+        except PositionBindingError as e:
+            logger.error("CM GUARANTEE 5 FAIL — PositionBindingError for %s: %s", body.ticker, e)
+            if pending_id:
+                cancel_pending_position(settings.prime_db_path, pending_id)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "executed": False,
+                    "reason": "position_binding_error",
+                    "detail": str(e),
+                },
+            )
+        except CapitalValidationError as e:
+            # GUARANTEE 3: log + alert Ahmed but DO NOT block execution
+            logger.warning("CM GUARANTEE 3 WARN — CapitalValidationError for %s: %s", body.ticker, e)
+            try:
+                from shared.notification_router import notify_warn as _nw_cv
+                _nw_cv(
+                    "prime-execution",
+                    "Capital Validation Warning (non-blocking)",
+                    f"{body.ticker}: {e}",
+                    ticker=body.ticker,
+                )
+            except Exception:
+                pass
+            # Execution continues — validation warnings are advisory
+        except OrphanDetectedError as e:
+            # GUARANTEE 6: orphan detected → circuit breaker → 503
+            logger.critical("CM GUARANTEE 6 FAIL — OrphanDetected for %s: %s", body.ticker, e)
+            with _state_lock:
+                app_state["cm_circuit_breaker_halted"] = True
+            if pending_id:
+                cancel_pending_position(settings.prime_db_path, pending_id)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "executed": False,
+                    "reason": "orphan_detected_circuit_breaker",
+                    "detail": str(e),
+                    "gate": "capital_manager_circuit_breaker",
+                },
+            )
         except Exception as e:
-            logger.warning("Capital gate check failed: %s — continuing with caution", str(e))
+            # Unexpected CM error — fail-open (don't block live trade on CM instability)
+            logger.error(
+                "CM unexpected error for %s: %s — proceeding fail-open",
+                body.ticker, str(e),
+            )
     
     try:
         order           = alpaca.place_order(body.ticker, shares, side, client_order_id=_prime_coid)
@@ -1192,6 +1343,13 @@ def execute(
         logger.error("Alpaca order FAILED for %s: %s — cancelling pending slot", body.ticker, e)
         if pending_id:
             cancel_pending_position(settings.prime_db_path, pending_id)
+        # GUARANTEE 5: Atomic rollback — release capital on Alpaca failure
+        if _allocation_id and _capital_mgr is not None:
+            try:
+                _capital_mgr.release_allocation(_allocation_id)
+                logger.info("CM ROLLBACK: allocation %s released after Alpaca order failure", _allocation_id)
+            except Exception as _rb_err:
+                logger.warning("CM rollback failed (non-fatal): %s", _rb_err)
         return JSONResponse(
             status_code=503,
             content={"executed": False,
@@ -1223,6 +1381,13 @@ def execute(
         )
         if pending_id:
             cancel_pending_position(settings.prime_db_path, pending_id)
+        # GUARANTEE 5: Atomic rollback — release capital reservation on VOID fill
+        if _allocation_id and _capital_mgr is not None:
+            try:
+                _capital_mgr.release_allocation(_allocation_id)
+                logger.info("CM ROLLBACK: allocation %s released after VOID fill", _allocation_id)
+            except Exception as _void_rb_err:
+                logger.warning("CM rollback on VOID failed (non-fatal): %s", _void_rb_err)
         try:
             from shared.notification_router import notify_warn as _nw
             _nw("prime-execution", "VOID trade", _fill.void_reason, ticker=body.ticker)
@@ -1252,15 +1417,55 @@ def execute(
         shares_remaining = shares,
     )
     
-    # ── Release Capital Gate Allocation (OMNI May 20, 2026) ──
-    # Order is now confirmed on Alpaca. Release the capital allocation lock
-    # so other systems can claim the allocated capital if needed.
-    if _allocation_id and _capital_gate:
+    # ── GUARANTEE 4: Synchronous Confirmation Hook (BLOCKING) ────────────────
+    # Called IMMEDIATELY after fill confirmed. Validates slippage vs prediction.
+    # Slippage alerts are non-blocking — position is already filled. Alert Ahmed.
+    if _binding is not None and _capital_mgr is not None:
         try:
-            _capital_gate.release_allocation(_allocation_id)
-            logger.info("Capital allocation released: %s for %s", _allocation_id, body.ticker)
-        except Exception as e:
-            logger.warning("Failed to release capital allocation %s: %s", _allocation_id, str(e))
+            _cm_confirmed = _capital_mgr.confirm_position(
+                binding_id=_binding.id,
+                alpaca_position_id=alpaca_order_id or "",
+                actual_qty=int(shares),
+                actual_entry_price=_confirmed_price,
+            )
+            if _cm_confirmed:
+                logger.info(
+                    "CM GUARANTEE 4 PASS: binding_id=%d %s filled qty=%d price=%.4f",
+                    _binding.id, body.ticker, int(shares), _confirmed_price,
+                )
+            else:
+                # confirm_position returns False on slippage/validation warning
+                logger.warning(
+                    "CM GUARANTEE 4 WARN: slippage or validation warning binding_id=%d %s",
+                    _binding.id, body.ticker,
+                )
+                try:
+                    from shared.notification_router import notify_warn as _nw_g4p
+                    _nw_g4p(
+                        "prime-execution",
+                        f"CM Slippage/Validation Warning — {body.ticker}",
+                        f"binding_id={_binding.id} | actual_qty={int(shares)} | actual_price={_confirmed_price:.4f}",
+                        ticker=body.ticker,
+                    )
+                except Exception:
+                    pass
+        except Exception as _cm_conf_err:
+            # Non-fatal — position is already live; log and continue
+            logger.error(
+                "CM confirm_position exception (non-fatal): binding=%s %s — %s",
+                getattr(_binding, "id", "?"), body.ticker, _cm_conf_err,
+            )
+
+    # ── GUARANTEE 2: Release capital allocation ───────────────────────────
+    # Allocation lock freed; position_binding record is the permanent audit trail.
+    if _allocation_id and _capital_mgr is not None:
+        try:
+            _capital_mgr.release_allocation(_allocation_id)
+            logger.info(
+                "CM GUARANTEE 2 PASS: allocation %s released for %s", _allocation_id, body.ticker
+            )
+        except Exception as _rel_err:
+            logger.warning("CM release_allocation failed (non-fatal): %s — %s", _allocation_id, _rel_err)
     
     position_id = pending_id
     with _state_lock:

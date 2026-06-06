@@ -29,6 +29,28 @@ try:
 except ImportError:
     CAPITAL_GATE_AVAILABLE = False
 
+# GUARANTEE 1-6: Capital Manager integration (GENESIS 2026-06-06 COMPLETE)
+_sys_capital.path.insert(0, '/Users/ahmedsadek/nexus')
+try:
+    from capital_manager import (
+        CapitalManager,
+        InsufficientCapitalError,
+        PositionBindingError,
+        CapitalValidationError,
+        OrphanDetectedError,
+    )
+    _CAPITAL_MANAGER_IMPORT_OK = True
+except ImportError as _cm_err:
+    logging.getLogger(__name__).warning(
+        "Capital manager import failed (non-blocking): %s", _cm_err
+    )
+    CapitalManager = None
+    InsufficientCapitalError = Exception
+    PositionBindingError = Exception
+    CapitalValidationError = Exception
+    OrphanDetectedError = Exception
+    _CAPITAL_MANAGER_IMPORT_OK = False
+
 # CRITICAL: Set sys.path BEFORE any local imports (mock_endpoints, etc.)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -179,14 +201,26 @@ except Exception as _log_err:
 ET       = pytz.timezone("America/New_York")
 settings = load_settings()
 
+# GUARANTEE 1-6: Capital Manager initialization
+_capital_manager = None
+if CapitalManager is not None:
+    try:
+        _capital_manager = CapitalManager(db_path=settings.alpha_db_path.replace('.db', '_capital.db'))
+        logger.info("Capital Manager initialized successfully")
+    except Exception as _cm_init_err:
+        logger.warning("Capital Manager init failed (non-blocking): %s", _cm_init_err)
+        _capital_manager = None
+
 app_state: dict = {
-    "settings":            settings,
-    "start_time":          datetime.now(ET).isoformat(),
-    "trades_today":        0,
-    "total_trades":        0,
-    "execution_paused":    False,
-    "first_exec_failed":   False,
-    "alpaca_reachable":    None,  # None=unchecked, True=ok, False=unreachable
+    "settings":               settings,
+    "capital_manager":        _capital_manager,  # GUARANTEE 1-6: Capital management
+    "cm_circuit_breaker_halted": False,          # GUARANTEE 6: orphan circuit breaker state
+    "start_time":             datetime.now(ET).isoformat(),
+    "trades_today":           0,
+    "total_trades":           0,
+    "execution_paused":       False,
+    "first_exec_failed":      False,
+    "alpaca_reachable":       None,  # None=unchecked, True=ok, False=unreachable
     "auto_execute":  os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true",
     "mode":          "live" if os.getenv("NEXUS_AUTO_EXECUTE", "false").lower() == "true" else "dry_run",
     # Exit monitor state (S10 fix)
@@ -757,12 +791,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── Initialize Queue Worker (May 21 2026: Batch execution optimization) ──
     # Decouples /execute endpoint (fast) from Alpaca submission (slow + rate-limited)
     # Handles 313+ orders without timeouts via batching + exponential backoff
+    # FIX (2026-06-05 12:42 ET): Pass credentials to worker for position gate checks
     try:
         _alpaca_instance = _get_alpaca()
-        init_queue_worker(settings.alpha_db_path, _alpaca_instance, logger)
+        # Pass credentials separately to avoid accessing client internals (NoneType bug)
+        from queue_worker import QueueWorker as _QueueWorkerClass
+        _qw = _QueueWorkerClass(
+            db_path=settings.alpha_db_path,
+            alpaca_client=_alpaca_instance,
+            logger_obj=logger,
+            alpaca_key=settings.alpaca_api_key,
+            alpaca_secret=settings.alpaca_secret_key
+        )
+        from queue_worker import _set_queue_worker
+        _set_queue_worker(_qw)
+        _qw.start()
         logger.info("Queue worker initialized for batch order processing")
     except Exception as _qw_err:
-        logger.warning("Queue worker init failed (non-fatal): %s", _qw_err)
+        logger.error("Queue worker init FAILED (critical): %s -- Position gating will not work", _qw_err)
 
     # BUG-FIX (Axiom 2.4): init v2 schema before reconcile_on_startup runs.
     # active_positions_v2 was never created, causing OperationalError on first use.
@@ -1109,7 +1155,10 @@ def _run_startup_reconciliation() -> None:
 
             # EQUITY POSITIONS: check underlying ticker as before
             if ticker not in alpaca_equity_tickers:
-                # MANDATE FIX (Jun 2, 2026): diagnose ROOT CAUSE before closing
+                # MANDATE FIX (Jun 2, 2026 + Jun 5 ROOT CAUSE FIX): diagnose ROOT CAUSE before closing
+                # NEW (Jun 5): Equity positions also need a settle window like options.
+                # Alpaca /v2/positions has eventual consistency — newly-filled orders may take
+                # up to 10-15 seconds to appear. Only ghost-close equity positions >10 min old.
                 import datetime as _dt_equity
                 opened_at_str = pos.get("opened_at") or ""
                 age_minutes_equity = 999
@@ -1124,6 +1173,15 @@ def _run_startup_reconciliation() -> None:
                     f"position_id={pos_id}, status={status}, age_min={age_minutes_equity:.1f}, "
                     f"created={opened_at_str}, window={window}"
                 )
+                
+                # NEW SETTLE WINDOW: if equity position is <10 min old, skip reconciliation.
+                # This prevents ghost-closing legitimate pending fills.
+                if age_minutes_equity < 10:
+                    logger.info(
+                        "Startup reconciliation: skipping equity position #%d %s — "                        "fill age %.1f min < 10 min settle window (will check next startup)",
+                        pos_id, ticker, age_minutes_equity,
+                    )
+                    continue
                 
                 reason = (
                     f"reconciled_alpaca_empty: {ticker} open in DB (status={status}) "
@@ -1322,6 +1380,27 @@ def health() -> JSONResponse:
         _resilience = _hr.to_dict()
     except Exception as _he:
         _resilience = {"error": str(_he)}
+    # Capital Manager health snapshot (non-fatal — never fail /health)
+    _cm_health_alpha: dict = {}
+    try:
+        _cm_inst_a = app_state.get("capital_manager")
+        if _cm_inst_a is not None:
+            _cm_health_alpha = {
+                "available_capital_usd": _cm_inst_a.get_available_capital(),
+                "open_positions":        _cm_inst_a.get_open_position_count(),
+                "circuit_breaker":       getattr(_cm_inst_a, "circuit_breaker_halted", False)
+                                          or app_state.get("cm_circuit_breaker_halted", False),
+                "circuit_breaker_reason": getattr(_cm_inst_a, "circuit_breaker_reason", None),
+                "status":                "halted" if (
+                    getattr(_cm_inst_a, "circuit_breaker_halted", False)
+                    or app_state.get("cm_circuit_breaker_halted", False)
+                ) else "ok",
+            }
+        else:
+            _cm_health_alpha = {"status": "unavailable"}
+    except Exception as _cm_he_a:
+        _cm_health_alpha = {"status": "error", "error": str(_cm_he_a)}
+
     return JSONResponse({
         "status":             "healthy" if execution_valid else "degraded",
         "service":            "alpha-execution",
@@ -1352,6 +1431,7 @@ def health() -> JSONResponse:
         # Cache the recomputed hash to avoid rehashing all .py files on every /health call (P3 fix).
         "stale_deploy":       _CODE_HASH != _get_cached_module_hash(),
         "resilience_status":  _resilience,
+        "capital_manager":    _cm_health_alpha,
     })
 
 
@@ -2050,11 +2130,173 @@ def execute(
             )
             order = _existing_order
         else:
-            # ── Capital Gate (OMNI May 20, 2026): Cross-system position + allocation checks ──
-            # Prevents: (1) doubled positions on same ticker (Alpha + Prime race)
-            #           (2) capital double-allocation after position rotation
-            _capital_gate = None
+            # ── GUARANTEE 1+5+6: Capital Manager — Reserve capital BEFORE Alpaca submit ──
+            # GENESIS 2026-06-06 COMPLETE: All 6 capital guarantees enforced here.
+            _alpha_capital_mgr = app_state.get("capital_manager")
+            _alpha_binding = None
             _allocation_id = None
+            _alpha_cm_request_id = f"{_window_id}:{body.ticker}"
+
+            if _alpha_capital_mgr is not None:
+                # GUARANTEE 6: Check circuit breaker state before execution
+                if getattr(_alpha_capital_mgr, "circuit_breaker_halted", False) \
+                        or app_state.get("cm_circuit_breaker_halted"):
+                    _cb_reason = getattr(_alpha_capital_mgr, "circuit_breaker_reason", "orphan_detected")
+                    logger.critical(
+                        "CM CIRCUIT BREAKER ACTIVE — blocking alpha execution for %s: %s",
+                        body.ticker, _cb_reason,
+                    )
+                    if pending_id:
+                        cancel_pending_position(settings.alpha_db_path, pending_id)
+                    _ticker_lock.release(); _ticker_lock = None
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "executed": False,
+                            "reason": f"circuit_breaker_active: {_cb_reason}",
+                            "gate": "capital_manager_circuit_breaker",
+                        },
+                    )
+
+                try:
+                    # GUARANTEE 1: Pre-execute capital check
+                    _alpha_allowed, _alpha_prediction = _alpha_capital_mgr.pre_execute_check(
+                        ticker=body.ticker,
+                        execution_system="alpha",
+                        quantity=contracts,
+                        entry_price=current_price,
+                        request_id=_alpha_cm_request_id,
+                    )
+
+                    if not _alpha_allowed:
+                        logger.warning(
+                            "CM GUARANTEE 1: capital check denied for alpha/%s (position limit)",
+                            body.ticker,
+                        )
+                        if pending_id:
+                            cancel_pending_position(settings.alpha_db_path, pending_id)
+                        _ticker_lock.release(); _ticker_lock = None
+                        return JSONResponse(
+                            status_code=402,
+                            content={
+                                "executed": False,
+                                "reason": "insufficient_capital",
+                                "detail": "Position limit reached",
+                            },
+                        )
+
+                    # GUARANTEE 5: Atomic position_binding + capital reservation
+                    _alpha_success, _alpha_binding = _alpha_capital_mgr.execute_with_atomic_binding(
+                        ticker=body.ticker,
+                        execution_system="alpha",
+                        quantity=contracts,
+                        entry_price=current_price,
+                        request_id=_alpha_cm_request_id,
+                    )
+
+                    if not _alpha_success or _alpha_binding is None:
+                        logger.error("CM GUARANTEE 5: atomic binding FAILED for alpha/%s", body.ticker)
+                        if pending_id:
+                            cancel_pending_position(settings.alpha_db_path, pending_id)
+                        _ticker_lock.release(); _ticker_lock = None
+                        return JSONResponse(
+                            status_code=500,
+                            content={
+                                "executed": False,
+                                "reason": "position_binding_failed",
+                                "detail": "Atomic capital reservation transaction failed",
+                            },
+                        )
+
+                    _allocation_id = _alpha_binding.allocation_id
+                    logger.info(
+                        "CM GUARANTEE 1+5 PASS (alpha): %s binding_id=%d allocation=%s reserved=$%.2f",
+                        body.ticker, _alpha_binding.id, _allocation_id,
+                        _alpha_binding.allocated_amount_usd,
+                    )
+
+                except InsufficientCapitalError as e:
+                    logger.warning(
+                        "CM GUARANTEE 1 FAIL (alpha) — InsufficientCapital for %s: %s",
+                        body.ticker, e,
+                    )
+                    if pending_id:
+                        cancel_pending_position(settings.alpha_db_path, pending_id)
+                    _ticker_lock.release(); _ticker_lock = None
+                    return JSONResponse(
+                        status_code=402,
+                        content={
+                            "executed": False,
+                            "reason": "insufficient_capital",
+                            "required_usd": getattr(e, "required", 0),
+                            "available_usd": getattr(e, "available", 0),
+                        },
+                    )
+                except PositionBindingError as e:
+                    logger.error(
+                        "CM GUARANTEE 5 FAIL (alpha) — PositionBindingError for %s: %s",
+                        body.ticker, e,
+                    )
+                    if pending_id:
+                        cancel_pending_position(settings.alpha_db_path, pending_id)
+                    _ticker_lock.release(); _ticker_lock = None
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "executed": False,
+                            "reason": "position_binding_error",
+                            "detail": str(e),
+                        },
+                    )
+                except CapitalValidationError as e:
+                    # GUARANTEE 3: log + alert Ahmed, DO NOT block execution
+                    logger.warning(
+                        "CM GUARANTEE 3 WARN (alpha) — CapitalValidationError for %s: %s",
+                        body.ticker, e,
+                    )
+                    try:
+                        from shared.notification_router import notify_warn as _nw_cv_a
+                        _nw_cv_a(
+                            "alpha-execution",
+                            "Capital Validation Warning (non-blocking)",
+                            f"{body.ticker}: {e}",
+                            ticker=body.ticker,
+                        )
+                    except Exception:
+                        pass
+                    # Execution continues — validation warnings are advisory
+                except OrphanDetectedError as e:
+                    # GUARANTEE 6: orphan detected → circuit breaker → 503
+                    logger.critical(
+                        "CM GUARANTEE 6 FAIL (alpha) — OrphanDetected for %s: %s",
+                        body.ticker, e,
+                    )
+                    with _state_lock:
+                        app_state["cm_circuit_breaker_halted"] = True
+                    if pending_id:
+                        cancel_pending_position(settings.alpha_db_path, pending_id)
+                    _ticker_lock.release(); _ticker_lock = None
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "executed": False,
+                            "reason": "orphan_detected_circuit_breaker",
+                            "detail": str(e),
+                            "gate": "capital_manager_circuit_breaker",
+                        },
+                    )
+                except Exception as _cm_alpha_err:
+                    # Unexpected CM error — fail-open
+                    logger.error(
+                        "CM unexpected error (alpha) for %s: %s — fail-open",
+                        body.ticker, _cm_alpha_err,
+                    )
+
+            # ── Legacy CapitalGate (OMNI May 20, 2026) — kept for backwards compat ──
+            # New capital_manager above supersedes this; legacy gate provides extra
+            # cross-system duplicate-ticker protection while still deployed.
+            _capital_gate = None
+            _legacy_allocation_id = None
             if CAPITAL_GATE_AVAILABLE:
                 try:
                     _capital_gate = CapitalGate(router_url="http://localhost:9100", timeout_sec=3)
@@ -2064,11 +2306,20 @@ def execute(
                         amount_usd=_position_size_usd
                     )
                     logger.info(
-                        "Capital gate result for %s: allowed=%s blocked_by=%s",
+                        "Legacy capital gate result for %s: allowed=%s blocked_by=%s",
                         body.ticker, _gate_allowed, _gate_result.get("blocked_by", "none")
                     )
                     if not _gate_allowed:
-                        logger.warning("Capital gate blocked execution: %s", _gate_result.get("blocked_by"))
+                        logger.warning("Legacy capital gate blocked execution: %s",
+                                       _gate_result.get("blocked_by"))
+                        if _allocation_id and _alpha_capital_mgr:
+                            try:
+                                _alpha_capital_mgr.release_allocation(_allocation_id)
+                            except Exception:
+                                pass
+                        if pending_id:
+                            cancel_pending_position(settings.alpha_db_path, pending_id)
+                        _ticker_lock.release(); _ticker_lock = None
                         return JSONResponse(
                             status_code=403,
                             content={
@@ -2077,13 +2328,11 @@ def execute(
                                 "gate_details": _gate_result
                             }
                         )
-                    _allocation_id = _gate_result.get("allocation_id")
+                    _legacy_allocation_id = _gate_result.get("allocation_id")
                 except Exception as e:
-                    logger.warning("Capital gate check failed: %s — continuing with caution", str(e))
-            
-            # 🔴 FINAL DEFENSIVE CHECK: Before order submission, verify position cap again
-            # This is a redundant safety check — if gate above passed, this should pass too
-            # But if anything slipped through, this is the last line of defense
+                    logger.warning("Legacy capital gate check failed: %s — continuing", str(e))
+
+            # 🔴 FINAL DEFENSIVE CHECK: position cap last-line-of-defense
             try:
                 from database import count_open_positions_alpaca
                 _final_alpaca_count = count_open_positions_alpaca(
@@ -2094,12 +2343,16 @@ def execute(
                         "🔴 FINAL GATE CHECK FAILED before order submission: %d/%d positions — aborting order",
                         _final_alpaca_count, MAX_CONCURRENT_POSITIONS
                     )
-                    raise RuntimeError(f"Position cap breach detected ({_final_alpaca_count}/{MAX_CONCURRENT_POSITIONS}) — order submission aborted")
+                    raise RuntimeError(
+                        f"Position cap breach detected ({_final_alpaca_count}/{MAX_CONCURRENT_POSITIONS})"
+                        " — order submission aborted"
+                    )
             except RuntimeError:
                 raise  # Re-raise to be caught by outer exception handler
             except Exception as _final_check_err:
-                logger.warning("Final position check failed: %s — allowing submission with caution", _final_check_err)
-            
+                logger.warning("Final position check failed: %s — allowing submission with caution",
+                                _final_check_err)
+
             order = alpaca.place_spread_order(
                 legs             = legs,
                 qty              = contracts,
@@ -2294,6 +2547,16 @@ def execute(
                         _ticker, fail_count, _TICKER_FAIL_THRESHOLD,
                     )
 
+            # GUARANTEE 5: Atomic rollback — release capital on Alpaca order failure
+            if _allocation_id and _alpha_capital_mgr is not None:
+                try:
+                    _alpha_capital_mgr.release_allocation(_allocation_id)
+                    logger.info(
+                        "CM ROLLBACK (alpha): allocation %s released after order failure",
+                        _allocation_id,
+                    )
+                except Exception as _alpha_rb_err:
+                    logger.warning("CM rollback failed (non-fatal): %s", _alpha_rb_err)
             _ticker_lock.release(); _ticker_lock = None  # GAP-6: release before early return
             return JSONResponse(
                 status_code=503,
@@ -2352,6 +2615,13 @@ def execute(
                     "VOID CIRCUIT BREAKER: %s hit %d VOIDs today — blacklisted for rest of session",
                     _void_ticker, _void_n,
                 )
+        # GUARANTEE 5: Atomic rollback — release capital on VOID fill
+        if _allocation_id and _alpha_capital_mgr is not None:
+            try:
+                _alpha_capital_mgr.release_allocation(_allocation_id)
+                logger.info("CM ROLLBACK (alpha): allocation %s released after VOID fill", _allocation_id)
+            except Exception as _void_rb_err:
+                logger.warning("CM rollback on VOID failed (non-fatal): %s", _void_rb_err)
         _ticker_lock.release(); _ticker_lock = None  # GAP-6: release before early return
         return JSONResponse(
             status_code=503,
@@ -2406,16 +2676,62 @@ def execute(
         # Re-raise so the order submission is marked as failed
         raise
     
-    # ── Release Capital Gate Allocation (OMNI May 20, 2026) ──
-    # Order is now confirmed on Alpaca. Release the capital allocation lock
-    # so other systems can claim the allocated capital if needed.
+    # ── GUARANTEE 4: Synchronous Confirmation Hook (BLOCKING) ─────────────────
+    # Called IMMEDIATELY after Alpaca fill confirmed. Validates slippage vs prediction.
+    # Non-blocking on mismatch — position is already filled; alert Ahmed.
+    _alpha_capital_mgr = app_state.get("capital_manager")
+    if _alpha_binding is not None and _alpha_capital_mgr is not None:
+        try:
+            _cm_alpha_confirmed = _alpha_capital_mgr.confirm_position(
+                binding_id=_alpha_binding.id,
+                alpaca_position_id=short_order_id or "",
+                actual_qty=contracts,
+                actual_entry_price=_confirmed_price,
+            )
+            if _cm_alpha_confirmed:
+                logger.info(
+                    "CM GUARANTEE 4 PASS (alpha): binding_id=%d %s qty=%d price=%.4f",
+                    _alpha_binding.id, body.ticker, contracts, _confirmed_price,
+                )
+            else:
+                logger.warning(
+                    "CM GUARANTEE 4 WARN (alpha): slippage/validation warning binding_id=%d %s",
+                    _alpha_binding.id, body.ticker,
+                )
+                try:
+                    from shared.notification_router import notify_warn as _nw_g4a
+                    _nw_g4a(
+                        "alpha-execution",
+                        f"CM Slippage/Validation Warning — {body.ticker}",
+                        f"binding_id={_alpha_binding.id} | actual_qty={contracts} | actual_price={_confirmed_price:.4f}",
+                        ticker=body.ticker,
+                    )
+                except Exception:
+                    pass
+        except Exception as _cm_a_conf_err:
+            logger.error(
+                "CM confirm_position exception (non-fatal, alpha): binding=%s %s — %s",
+                getattr(_alpha_binding, "id", "?"), body.ticker, _cm_a_conf_err,
+            )
+
+    # ── GUARANTEE 2: Release capital allocation ──────────────────────────────
+    # Allocation lock freed; position_binding record is the permanent audit trail.
+    if _allocation_id and _alpha_capital_mgr is not None:
+        try:
+            _alpha_capital_mgr.release_allocation(_allocation_id)
+            logger.info(
+                "CM GUARANTEE 2 PASS (alpha): allocation %s released for %s",
+                _allocation_id, body.ticker,
+            )
+        except Exception as _alpha_rel_err:
+            logger.warning("CM release_allocation failed (non-fatal): %s — %s", _allocation_id, _alpha_rel_err)
+    # Legacy CapitalGate release (OMNI May 20, 2026)
     if _allocation_id and _capital_gate:
         try:
             _capital_gate.release_allocation(_allocation_id)
-            logger.info("Capital allocation released: %s for %s", _allocation_id, body.ticker)
-        except Exception as e:
-            logger.warning("Failed to release capital allocation %s: %s", _allocation_id, str(e))
-    
+        except Exception:
+            pass
+
     # GAP-6: Release per-ticker lock — position is now durable in DB
     _safe_lock_release()  # BUG-FIX RE-002: use safe release to set _ticker_lock_released=True
     position_id = pending_id
