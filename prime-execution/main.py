@@ -183,6 +183,13 @@ logging.basicConfig(
 logger = logging.getLogger("prime_exec.main")
 
 ET       = pytz.timezone("America/New_York")
+
+# FIX 2026-06-08: Ensure .env is loaded before settings init
+import dotenv as _dotenv_prime
+_dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+if os.path.exists(_dotenv_path):
+    _dotenv_prime.load_dotenv(_dotenv_path, override=True)
+
 settings = load_settings()
 
 # GUARANTEE 1-6: Capital Manager initialization
