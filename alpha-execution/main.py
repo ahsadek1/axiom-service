@@ -1594,10 +1594,11 @@ def execute(
     # This is the HARD enforcement point — NO executions allowed if position count >= 3.
     try:
         from database import count_open_positions_alpaca
+        alpaca_client = _get_alpaca()
         alpaca_live_count = count_open_positions_alpaca(
-            _alpaca_client.base_url,
-            _alpaca_client._headers.get('APCA-API-KEY-ID', ''),
-            _alpaca_client._headers.get('APCA-API-SECRET-KEY', '')
+            alpaca_client.base_url,
+            alpaca_client._headers.get('APCA-API-KEY-ID', ''),
+            alpaca_client._headers.get('APCA-API-SECRET-KEY', '')
         )
         logger.info(f"Position check: Alpaca = {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open")
         

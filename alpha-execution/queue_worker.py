@@ -400,18 +400,19 @@ class QueueWorker(threading.Thread):
                 
                 try:
                     # ━━━━━ POSITION GATE CHECK (ATOMIC) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                    # CRITICAL FIX 2026-06-02 10:41 ET: Check position count BEFORE EACH order
-                    # not just at batch start. Prevents race condition where multiple orders
-                    # execute simultaneously, breaching position cap (3 max).
+                    # CRITICAL FIX 2026-06-08 13:15 ET: Check Alpaca live position count (ground truth)
+                    # Both Alpha and Prime must use shared gate. Prevents race between services.
                     try:
-                        from database import count_open_positions_alpaca
                         from config import MAX_CONCURRENT_POSITIONS
-                        # CRITICAL FIX 2026-06-08 12:05 ET: Use AlpacaClient._headers directly (no _session attribute)
-                        # AlpacaClient stores credentials in _headers dict, not _session
-                        alpaca_live_count = count_open_positions_alpaca(
-                            self.alpaca_client.base_url,
-                            self.alpaca_client._headers.get('APCA-API-KEY-ID', ''),
-                            self.alpaca_client._headers.get('APCA-API-SECRET-KEY', '')
+                        import sys as _sys_cg
+                        _sys_cg.path.insert(0, '/Users/ahmedsadek/nexus')
+                        from shared.combined_position_gate import get_live_position_count_safe, PositionCountError
+                        
+                        alpaca_live_count = get_live_position_count_safe(
+                            alpaca_url=self.alpaca_client.base_url,
+                            api_key=self.alpaca_client._headers.get('APCA-API-KEY-ID', ''),
+                            secret_key=self.alpaca_client._headers.get('APCA-API-SECRET-KEY', ''),
+                            timeout_sec=5
                         )
                         
                         if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
@@ -425,6 +426,14 @@ class QueueWorker(threading.Thread):
                             )
                             conn.commit()
                             continue  # Skip this order, try next one
+                    except PositionCountError as pos_check_err:
+                        self.logger.critical(f"Queue {queue_id}: Position count verification FAILED (fail closed): {pos_check_err}")
+                        cursor.execute(
+                            "UPDATE execution_queue SET status = 'position_gate_failed', error = ? WHERE id = ?",
+                            (f"Position count unavailable: {str(pos_check_err)}", queue_id)
+                        )
+                        conn.commit()
+                        continue  # Skip this order — cannot verify position count
                     except Exception as pos_check_err:
                         self.logger.error(f"Queue {queue_id}: Position count check failed: {pos_check_err}")
                         # Don't block; continue with submission. Better to breach than deadlock.

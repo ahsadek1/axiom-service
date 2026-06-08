@@ -271,23 +271,44 @@ def execute_trade(opportunity: dict, size_result: dict) -> Optional[dict]:
         return None
 
     # MANDATORY AXIOM GATE: Position cap (3 max) + 10-layer risk assessment
+    # CRITICAL FIX: Check ALPACA reality, not just Prime DB
+    try:
+        # Get actual Alpaca positions
+        r = requests.get(
+            f"{ALPACA_URL}/v2/positions",
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET,
+            },
+            timeout=5,
+        )
+        alpaca_count = len(r.json()) if r.status_code == 200 else 0
+        log.info("Alpaca actual position count: %d", alpaca_count)
+    except Exception as exc:
+        log.error("Cannot query Alpaca positions: %s", exc)
+        alpaca_count = 99  # Fail closed on Alpaca error
+
     try:
         conn = sqlite3.connect(PRIME_V2_DB, timeout=5)
         open_row = conn.execute(
             "SELECT COUNT(*) FROM prime_v2_positions WHERE status='OPEN'"
         ).fetchone()
         conn.close()
-        open_count = open_row[0] if open_row else 0
+        db_count = open_row[0] if open_row else 0
     except Exception:
-        open_count = 0
+        db_count = 0
+
+    # Use the max of (Alpaca reality, Prime DB) to ensure we never exceed limit
+    effective_count = max(alpaca_count, db_count)
+    log.info("Position count: DB=%d Alpaca=%d effective=%d", db_count, alpaca_count, effective_count)
 
     # Hard stop: 3-position cap (Ahmed mandate)
-    if open_count >= 3:
-        log.critical("POSITION CAP BREACH: %d open >= 3 max. BLOCKING %s", open_count, ticker)
+    if effective_count >= 3:
+        log.critical("POSITION CAP BREACH: %d open >= 3 max. BLOCKING %s", effective_count, ticker)
         _notify(
             f"<b>🔴 POSITION CAP BREACH</b>\n"
             f"Ticker: {ticker}\n"
-            f"Open: {open_count}/3 max\n"
+            f"Open: {effective_count}/3 max (DB={db_count} Alpaca={alpaca_count})\n"
             f"Trade BLOCKED — position limit exceeded"
         )
         return None

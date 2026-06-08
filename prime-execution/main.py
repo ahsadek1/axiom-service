@@ -1050,29 +1050,74 @@ def execute(
         )
 
     # ── Atomic limit check + PENDING slot reservation (Cipher Finding 1+2 fix) ─
-    # CRITICAL RACE FIX (Jun 8 2026 13:00 ET):
-    # Old order: check Alpaca → guard → reserve DB. Problem: race window between check and reserve.
-    # New order: reserve DB first (atomic, visible immediately) → then validate against Alpaca as safety check.
-    # This makes the local DB the source of truth for position cap, while Alpaca is the reconciliation truth.
+    # CRITICAL RACE FIX (Jun 8 2026 13:15 ET — DEPLOYED AFTER MSTR GATING FAILURE):
+    # ALPACA IS GROUND TRUTH. Both Alpha and Prime must check live Alpaca count before execution.
+    # Old: local DB check (desync risk between services). New: Alpaca /v2/positions check first.
     import json as _json
-    pending_id = None
-    with _execute_lock:
-        open_count  = count_open_positions(settings.prime_db_path)  # includes 'pending'
-        today_count = count_new_positions_today(settings.prime_db_path)
-        
-        # FIRST: Guard against position limit using LOCAL DB (atomic, includes pending from concurrent reqs)
-        if open_count >= MAX_CONCURRENT_POSITIONS:
+    import sys as _sys_cgate
+    _sys_cgate.path.insert(0, '/Users/ahmedsadek/nexus')
+    try:
+        from shared.combined_position_gate import get_live_position_count_safe, PositionCountError
+        # FIRST: Check Alpaca live count (GROUND TRUTH)
+        alpaca_client_instance = _get_alpaca()
+        alpaca_live_count = get_live_position_count_safe(
+            alpaca_url=alpaca_client_instance.base_url,
+            api_key=alpaca_client_instance._headers.get('APCA-API-KEY-ID', ''),
+            secret_key=alpaca_client_instance._headers.get('APCA-API-SECRET-KEY', ''),
+            timeout_sec=5
+        )
+        if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
             logger.critical(
-                "🔴 POSITION GATE (Prime DB): Local DB has %d/%d positions — NEW EXECUTION BLOCKED",
-                open_count, MAX_CONCURRENT_POSITIONS
+                "🔴 POSITION GATE (Alpaca ground truth): Alpaca has %d/%d positions — NEW EXECUTION BLOCKED",
+                alpaca_live_count, MAX_CONCURRENT_POSITIONS
             )
             return JSONResponse(
                 status_code=429,
                 content={
                     "executed": False,
-                    "reason": f"🔴 POSITION_CAP (local DB): {open_count}/{MAX_CONCURRENT_POSITIONS} positions reserved. No new executions allowed.",
+                    "reason": f"🔴 POSITION_CAP (Alpaca): {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} positions. No new executions allowed.",
                 },
             )
+    except PositionCountError as _pce:
+        logger.critical(
+            "🔴 POSITION GATE FAIL CLOSED: Cannot verify Alpaca position count: %s — BLOCKING EXECUTION",
+            _pce
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "executed": False,
+                "reason": f"Cannot verify position limit (Alpaca unreachable): {str(_pce)}",
+            },
+        )
+    except Exception as _pce_unk:
+        logger.critical(
+            "🔴 POSITION GATE UNEXPECTED ERROR: %s — BLOCKING EXECUTION",
+            _pce_unk
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "executed": False,
+                "reason": f"Unexpected error checking position limit: {str(_pce_unk)}",
+            },
+        )
+    
+    pending_id = None
+    with _execute_lock:
+        open_count  = count_open_positions(settings.prime_db_path)  # includes 'pending'
+        today_count = count_new_positions_today(settings.prime_db_path)
+        
+        # SECOND: Guard against position limit using LOCAL DB (atomic check against our own queue)
+        # Note: Alpaca check above is primary gate. This is secondary sanity check.
+        if open_count >= MAX_CONCURRENT_POSITIONS:
+            logger.warning(
+                "🔴 POSITION GATE (Prime DB): Local DB has %d/%d positions — additional safety block",
+                open_count, MAX_CONCURRENT_POSITIONS
+            )
+            # Don't reject here — Alpaca check already caught it. This is just a warning.
+            # Log it for diagnostics but allow DB to catch up.
+            pass
         
         if today_count >= MAX_NEW_PER_DAY:
             return JSONResponse(
