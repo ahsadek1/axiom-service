@@ -1053,54 +1053,35 @@ def execute(
     import json as _json
     pending_id = None
     with _execute_lock:
-        open_count  = count_open_positions(settings.prime_db_path)  # includes 'pending'
-        today_count = count_new_positions_today(settings.prime_db_path)
-
-        # ── AXIOM CROSS-SYSTEM POSITION GATE (2026-06-02: Critical fix for Prime-Axiom sync)
-        # Prime must respect the global 3-position maximum enforced by Axiom across ALL systems.
-        # This prevents Prime from opening positions that would breach Ahmed's cap.
-        # Root cause of position limit breaches: Prime checked only its own DB, not global state.
+        # CRITICAL FIX (Jun 8 2026 11:52 ET): Use Alpaca LIVE position count as ground truth
+        # DO NOT fall back to local DB count if Axiom is unavailable.
+        # Root cause of 6-position breach: Prime used local DB count when cross-system gate failed.
         try:
-            from config import AXIOM_URL_PRIME, AXIOM_SECRET_PRIME
-            import requests as _req_axiom
-            _ax_resp = _req_axiom.get(
-                f"{AXIOM_URL_PRIME}/positions/count",
-                headers={"X-Axiom-Secret": AXIOM_SECRET_PRIME},
-                timeout=2
+            from database import count_open_positions_alpaca
+            alpaca_live_count = count_open_positions_alpaca(
+                settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
             )
-            if _ax_resp.status_code == 200:
-                _ax_data = _ax_resp.json()
-                _axiom_count = _ax_data.get("total_positions", 0)
-                _axiom_max = _ax_data.get("max_allowed", 3)  # Default: Ahmed's 3-position cap
-                if _axiom_count >= _axiom_max:
-                    logger.warning(
-                        "AXIOM CROSS-SYSTEM GATE: position count=%d >= max=%d — blocking new position %s",
-                        _axiom_count, _axiom_max, body.ticker
-                    )
-                    return JSONResponse(
-                        status_code=429,
-                        content={
-                            "executed": False,
-                            "reason": f"Axiom position cap reached: {_axiom_count}/{_axiom_max} (cross-system gated)",
-                            "gate": "axiom_cross_system",
-                        },
-                    )
-        except Exception as _axiom_gate_err:
-            # CRITICAL: Axiom cross-system gate is a hard safety requirement.
-            # Cannot fall through to local check during market hours — that's how we breached the cap.
-            # Must reject execution to protect global position limit.
-            logger.error(
-                "AXIOM CROSS-SYSTEM GATE FAILED (hard block): %s — rejecting execution for %s", 
-                _axiom_gate_err, body.ticker
-            )
+            if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
+                logger.critical(
+                    "🔴 POSITION GATE FIRED (Prime): Alpaca has %d/%d positions — NEW EXECUTION BLOCKED",
+                    alpaca_live_count, MAX_CONCURRENT_POSITIONS
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "executed": False,
+                        "reason": f"🔴 POSITION_CAP: Alpaca shows {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open positions (combined across all services). No new executions allowed until positions are closed.",
+                    },
+                )
+        except RuntimeError as _alpaca_err:
+            logger.warning("Alpaca live position check failed (Prime): %s — blocking as safety measure", _alpaca_err)
             return JSONResponse(
                 status_code=503,
-                content={
-                    "executed": False,
-                    "reason": f"Axiom cross-system gate unreachable — cannot verify global position cap. Execution blocked.",
-                    "gate": "axiom_cross_system_failed",
-                },
+                content={"executed": False, "reason": f"Cannot verify position count: {_alpaca_err}"},
             )
+        
+        open_count  = count_open_positions(settings.prime_db_path)  # includes 'pending'
+        today_count = count_new_positions_today(settings.prime_db_path)
 
         # Per-ticker duplicate guard (2026-04-24): reject if ticker already open.
         # Concordances fire per-window; a strong ticker can generate new P1 events
@@ -1204,9 +1185,9 @@ def execute(
     _cm_request_id = f"{body.window_id}:{body.ticker}"
 
     if _capital_mgr is not None:
-        # GUARANTEE 6: Check circuit breaker — orphan detection halts system
-        if getattr(_capital_mgr, "circuit_breaker_halted", False) or app_state.get("cm_circuit_breaker_halted"):
-            _cb_reason = getattr(_capital_mgr, "circuit_breaker_reason", "orphan_detected")
+        # GUARANTEE 6: Check circuit breaker — orphan detection halts system (PERSISTENT)
+        _cb_halted, _cb_reason = _capital_mgr.get_circuit_breaker_state()
+        if _cb_halted:
             logger.critical("CM CIRCUIT BREAKER ACTIVE — blocking %s: %s", body.ticker, _cb_reason)
             if pending_id:
                 cancel_pending_position(settings.prime_db_path, pending_id)
