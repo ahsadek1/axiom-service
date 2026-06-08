@@ -101,7 +101,7 @@ L9_MIN_SCORE       = 40.0       # Minimum technical score to proceed
 
 # Layer 10: Circuit Breaker
 L10_DAILY_LOSS_PCT = 0.05       # Halt if daily portfolio loss > 5%
-L10_MAX_POSITIONS  = 3          # Hard stop if open positions ≥ 3 (Ahmed mandate)
+L10_MAX_POSITIONS  = 3          # AHMED MANDATE: Hard stop if open positions ≥ 3 (absolute cap, no exceptions)
 
 
 # ── Sector Map ─────────────────────────────────────────────────────────────────
@@ -811,8 +811,8 @@ def _layer10_circuit_breaker(positions: list, account: Optional[dict]) -> LayerR
             layer.flag       = "POSITION_CAP_EXCEEDED"
             layer.risk_delta = 50.0
             layer.detail     = (
-                f"{n_positions} open positions exceeds cap "
-                f"(max {L10_MAX_POSITIONS}) — HARD STOP"
+                f"{n_positions} open positions at/exceeds limit "
+                f"(gate threshold {L10_MAX_POSITIONS} to prevent race conditions) — HARD STOP"
             )
         else:
             layer.detail = (

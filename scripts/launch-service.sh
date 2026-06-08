@@ -19,6 +19,12 @@ if [ -f ".env" ]; then
   set +a
 fi
 
+# Explicitly ensure critical env vars are exported (for subprocess inheritance)
+export DEEPSEEK_API_KEY
+export POLYGON_API_KEY
+export ALPACA_API_KEY
+export ALPACA_SECRET_KEY
+
 # Add nexus directory to Python path for module resolution
 export PYTHONPATH=/Users/ahmedsadek/nexus:${PYTHONPATH}
 
@@ -32,7 +38,14 @@ else
   PY="/usr/bin/python3"
 fi
 
-$PY -m uvicorn main:app --host 0.0.0.0 --port "$FINAL_PORT" --log-level info
+# Try to use startup wrapper if it exists (for .env auto-loading)
+if [ -f "$SERVICE_DIR/startup.py" ]; then
+  echo "[LAUNCH] Using startup.py wrapper for $SERVICE_DIR" >&2
+  $PY "$SERVICE_DIR/startup.py" "$FINAL_PORT"
+else
+  echo "[LAUNCH] No startup.py found, using uvicorn directly" >&2
+  $PY -m uvicorn main:app --host 0.0.0.0 --port "$FINAL_PORT" --log-level info
+fi
 EXIT_CODE=$?
 # Exit with the same code Uvicorn returned
 # Exit 0 = graceful shutdown (normal exit — do NOT restart)

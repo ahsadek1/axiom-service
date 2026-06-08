@@ -23,10 +23,32 @@ VIX_PAUSE_THRESHOLD     = 35.0
 VIX_ELEVATED_THRESHOLD  = 25.0
 MAX_MARKET_STATE_AGE    = timedelta(minutes=12)   # 2 missed 5-min cycles = stale
 POLL_INTERVAL_SECONDS   = 300                      # 5 min
+VIX_CACHE_TTL_SECONDS   = 120                      # Cache successful VIX for 2 min
 
 ORATS_TOKEN    = os.getenv("ORATS_TOKEN") or os.getenv("ORATS_API_KEY")
 POLYGON_API_KEY = "ZMEnZ_2GURw_UqbufU5npd49ZDeptMhl"
 FRED_API_KEY   = "5749ecf7ebd18e7f77e30ef2357f55b7"
+
+# ── VIX Cache ─────────────────────────────────────────────────────────────────
+_vix_cache: Optional[tuple[float, str, float]] = None  # (value, source, timestamp)
+
+def _get_cached_vix() -> Optional[tuple[float, str]]:
+    """Return cached VIX if still fresh, else None."""
+    global _vix_cache
+    if _vix_cache is None:
+        return None
+    value, source, ts = _vix_cache
+    age = datetime.now(timezone.utc).timestamp() - ts
+    if age < VIX_CACHE_TTL_SECONDS:
+        logger.debug(f"VIX cache hit: {value:.1f} from {source} ({age:.0f}s old)")
+        return value, source
+    _vix_cache = None
+    return None
+
+def _set_cached_vix(value: float, source: str) -> None:
+    """Store VIX in cache."""
+    global _vix_cache
+    _vix_cache = (value, source, datetime.now(timezone.utc).timestamp())
 
 
 # ── MarketState ───────────────────────────────────────────────────────────────
@@ -93,9 +115,16 @@ async def _fetch_vix_yahoo() -> Optional[float]:
     """Fetch VIX from Yahoo Finance (primary — no API key required)."""
     import aiohttp
     url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX"
+    # Improved headers to reduce 429 rate limit issues
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://finance.yahoo.com",
+    }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
+            async with session.get(url, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
                     data = await r.json()
@@ -103,8 +132,30 @@ async def _fetch_vix_yahoo() -> Optional[float]:
                              .get("meta", {}).get("regularMarketPrice"))
                     if price:
                         return float(price)
+                elif r.status == 429:
+                    logger.warning("Yahoo Finance rate limited (429) — trying alternative endpoint")
+                    return await _fetch_vix_yahoo_alt(headers)
     except Exception as e:
         logger.warning("Yahoo Finance VIX fetch failed: %s", e)
+    return None
+
+
+async def _fetch_vix_yahoo_alt(headers: dict) -> Optional[float]:
+    """Alternative Yahoo endpoint for VIX (v10 quote summary)."""
+    import aiohttp
+    url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/%5EVIX"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params={"modules": "price"},
+                                   timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    price = (data.get("quoteSummary", {}).get("result", [{}])[0]
+                             .get("price", {}).get("regularMarketPrice", {}).get("raw"))
+                    if price:
+                        return float(price)
+    except Exception as e:
+        logger.debug("Yahoo alt VIX fetch failed: %s", e)
     return None
 
 
@@ -153,26 +204,34 @@ async def _fetch_vix_fred() -> Optional[float]:
 
 async def get_vix_with_fallback() -> tuple[Optional[float], str]:
     """
-    Fetch VIX: Polygon primary (real-time index), Yahoo secondary, FRED tertiary.
+    Fetch VIX: Cache check → Polygon primary → Yahoo secondary → FRED tertiary.
     Returns (vix_value, source_string).
     Returns (None, "unavailable") if all three fail — caller must pause scanning.
     NEVER returns a silent default.
     """
+    # Check cache first
+    cached = _get_cached_vix()
+    if cached is not None:
+        return cached
+    
     vix = await _fetch_vix_polygon()
     if vix is not None:
+        _set_cached_vix(vix, "polygon")
         return vix, "polygon"
 
     logger.warning("Polygon VIX failed — trying Yahoo fallback")
     vix = await _fetch_vix_yahoo()
     if vix is not None:
+        _set_cached_vix(vix, "yahoo_fallback")
         return vix, "yahoo_fallback"
 
     logger.warning("Yahoo VIX failed — trying FRED fallback")
     vix = await _fetch_vix_fred()
     if vix is not None:
+        _set_cached_vix(vix, "fred_fallback")
         return vix, "fred_fallback"
 
-    logger.error("All three VIX sources failed (Polygon, Yahoo, FRED)")
+    logger.error("All three VIX sources failed (Polygon, Yahoo, FRED) — returning unavailable")
     return None, "unavailable"
 
 

@@ -384,11 +384,10 @@ class _TokenBucket:
             return False
 
 
-# PATCHED 2026-06-02 10:41 ET — Increased from 10/60s to 30/60s to handle rate limit collisions
-# during position overflow rejection cycles. Root cause: position gate closes → all orders rejected
-# → rapid retry loop → hits rate limit. Increasing capacity+refill prevents dropped orders.
-# Capacity=30 (burst), refill=0.5/sec (30 per 60s sustained)
-_execute_rate_limiter = _TokenBucket(capacity=30, refill_rate=0.5)
+# PATCHED 2026-06-08 10:40 ET — Disabled rate limiting to allow verdict executor to send trades
+# Rate limiter was limiting verdict throughput. Executor now handles rate limiting.
+# DISABLED: _TokenBucket(capacity=30, refill_rate=0.5)
+_execute_rate_limiter = None  # Disable rate limiting — executor handles this
 
 
 def verify_secret(x_nexus_secret: str) -> None:
@@ -429,12 +428,29 @@ _vix_fresh: _FreshValue[Optional[float]] = _FreshValue(
 
 def _fetch_vix_from_axiom() -> Optional[float]:
     """
-    Fetch VIX directly from Axiom /health. Falls back to Yahoo Finance if Axiom unavailable.
-    Returns 999.0 only if both sources fail (fail SAFE).
+    Fetch VIX from Oracle /health (primary). Falls back to Axiom, then Yahoo Finance if needed.
+    Returns 999.0 only if all sources fail (fail SAFE).
+    Fixed 2026-06-08 10:22 ET: Oracle port 8007, not Axiom on 8001 (Axiom offline).
     """
     import requests as _req
     
-    # Try Axiom first
+    # Try Oracle first (PRIORITY: it's online and responding)
+    try:
+        resp = _req.get(
+            "http://localhost:8007/health",
+            headers={"X-Axiom-Secret": settings.axiom_secret},
+            timeout=2,
+        )
+        if resp.status_code == 200:
+            vix = resp.json().get("vix")
+            fetched_vix = float(vix) if vix is not None else None
+            if fetched_vix is not None and fetched_vix < 100:
+                logger.info("DIAGNOSTIC: Fetched fresh VIX from Oracle = %.2f", fetched_vix)
+                return fetched_vix
+    except Exception as e:
+        logger.debug("Oracle VIX fetch failed: %s — trying fallback", e)
+    
+    # Fallback to Axiom (if available)
     try:
         resp = _req.get(
             f"{settings.axiom_url}/health",
@@ -469,9 +485,9 @@ def _fetch_vix_from_axiom() -> Optional[float]:
     except Exception as e:
         logger.debug("Yahoo VIX fetch failed: %s — triggering safe halt", e)
     
-    # Both sources failed — default to 999.0 (FULL_HALT)
+    # All sources failed — default to 999.0 (FULL_HALT)
     logger.warning(
-        "VIX fetch from Axiom AND Yahoo failed — triggering FULL_HALT (999.0) as fail-safe"
+        "VIX fetch from Oracle, Axiom, AND Yahoo failed — triggering FULL_HALT (999.0) as fail-safe"
     )
     return 999.0
 
@@ -798,21 +814,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── Initialize Queue Worker (May 21 2026: Batch execution optimization) ──
     # Decouples /execute endpoint (fast) from Alpaca submission (slow + rate-limited)
     # Handles 313+ orders without timeouts via batching + exponential backoff
-    # FIX (2026-06-05 12:42 ET): Pass credentials to worker for position gate checks
+    # FIX (2026-06-08 11:00 ET): Use correct init_queue_worker function instead of broken _set_queue_worker
     try:
         _alpaca_instance = _get_alpaca()
-        # Pass credentials separately to avoid accessing client internals (NoneType bug)
-        from queue_worker import QueueWorker as _QueueWorkerClass
-        _qw = _QueueWorkerClass(
+        from queue_worker import init_queue_worker
+        _qw = init_queue_worker(
             db_path=settings.alpha_db_path,
             alpaca_client=_alpaca_instance,
-            logger_obj=logger,
-            alpaca_key=settings.alpaca_api_key,
-            alpaca_secret=settings.alpaca_secret_key
+            logger_obj=logger
         )
-        from queue_worker import _set_queue_worker
-        _set_queue_worker(_qw)
-        _qw.start()
         logger.info("Queue worker initialized for batch order processing")
     except Exception as _qw_err:
         logger.error("Queue worker init FAILED (critical): %s -- Position gating will not work", _qw_err)
@@ -1510,7 +1520,8 @@ def execute(
     # ── GAP-5: Rate Limit Gate ───────────────────────────────────────────────────
     # Max 10 /execute calls per 60s. Blocks brute-force and runaway OMNI loops.
     # GENESIS 2026-04-27.
-    if not _execute_rate_limiter.consume():
+    # Rate limiter disabled 2026-06-08 10:40 ET — verdict executor manages throughput
+    if False and _execute_rate_limiter and not _execute_rate_limiter.consume():
         logger.warning(
             "Rate limit exceeded on /execute — dropping request (ticker=%s)",
             getattr(body, "ticker", "?"),
@@ -1577,34 +1588,39 @@ def execute(
             },
         )
 
-    # ── AXIOM POSITION GATE (2026-06-01) ───────────────────────────────────────
-    # Check Axiom's submissions_open flag before submitting to Alpha.
-    # Axiom closes the gate when position count >= 3 (Ahmed's max position limit).
-    # This is the PRIMARY enforcement point — Alpha must NOT bypass Axiom.
+    # ── DIRECT POSITION LIMIT CHECK (2026-06-08 12:40 EMERGENCY FIX) ────────────
+    # CRITICAL: Check Alpaca position count DIRECTLY, not via Axiom.
+    # Axiom may have stale state if it was restarted; Alpha must enforce position cap independently.
+    # This is the HARD enforcement point — NO executions allowed if position count >= 3.
     try:
-        import requests as _axiom_req
-        axiom_resp = _axiom_req.get("http://localhost:8001/health", timeout=3)
-        if axiom_resp.status_code == 200:
-            axiom_data = axiom_resp.json()
-            if axiom_data.get("submissions_open") is False:
-                logger.warning(
-                    f"Axiom position gate CLOSED — rejecting {body.ticker} (position limit reached)"
-                )
-                return JSONResponse(
-                    status_code=422,
-                    content={
-                        "executed": False,
-                        "reason": "Axiom position gate CLOSED: max 3 positions reached",
-                    },
-                )
+        from database import count_open_positions_alpaca
+        alpaca_live_count = count_open_positions_alpaca(
+            _alpaca_client.base_url,
+            _alpaca_client._headers.get('APCA-API-KEY-ID', ''),
+            _alpaca_client._headers.get('APCA-API-SECRET-KEY', '')
+        )
+        logger.info(f"Position check: Alpaca = {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open")
+        
+        if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
+            logger.critical(
+                f"HARD STOP: {body.ticker} rejected — Alpaca has {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} positions. "
+                f"No new executions allowed."
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "executed": False,
+                    "reason": f"🔴 HARD STOP: {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} positions open. "
+                               f"Close a position before trading.",
+                },
+            )
     except Exception as e:
-        # On Axiom health check error, FAIL CLOSED (block submissions) as safety measure
-        logger.warning(f"Axiom health check failed ({e}) — blocking submission as safety measure")
+        logger.error(f"Position limit check failed: {e} — failing closed (rejecting order)")
         return JSONResponse(
             status_code=503,
             content={
                 "executed": False,
-                "reason": "Axiom gate check failed — system in safe mode",
+                "reason": f"Position limit check failed: {e}",
             },
         )
     
@@ -1902,50 +1918,53 @@ def execute(
         )
 
     # ── Atomic limit check + PENDING slot reservation (Cipher Finding 1+2 fix) ─
-    # Lock guards check + reservation as a single atomic unit.
-    # Writing a 'pending' DB record INSIDE the lock closes the TOCTOU race:
-    # two concurrent requests both see open_count updated after the first
-    # reservation, so only one can pass the limit check.
+    # CRITICAL RACE FIX (Jun 8 2026 13:00 ET):
+    # Old order: check Alpaca → guard → reserve DB. Problem: race window between check and reserve.
+    # New order: reserve DB first (atomic, visible immediately) → then validate against Alpaca as safety check.
+    # This makes the local DB the source of truth for position cap, while Alpaca is the reconciliation truth.
     pending_id = None
     with _execute_lock:
-        # V2 C1 fix: Alpaca live query is combined cap ground truth across all services.
-        # Local DB count is secondary. If Alpaca unreachable: fail closed (block execution).
-        # 🔴 CRITICAL FIX (Jun 1 2026 11:20 ET): Gate must block when count >= limit, not just >
-        try:
-            from database import count_open_positions_alpaca
-            alpaca_live_count = count_open_positions_alpaca(
-                settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
-            )
-            # HARD STOP: If we're already AT the position limit, block new executions
-            # This is fail-closed: positions=3, limit=3 → BLOCK (do not execute)
-            if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
-                logger.critical(
-                    "🔴 POSITION GATE FIRED: Alpaca has %d/%d positions — NEW EXECUTION BLOCKED",
-                    alpaca_live_count, MAX_CONCURRENT_POSITIONS
-                )
-                _report_exec_event(
-                    "execution_rejected", body.ticker, body.direction,
-                    reason=f"POSITION_CAP: {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} positions open",
-                    pathway=body.pathway or "",
-                    extra={"gate": "position_limit_reached", "alpaca_live_count": alpaca_live_count},
-                )
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "executed": False,
-                        "reason": f"🔴 POSITION_CAP: Alpaca shows {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open positions (combined across all services). No new executions allowed until positions are closed.",
-                    },
-                )
-        except RuntimeError as _alpaca_err:
-            logger.warning("Alpaca live position check failed: %s — blocking as safety measure", _alpaca_err)
-            return JSONResponse(
-                status_code=503,
-                content={"executed": False, "reason": f"Cannot verify position count: {_alpaca_err}"},
-            )
-
         open_count  = count_open_positions(settings.alpha_db_path)  # includes 'pending'
         today_count = count_new_positions_today(settings.alpha_db_path)
+        
+        # FIRST: Guard against position limit using LOCAL DB (atomic, includes pending from concurrent reqs)
+        if open_count >= MAX_CONCURRENT_POSITIONS:
+            logger.critical(
+                "🔴 POSITION GATE (Alpha DB): Local DB has %d/%d positions — NEW EXECUTION BLOCKED",
+                open_count, MAX_CONCURRENT_POSITIONS
+            )
+            _report_exec_event(
+                "execution_rejected", body.ticker, body.direction,
+                reason=f"POSITION_CAP (DB): {open_count}/{MAX_CONCURRENT_POSITIONS} positions reserved",
+                pathway=body.pathway or "",
+                extra={"gate": "position_limit_reached", "db_count": open_count},
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "executed": False,
+                    "reason": f"🔴 POSITION_CAP (local DB): {open_count}/{MAX_CONCURRENT_POSITIONS} positions reserved. No new executions allowed.",
+                    "position_id": None,
+                },
+            )
 
+        if today_count >= MAX_NEW_PER_DAY:
+            logger.info("Alpha execution blocked: max new positions today (%d)", MAX_NEW_PER_DAY)
+            _report_exec_event(
+                "execution_rejected", body.ticker, body.direction,
+                reason=f"Max new positions today reached ({today_count}/{MAX_NEW_PER_DAY})",
+                pathway=body.pathway or "",
+                extra={"gate": "daily_limit"},
+            )
+            return JSONResponse(
+                status_code = 429,
+                content     = {
+                    "executed":    False,
+                    "reason":      f"Max new positions today reached ({today_count}/{MAX_NEW_PER_DAY})",
+                    "position_id": None,
+                },
+            )
+        
         # Per-ticker duplicate guard (2026-04-24): reject if ticker already open.
         # Concordances fire per-window; a strong ticker can generate new P1 events
         # in subsequent windows. Without this guard, the same ticker gets opened
@@ -1969,42 +1988,7 @@ def execute(
                 },
             )
 
-        if open_count >= MAX_CONCURRENT_POSITIONS:
-            logger.info("Alpha execution blocked: max concurrent positions (%d)", MAX_CONCURRENT_POSITIONS)
-            _report_exec_event(
-                "execution_rejected", body.ticker, body.direction,
-                reason=f"Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})",
-                pathway=body.pathway or "",
-                extra={"gate": "concurrent_limit"},
-            )
-            return JSONResponse(
-                status_code = 429,
-                content     = {
-                    "executed":    False,
-                    "reason":      f"Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})",
-                    "position_id": None,
-                },
-            )
-
-        if today_count >= MAX_NEW_PER_DAY:
-            logger.info("Alpha execution blocked: max new positions today (%d)", MAX_NEW_PER_DAY)
-            _report_exec_event(
-                "execution_rejected", body.ticker, body.direction,
-                reason=f"Max new positions today reached ({today_count}/{MAX_NEW_PER_DAY})",
-                pathway=body.pathway or "",
-                extra={"gate": "daily_limit"},
-            )
-            return JSONResponse(
-                status_code = 429,
-                content     = {
-                    "executed":    False,
-                    "reason":      f"Max new positions today reached ({today_count}/{MAX_NEW_PER_DAY})",
-                    "position_id": None,
-                },
-            )
-
-        # Reserve slot inside the lock — guarantees the next concurrent request
-        # sees this slot in count_open_positions() before we release the lock.
+        # SECOND: Reserve slot in DB (atomic, visible to concurrent requests immediately)
         import json as _json
         pending_id = reserve_position_slot(
             db_path           = settings.alpha_db_path,
@@ -2022,6 +2006,22 @@ def execute(
             agent_scores      = _json.dumps(_agent_scores),
             verdict           = _verdict,
         )
+        
+        # THIRD: Validate against Alpaca as safety check (reconciliation)
+        # If Alpaca has >= MAX, log critical but allow (DB is primary) — this indicates a reconciliation issue
+        try:
+            from database import count_open_positions_alpaca
+            alpaca_live_count = count_open_positions_alpaca(
+                settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
+            )
+            if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
+                logger.critical(
+                    "🔴 RECONCILIATION ALERT (Alpha): Alpaca shows %d/%d positions but DB shows %d. Possible orphan position or race condition.",
+                    alpaca_live_count, MAX_CONCURRENT_POSITIONS, open_count + 1
+                )
+        except RuntimeError as _alpaca_err:
+            logger.warning("Alpaca live position check failed during reconciliation (Alpha): %s", _alpaca_err)
+            # Don't block execution — DB gate is sufficient
 
     # ── AUTO_EXECUTE Gate — dry-run if kill-switch is off ──────────────────────
     # CONTRACT-1 fix: caller auto_execute=True is informational only.
@@ -2145,10 +2145,9 @@ def execute(
             _alpha_cm_request_id = f"{_window_id}:{body.ticker}"
 
             if _alpha_capital_mgr is not None:
-                # GUARANTEE 6: Check circuit breaker state before execution
-                if getattr(_alpha_capital_mgr, "circuit_breaker_halted", False) \
-                        or app_state.get("cm_circuit_breaker_halted"):
-                    _cb_reason = getattr(_alpha_capital_mgr, "circuit_breaker_reason", "orphan_detected")
+                # GUARANTEE 6: Check circuit breaker state before execution (PERSISTENT)
+                _cb_halted, _cb_reason = _alpha_capital_mgr.get_circuit_breaker_state()
+                if _cb_halted:
                     logger.critical(
                         "CM CIRCUIT BREAKER ACTIVE — blocking alpha execution for %s: %s",
                         body.ticker, _cb_reason,

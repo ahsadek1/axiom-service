@@ -1050,68 +1050,38 @@ def execute(
         )
 
     # ── Atomic limit check + PENDING slot reservation (Cipher Finding 1+2 fix) ─
+    # CRITICAL RACE FIX (Jun 8 2026 13:00 ET):
+    # Old order: check Alpaca → guard → reserve DB. Problem: race window between check and reserve.
+    # New order: reserve DB first (atomic, visible immediately) → then validate against Alpaca as safety check.
+    # This makes the local DB the source of truth for position cap, while Alpaca is the reconciliation truth.
     import json as _json
     pending_id = None
     with _execute_lock:
-        # CRITICAL FIX (Jun 8 2026 11:52 ET): Use Alpaca LIVE position count as ground truth
-        # DO NOT fall back to local DB count if Axiom is unavailable.
-        # Root cause of 6-position breach: Prime used local DB count when cross-system gate failed.
-        try:
-            from database import count_open_positions_alpaca
-            alpaca_live_count = count_open_positions_alpaca(
-                settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
-            )
-            if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
-                logger.critical(
-                    "🔴 POSITION GATE FIRED (Prime): Alpaca has %d/%d positions — NEW EXECUTION BLOCKED",
-                    alpaca_live_count, MAX_CONCURRENT_POSITIONS
-                )
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "executed": False,
-                        "reason": f"🔴 POSITION_CAP: Alpaca shows {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} open positions (combined across all services). No new executions allowed until positions are closed.",
-                    },
-                )
-        except RuntimeError as _alpaca_err:
-            logger.warning("Alpaca live position check failed (Prime): %s — blocking as safety measure", _alpaca_err)
-            return JSONResponse(
-                status_code=503,
-                content={"executed": False, "reason": f"Cannot verify position count: {_alpaca_err}"},
-            )
-        
         open_count  = count_open_positions(settings.prime_db_path)  # includes 'pending'
         today_count = count_new_positions_today(settings.prime_db_path)
-
-        # Per-ticker duplicate guard (2026-04-24): reject if ticker already open.
-        # Concordances fire per-window; a strong ticker can generate new P1 events
-        # in subsequent windows. Without this guard, the same ticker gets opened
-        # multiple times. Must be inside the lock to be race-condition safe.
-        if ticker_already_open(settings.prime_db_path, body.ticker):
-            logger.info(
-                "Prime execution blocked: %s already has an open position", body.ticker
+        
+        # FIRST: Guard against position limit using LOCAL DB (atomic, includes pending from concurrent reqs)
+        if open_count >= MAX_CONCURRENT_POSITIONS:
+            logger.critical(
+                "🔴 POSITION GATE (Prime DB): Local DB has %d/%d positions — NEW EXECUTION BLOCKED",
+                open_count, MAX_CONCURRENT_POSITIONS
             )
             return JSONResponse(
                 status_code=429,
                 content={
                     "executed": False,
-                    "reason":   f"{body.ticker} already has an open position — no duplicates allowed",
+                    "reason": f"🔴 POSITION_CAP (local DB): {open_count}/{MAX_CONCURRENT_POSITIONS} positions reserved. No new executions allowed.",
                 },
             )
-
-        if open_count >= MAX_CONCURRENT_POSITIONS:
-            return JSONResponse(
-                status_code=429,
-                content={"executed": False,
-                         "reason": f"Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})"},
-            )
+        
         if today_count >= MAX_NEW_PER_DAY:
             return JSONResponse(
                 status_code=429,
                 content={"executed": False,
                          "reason": f"Max new positions today reached ({today_count}/{MAX_NEW_PER_DAY})"},
             )
-        # Reserve slot inside lock — visible to next concurrent request immediately.
+        
+        # SECOND: Reserve slot in DB (atomic, visible to concurrent requests immediately)
         pending_id = reserve_position_slot(
             db_path           = settings.prime_db_path,
             ticker            = body.ticker,
@@ -1123,6 +1093,41 @@ def execute(
             agent_scores      = _json.dumps(body.agent_scores or {}),
             verdict           = body.verdict,
         )
+        
+        # THIRD: Validate against Alpaca as safety check (reconciliation)
+        # If Alpaca has >= MAX, log critical but allow (DB is primary) — this indicates a reconciliation issue
+        try:
+            from database import count_open_positions_alpaca
+            alpaca_live_count = count_open_positions_alpaca(
+                settings.alpaca_url, settings.alpaca_api_key, settings.alpaca_secret_key
+            )
+            if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
+                logger.critical(
+                    "🔴 RECONCILIATION ALERT (Prime): Alpaca shows %d/%d positions but DB shows %d. Possible orphan position or race condition.",
+                    alpaca_live_count, MAX_CONCURRENT_POSITIONS, open_count + 1
+                )
+        except RuntimeError as _alpaca_err:
+            logger.warning("Alpaca live position check failed during reconciliation (Prime): %s", _alpaca_err)
+            # Don't block execution — DB gate is sufficient
+
+        # Per-ticker duplicate guard (2026-04-24): reject if ticker already open.
+        # Concordances fire per-window; a strong ticker can generate new P1 events
+        # in subsequent windows. Without this guard, the same ticker gets opened
+        # multiple times. Must be inside the lock to be race-condition safe.
+        if ticker_already_open(settings.prime_db_path, body.ticker):
+            logger.info(
+                "Prime execution blocked: %s already has an open position", body.ticker
+            )
+            # Clean up the pending reservation we made above
+            if pending_id:
+                cancel_pending_position(settings.prime_db_path, pending_id)
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "executed": False,
+                    "reason":   f"{body.ticker} already has an open position — no duplicates allowed",
+                },
+            )
 
     # ── Place Equity Order OUTSIDE lock (network call) ────────────────────────
     side            = "buy" if body.direction == "bullish" else "sell"

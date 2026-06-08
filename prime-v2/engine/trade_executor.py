@@ -24,6 +24,10 @@ import requests
 log = logging.getLogger("prime_v2.executor")
 _ET = ZoneInfo("America/New_York")
 
+# Axiom risk gating constants
+AXIOM_BASE   = os.getenv("AXIOM_BASE", "http://localhost:8007")
+AXIOM_SECRET = os.getenv("NEXUS_SECRET", "62d7ecd98c8e298916c6c87555eac10e7a701cd9be86db27561593a9122244d2")
+
 PRIME_V2_DB = os.getenv("PRIME_V2_DB",
               "/Users/ahmedsadek/nexus/data/prime_v2.db")
 TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN","")
@@ -264,6 +268,78 @@ def execute_trade(opportunity: dict, size_result: dict) -> Optional[dict]:
     # Duplicate check
     if is_already_positioned(ticker):
         log.info("Already positioned in %s — skip", ticker)
+        return None
+
+    # MANDATORY AXIOM GATE: Position cap (3 max) + 10-layer risk assessment
+    try:
+        conn = sqlite3.connect(PRIME_V2_DB, timeout=5)
+        open_row = conn.execute(
+            "SELECT COUNT(*) FROM prime_v2_positions WHERE status='OPEN'"
+        ).fetchone()
+        conn.close()
+        open_count = open_row[0] if open_row else 0
+    except Exception:
+        open_count = 0
+
+    # Hard stop: 3-position cap (Ahmed mandate)
+    if open_count >= 3:
+        log.critical("POSITION CAP BREACH: %d open >= 3 max. BLOCKING %s", open_count, ticker)
+        _notify(
+            f"<b>🔴 POSITION CAP BREACH</b>\n"
+            f"Ticker: {ticker}\n"
+            f"Open: {open_count}/3 max\n"
+            f"Trade BLOCKED — position limit exceeded"
+        )
+        return None
+
+    # Query Axiom for full 10-layer risk assessment
+    try:
+        r = requests.post(
+            f"{AXIOM_BASE}/assess",
+            json={
+                "ticker": ticker,
+                "strategy": strategy,
+                "secret": AXIOM_SECRET,
+            },
+            timeout=8,
+        )
+        if r.status_code == 200:
+            axiom_result = r.json()
+            if axiom_result.get("hard_stops"):
+                reason = "; ".join(axiom_result["hard_stops"])
+                log.warning("Axiom BLOCKED %s: %s", ticker, reason)
+                _notify(
+                    f"<b>🔴 AXIOM RISK GATE BLOCKED: {ticker}</b>\n"
+                    f"Reason: {reason}\n"
+                    f"Strategy: {strategy}"
+                )
+                return None
+            risk_score = axiom_result.get("risk_score", 0)
+            log.info("Axiom cleared %s (risk_score=%.0f, open=%d)", ticker, risk_score, open_count)
+        else:
+            log.error("Axiom service error: HTTP %d", r.status_code)
+            # Fail open on Axiom outage — do not execute
+            _notify(
+                f"<b>⚠️ Axiom unavailable</b>\n"
+                f"Cannot execute {ticker} — Axiom HTTP {r.status_code}\n"
+                f"Strategy: {strategy}"
+            )
+            return None
+    except requests.Timeout:
+        log.error("Axiom timeout for %s", ticker)
+        _notify(
+            f"<b>⚠️ Axiom timeout</b>\n"
+            f"Cannot execute {ticker}\n"
+            f"Axiom service unresponsive"
+        )
+        return None
+    except Exception as e:
+        log.error("Axiom gate exception for %s: %s", ticker, str(e))
+        _notify(
+            f"<b>⚠️ Axiom error</b>\n"
+            f"Cannot execute {ticker}\n"
+            f"Error: {str(e)[:100]}"
+        )
         return None
 
     # Get current price

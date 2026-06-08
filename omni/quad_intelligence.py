@@ -307,15 +307,30 @@ def run_all_brains(
     _HARD_DEADLINE = min(BRAIN_TIMEOUT_SECONDS * 4 // 3, 45)  # CANARY FIX 2026-06-04: 45s hard stop (from 60s) to prevent canary timeout (120s window). 4 brains * 30s timeout / 3 = 40s + 5s buffer = 45s max.
 
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omni-brain")
-    futures = {
-        executor.submit(
-            _call_brain,
-            brain_name,
-            brain_contexts_json[brain_name],  # FIX-MEMORY-PHASE2: Use brain-specific context
-            api_keys[brain_name],
-        ): brain_name
-        for brain_name in ALL_BRAINS
-    }
+    futures = {}
+    
+    # Wrap executor.submit in try/except to handle "cannot schedule new futures"
+    # errors that occur during interpreter shutdown or when executor is already dead
+    for brain_name in ALL_BRAINS:
+        try:
+            future = executor.submit(
+                _call_brain,
+                brain_name,
+                brain_contexts_json[brain_name],  # FIX-MEMORY-PHASE2: Use brain-specific context
+                api_keys[brain_name],
+            )
+            futures[future] = brain_name
+        except RuntimeError as e:
+            if "cannot schedule new futures" in str(e):
+                logger.critical(
+                    "EXECUTOR DEAD: Brain %s cannot submit — executor in shutdown state. "
+                    "This synthesis will be marked as FAILED. Triggering pool restart.",
+                    brain_name,
+                )
+                # Mark this as a hard failure so synthesis doesn't proceed with partial results
+                results[brain_name] = _error_result(brain_name, "Executor shutdown")
+            else:
+                raise
 
     completed_brains: set = set()
     try:

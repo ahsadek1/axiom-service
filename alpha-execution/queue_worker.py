@@ -60,6 +60,32 @@ class QueueWorker(threading.Thread):
     
     def enqueue(self, order: Dict[str, Any]) -> bool:
         """Enqueue an order for async processing. Returns False if rejected due to insufficient buying power."""
+        # PRE-QUEUE GATE: Check for duplicate (idempotency)
+        ticker = order['ticker']
+        direction = order.get('direction', 'bullish')
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            cursor = conn.cursor()
+            
+            # Check if this ticker is already queued or submitted (today)
+            cursor.execute("""
+                SELECT id, status, created_at FROM execution_queue
+                WHERE ticker = ? AND status IN ('queued', 'processing', 'submitted')
+                ORDER BY created_at DESC LIMIT 1
+            """, (ticker,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                existing_id, existing_status, created_at = existing
+                self.logger.warning(
+                    f"DEDUP: {ticker} {direction} already in queue (id={existing_id}, status={existing_status}). "
+                    f"Rejecting duplicate submission (created {created_at})."
+                )
+                conn.close()
+                return False  # Reject duplicate
+        except Exception as e:
+            self.logger.error(f"Deduplication check failed: {e}. Continuing (may allow duplicate).")
+        
         # PRE-QUEUE GATE: Check if we have enough daytrading buying power BEFORE accepting the order
         try:
             account = self.alpaca_client.get_account()
@@ -69,7 +95,7 @@ class QueueWorker(threading.Thread):
             
             if daytrading_bp < required_bp:
                 self.logger.warning(
-                    f"PRE-QUEUE REJECT: {order['ticker']} {order.get('direction')} — "
+                    f"PRE-QUEUE REJECT: {ticker} {direction} — "
                     f"insufficient daytrading BP: have ${daytrading_bp:.2f}, need ${required_bp:.2f}. "
                     f"Pausing order acceptance until buying power is restored."
                 )
@@ -380,11 +406,14 @@ class QueueWorker(threading.Thread):
                     try:
                         from database import count_open_positions_alpaca
                         from config import MAX_CONCURRENT_POSITIONS
+                        # CRITICAL FIX 2026-06-08 12:05 ET: Use AlpacaClient._headers directly (no _session attribute)
+                        # AlpacaClient stores credentials in _headers dict, not _session
                         alpaca_live_count = count_open_positions_alpaca(
                             self.alpaca_client.base_url,
-                            getattr(self.alpaca_client, '_session', None).headers.get('APCA-API-KEY-ID', ''),
-                            getattr(self.alpaca_client, '_session', None).headers.get('APCA-API-SECRET-KEY', '')
+                            self.alpaca_client._headers.get('APCA-API-KEY-ID', ''),
+                            self.alpaca_client._headers.get('APCA-API-SECRET-KEY', '')
                         )
+                        
                         if alpaca_live_count >= MAX_CONCURRENT_POSITIONS:
                             self.logger.critical(
                                 f"Queue {queue_id}: POSITION GATE FIRED — Alpaca has {alpaca_live_count}/{MAX_CONCURRENT_POSITIONS} "

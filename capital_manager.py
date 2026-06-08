@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
 import pytz
 
@@ -222,14 +223,45 @@ class CapitalManager:
         self.max_positions = POSITION_LIMIT_MAX
         self.allocation_ttl = ALLOCATION_TTL_SEC
         self._lock = threading.Lock()
-        # GUARANTEE 6: Circuit breaker state (orphan detection)
-        self.circuit_breaker_halted = False
-        self.circuit_breaker_reason: Optional[str] = None
         self._init_schema()
+        # Load circuit breaker state from DB (not in-memory)
+        self._load_circuit_breaker_state()
+    
+    def _load_circuit_breaker_state(self):
+        """Load circuit breaker state from persistent database."""
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT halted, reason FROM circuit_breaker_state LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                self.circuit_breaker_halted = bool(row['halted'])
+                self.circuit_breaker_reason = row['reason']
+            else:
+                self.circuit_breaker_halted = False
+                self.circuit_breaker_reason = None
     
     def _init_schema(self):
         """Initialize database schema."""
         with self._get_connection() as conn:
+            # Circuit breaker state table (shared across all instances)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+                    id INTEGER PRIMARY KEY,
+                    halted INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    activated_at TEXT,
+                    cleared_at TEXT,
+                    last_update TEXT
+                )
+            """)
+            
+            # Initialize circuit breaker state if not exists
+            cursor = conn.execute("SELECT COUNT(*) FROM circuit_breaker_state")
+            if cursor.fetchone()[0] == 0:
+                conn.execute(
+                    "INSERT INTO circuit_breaker_state (halted, reason, last_update) VALUES (?, ?, ?)",
+                    (0, None, datetime.now(ET).isoformat())
+                )
+            
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS position_binding (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -592,16 +624,104 @@ class CapitalManager:
             logger.error(f"Confirm position failed for binding {binding_id}: {e}", exc_info=True)
             return False
     
-    def detect_orphans(self) -> List[OrphanPosition]:
+    def detect_orphans(self, alpaca_client=None) -> List[OrphanPosition]:
         """
         GUARANTEE 6: Detect orphans (positions in Alpaca not in position_binding).
         
-        NOTE: Requires access to Alpaca client. Stub implementation for now.
+        Fetches live positions from Alpaca and compares against position_binding.
+        Returns list of orphan positions found.
+        
+        Args:
+            alpaca_client: Instance with list_positions() method, or None (safe mode)
         """
-        # TODO: Integrate with Alpaca client to fetch actual positions
-        # Compare to position_binding table
-        # Return list of orphans if any
-        return []
+        orphans: List[OrphanPosition] = []
+        
+        # Safe mode: if no client provided, skip check
+        if alpaca_client is None:
+            logger.debug("detect_orphans: no alpaca_client provided, skipping check")
+            return []
+        
+        try:
+            # Fetch live Alpaca positions
+            alpaca_positions = {}
+            for pos in alpaca_client.list_positions():
+                symbol = pos.symbol if hasattr(pos, 'symbol') else pos.get('symbol')
+                qty = pos.qty if hasattr(pos, 'qty') else pos.get('qty')
+                alpaca_positions[symbol] = {
+                    'qty': int(qty),
+                    'entry_price': float(pos.avg_entry_price if hasattr(pos, 'avg_entry_price') else pos.get('avg_entry_price', 0)),
+                    'market_value': float(pos.market_value if hasattr(pos, 'market_value') else pos.get('market_value', 0)),
+                }
+            
+            # Fetch tracked positions from position_binding (status='filled')
+            with self._get_connection() as conn:
+                cursor = conn.execute("""
+                    SELECT DISTINCT symbol FROM position_binding
+                    WHERE status IN ('filled', 'allocated', 'submitted')
+                """)
+                tracked_symbols = {row['symbol'] for row in cursor.fetchall()}
+            
+            # Find orphans: in Alpaca but not in position_binding
+            for symbol, pos_data in alpaca_positions.items():
+                if symbol not in tracked_symbols:
+                    orphan = OrphanPosition(
+                        symbol=symbol,
+                        qty=pos_data['qty'],
+                        entry_price=pos_data['entry_price'],
+                        market_value=pos_data['market_value'],
+                    )
+                    orphans.append(orphan)
+                    logger.critical(
+                        "ORPHAN DETECTED: %s qty=%d entry=$%.2f market_value=$%.2f",
+                        symbol, pos_data['qty'], pos_data['entry_price'], pos_data['market_value']
+                    )
+            
+            if orphans:
+                logger.error(f"Found {len(orphans)} orphan position(s) in Alpaca")
+                # Flip circuit breaker (persist to DB)
+                self._set_circuit_breaker(
+                    halted=True,
+                    reason=f"orphan_detected: {len(orphans)} untracked position(s)"
+                )
+            
+            return orphans
+        
+        except Exception as e:
+            logger.error(f"detect_orphans failed (non-fatal): {e}", exc_info=True)
+            return []
+    
+    def _set_circuit_breaker(self, halted: bool, reason: Optional[str] = None):
+        """Persistently update circuit breaker state in database."""
+        try:
+            with self._lock:
+                with self._get_connection() as conn:
+                    now = datetime.now(ET).isoformat()
+                    if halted:
+                        conn.execute(
+                            "UPDATE circuit_breaker_state SET halted=1, reason=?, activated_at=?, last_update=?",
+                            (reason, now, now)
+                        )
+                        logger.critical(f"CIRCUIT BREAKER ACTIVATED: {reason}")
+                    else:
+                        conn.execute(
+                            "UPDATE circuit_breaker_state SET halted=0, reason=NULL, cleared_at=?, last_update=?",
+                            (now, now)
+                        )
+                        logger.info(f"CIRCUIT BREAKER CLEARED")
+                    conn.commit()
+                    # Reload state
+                    self._load_circuit_breaker_state()
+        except Exception as e:
+            logger.error(f"Failed to update circuit breaker state: {e}")
+    
+    def get_circuit_breaker_state(self) -> Tuple[bool, Optional[str]]:
+        """Get current circuit breaker state from database."""
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT halted, reason FROM circuit_breaker_state LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                return (bool(row['halted']), row['reason'])
+        return (False, None)
     
     def close_position(self, binding_id: int, closed_at: str = None) -> bool:
         """Mark position as closed."""

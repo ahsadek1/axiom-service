@@ -33,10 +33,10 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from config import BASE_POSITION_SIZE, MIN_BRAINS_REQUIRED, load_settings
-from axiom_client import assess_ticker, get_regime
-from worker_monitor import WorkerHealthMonitor
-from database import (
+from omni.config import BASE_POSITION_SIZE, MIN_BRAINS_REQUIRED, load_settings
+from omni.axiom_client import assess_ticker, get_regime
+from omni.worker_monitor import WorkerHealthMonitor
+from omni.database import (
     get_conn,
     get_recent_syntheses,
     get_synthesis_result,
@@ -44,10 +44,10 @@ from database import (
     mark_execution_dispatched,
     save_synthesis_result,
 )
-from execution_router import calculate_position_size, route_to_execution
-from execution_confirmation import confirm_order_submitted
-from credential_loader import get_credentials as get_cached_credentials
-from quad_intelligence import run_all_brains
+from omni.execution_router import calculate_position_size, route_to_execution
+from omni.execution_confirmation import confirm_order_submitted
+from omni.credential_loader import get_credentials as get_cached_credentials
+from omni.quad_intelligence import run_all_brains
 from synthesis import build_context, compute_verdict, _maybe_alert_brain_degradation
 from psychology_overlay import apply_psychology_overlay, PsychologyOverlayResult
 import oracle_client
@@ -1111,6 +1111,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     _worker_monitor.start()
     logger.info("OMNI Worker Health Monitor started ✅ (checking every 10s, restart if alive < 2)")
+
+    # START VERDICT EXECUTOR — polls GO verdicts and routes to Alpha /execute endpoint
+    from verdict_executor import run_executor_loop
+    _executor_thread = threading.Thread(
+        target=run_executor_loop,
+        daemon=True,
+        name="omni-verdict-executor"
+    )
+    _executor_thread.start()
+    logger.info("OMNI Verdict Executor started ✅ (polling every 5s for GO verdicts)")
 
     yield
 
